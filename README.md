@@ -13,9 +13,24 @@ This project is managed with [`uv`](https://docs.astral.sh/uv/) (`uv.lock` is co
 
 ```bash
 cp .env.example .env          # set OPENAI_API_KEY, TAVILY_API_KEY (+ optional DRA_MCP_*)
+./run.sh                      # sync deps (first run) + start the dev server on :2024
+```
+
+`run.sh` is a one-command dev bring-up. It loads `./.env` (so the script and server share config), syncs `./.venv` on first run, and starts the LangGraph server:
+
+| Command | Does |
+|---|---|
+| `./run.sh` (or `./run.sh up`) | Sync deps if `./.venv` is missing, then start the dev server (API + docs at `http://127.0.0.1:2024/docs`). Warns if `OPENAI_API_KEY` / `TAVILY_API_KEY` are unset. |
+| `./run.sh --sync` | Force `uv sync --extra dev`, then start the server. |
+| `./run.sh ask "<question>"` | Stream one research run against an **already-running** server. |
+| `./run.sh smoke` | `ask` a canned question against a running server. |
+| `./run.sh test` | Sync, then run the offline `pytest` suite (no API keys / network). |
+
+Host/port follow `DRA_HOST` (default `127.0.0.1`) and `PORT` (default `2024`). `ask`/`smoke` need the server up in another shell first. The equivalent manual commands:
+
+```bash
 uv sync --extra dev           # create ./.venv with all deps + the langgraph CLI
 uv run langgraph dev --host 127.0.0.1 --port 2024
-# API + docs: http://127.0.0.1:2024/docs
 uv run python examples/client.py "What are the recent trends across the tracked entities, and where can I find supporting data?"
 ```
 
@@ -26,6 +41,7 @@ Graph id: **`deep_research_agent`** — set this as your caller's `assistant_id`
 Tests live in `tests/` (e.g. the deterministic report-hygiene guard — `scrub_report` + `lint_citations` / `report_problems`). Pure-Python, no API keys or network needed. `pytest` ships in the `dev` extra, so the suite runs inside `./.venv` alongside the runtime deps:
 
 ```bash
+./run.sh test                # sync + run the suite (equivalent to the two commands below)
 uv sync --extra dev          # installs pytest + deepagents + the langgraph CLI into ./.venv
 uv run pytest tests/ -q
 ```
@@ -108,11 +124,29 @@ It speaks the LangGraph HTTP/SSE API, so any consumer (the included `examples/cl
 4. To get the rich live UI, have the frontend additionally consume the `custom` event channel above.
 
 ### MCP connection notes
+
+**Who connects, and where the config comes from.** The agent is always the MCP *client* — it opens the connection itself (at graph build, `agent.py` → `load_mcp_tools`) and the model calls the resulting tools during research. There is no separate connector process. What varies is where the server list (url + auth) is resolved from. Precedence (first non-empty wins, `config.py`):
+
+1. `configurable.mcp_servers` — per-run request (native).
+2. `configurable.mcp_config` — per-run request (compat alias). **The normal host-app path:** the backend injects url + `headers` (incl. auth) into every run, so the env vars below are never consulted.
+3. `DRA_MCP_SERVERS` — env (JSON list).
+4. `DRA_MCP_URL` (+ `DRA_MCP_LABEL`) — env (single server).
+
+So when a request arrives **with** MCP config, the agent connects using *that* (and its auth). When a bare run arrives **without** it — e.g. a Studio / `langgraph dev` trigger, or any caller that omits `configurable.mcp_config` — it falls back to the `DRA_MCP_*` env entry. The env entry is a standalone-run fallback, not the primary path. If that fallback has no auth, you get the failure below.
+
+**Auth / `401 Unauthorized`.** A `401` means the connection *reached* the server and was rejected for missing/wrong credentials — the path is correct, so do **not** strip `/mcp` (that would give `404`, a different error). Attach credentials instead:
+- request-supplied servers: put them in `headers` (e.g. `{"Authorization": "Bearer …"}` or a server-specific header like `x-litellm-api-key`).
+- env-supplied servers: set `DRA_MCP_BEARER=<token>` — it's attached as `Authorization: Bearer <token>` to every server that doesn't already carry explicit auth.
+
+To keep bare local runs from attempting an auth-less connect at all, leave `DRA_MCP_URL` unset and rely on the backend to inject `mcp_config`.
+
+**`/mcp` path rule differs by source.** Under `mcp_config`, `url` is treated as a **base** and `/mcp` is appended for you — pass the url *without* `/mcp`. Under `DRA_MCP_URL` / `mcp_servers`, the url is used as given except that a **bare host** gets `/mcp` appended; a url that already has a path is left untouched — so pass the full url *with* `/mcp`.
+
+**Other guards.**
 - Connect to **`127.0.0.1`**, never `0.0.0.0` (bind address — dialing it fails). Config normalizes `0.0.0.0` → loopback defensively.
-- `/mcp` is appended automatically for a bare host; a URL that already has a path is left untouched.
 - Each call is bounded by a shared semaphore (`mcp_max_concurrency`) so the agent's fan-out can't exhaust the server's file descriptors; 429s back off and retry within `mcp_rate_limit_max_wait` rather than failing immediately.
 - SSRF guard: only `http(s)` schemes are allowed and link-local / cloud-metadata targets are refused. Loopback / private hosts are allowed (the internal gateway uses them).
-- Connection failures emit `status: mcp_error` (with detail) instead of failing silently.
+- Connection failures emit `status: mcp_error` (with detail) instead of failing silently — one unreachable server does not take down the others or the run.
 
 ## Code execution, large results & budgets
 
