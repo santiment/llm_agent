@@ -1,0 +1,8 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "deep_research_agent": "deep_research_agent.agent:make_graph"
+  },
+  "python_version": "3.11",
+  "env": "./.env"
+}
