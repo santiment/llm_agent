@@ -22,14 +22,13 @@ class _EmptyArgs(BaseModel):
     pass
 
 
-def _expect_raise(make_coro) -> None:
-    """Run ``make_coro()`` to completion; fail unless it raised. Kept as a plain
-    helper (not ``pytest.raises``) so this file still runs under bare ``python``."""
-    try:
-        asyncio.run(make_coro())
-    except Exception:
-        return
-    raise AssertionError("expected the call to raise")
+def _expect_tool_error(make_coro) -> str:
+    """Run ``make_coro()``; the hardened contract is that a failed call RETURNS a
+    'TOOL ERROR' string (the model self-corrects from it) instead of raising —
+    a raise would kill the whole run (see test_tool_errors.py)."""
+    result = asyncio.run(make_coro())
+    assert isinstance(result, str) and result.startswith("TOOL ERROR"), result
+    return result
 
 
 class _FakeTool:
@@ -104,12 +103,12 @@ def test_rate_limit_gives_up_after_budget() -> None:
     wrapped = instrument_tool(
         _FakeTool(behavior), kind="mcp", rate_limit_max_wait=0.05, base_delay=0.01
     )
-    _expect_raise(lambda: wrapped.ainvoke({}))
+    _expect_tool_error(lambda: wrapped.ainvoke({}))
 
 
 def test_non_rate_limit_error_is_not_retried() -> None:
-    """Connection/fd errors must propagate immediately — retrying them would only
-    hammer an already-struggling server."""
+    """Connection/fd errors must fail the CALL immediately (no retry loop — that
+    would hammer an already-struggling server), surfacing as a tool-error result."""
     calls = 0
 
     async def behavior():
@@ -120,8 +119,9 @@ def test_non_rate_limit_error_is_not_retried() -> None:
     wrapped = instrument_tool(
         _FakeTool(behavior), kind="mcp", rate_limit_max_wait=60.0, base_delay=0.0
     )
-    _expect_raise(lambda: wrapped.ainvoke({}))
+    result = _expect_tool_error(lambda: wrapped.ainvoke({}))
     assert calls == 1, f"non-rate-limit error must not retry, got {calls} calls"
+    assert "transient" in result  # connection errors read as transient to the model
 
 
 if __name__ == "__main__":

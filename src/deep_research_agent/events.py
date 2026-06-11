@@ -86,6 +86,69 @@ def _is_rate_limited(msg: str) -> bool:
     return "429" in msg or "too many requests" in msg or "rate limit" in msg
 
 
+# A failed tool call must NOT kill the run (one mistyped metric name used to abort the
+# whole research) — the error text goes back to the model as the tool result so it can
+# self-correct. Classification decides the guidance: PERMANENT (validation /
+# unknown-name — the same arguments can never succeed) vs TRANSIENT (worth one retry).
+# Servers that know best can tag explicitly: a message starting with "[permanent]" or
+# "[transient]" wins over the marker heuristics.
+_PERMANENT_MARKERS = (
+    "not supported", "not found", "unknown", "invalid", "unsupported",
+    "does not exist", "must be one of", "mistyped", "missing required",
+    "can contain at most", "not available for", "bad request",
+)
+_TRANSIENT_MARKERS = (
+    "timeout", "timed out", "connection", "temporarily", "unavailable",
+    "internal server error", "500", "502", "503", "504",
+)
+
+
+def classify_tool_error(msg: str) -> str:
+    """``"permanent"`` | ``"transient"`` | ``"unknown"`` for a tool error message."""
+    low = msg.strip().lower()
+    if low.startswith("[permanent]"):
+        return "permanent"
+    if low.startswith("[transient]"):
+        return "transient"
+    if any(m in low for m in _PERMANENT_MARKERS):
+        return "permanent"
+    if any(m in low for m in _TRANSIENT_MARKERS):
+        return "transient"
+    return "unknown"
+
+
+def _strip_class_tag(msg: str) -> str:
+    low = msg.lstrip().lower()
+    for tag in ("[permanent]", "[transient]"):
+        if low.startswith(tag):
+            return msg.lstrip()[len(tag):].lstrip()
+    return msg
+
+
+_ERROR_GUIDANCE = {
+    "permanent": (
+        "This error is PERMANENT for these arguments — repeating the identical call WILL "
+        "fail again. Fix the arguments (e.g. resolve valid names with a discovery tool) "
+        "or proceed without this data and note the gap."
+    ),
+    "transient": (
+        "This error is likely TRANSIENT. You may retry this call ONCE; if it fails "
+        "again, proceed without this data and note the gap."
+    ),
+    "unknown": (
+        "If a retry with the SAME arguments fails again, treat the error as permanent: "
+        "fix the arguments or proceed without this data and note the gap."
+    ),
+}
+
+
+def tool_error_text(tool_name: str, msg: str, classification: str) -> str:
+    """The model-facing tool result for a failed call: the error + how to proceed."""
+    return (f"TOOL ERROR ({tool_name}, {classification}): "
+            f"{_summarize(_strip_class_tag(msg), 1000)}\n"
+            + _ERROR_GUIDANCE[classification])
+
+
 def _retry_after_seconds(msg: str) -> float | None:
     """Honor a server-provided ``Retry-After`` hint if it leaked into the message."""
     m = _RETRY_AFTER.search(msg)
@@ -216,6 +279,11 @@ def instrument_tool(
     server.
     """
 
+    # Permanent failures remembered per (args) so an identical retry is answered
+    # locally instead of hammering the server. Per-run state: make_graph builds the
+    # wrappers fresh for every run.
+    failed_permanently: dict[str, str] = {}
+
     async def _run(**kwargs: Any) -> Any:
         call_id = new_id()
         emit({
@@ -224,6 +292,15 @@ def instrument_tool(
             "tool": tool.name,
             "args": {k: _summarize(v, 120) for k, v in kwargs.items()},
         })
+        args_key = json.dumps(kwargs, sort_keys=True, default=str)
+        if args_key in failed_permanently:
+            emit({"type": f"{kind}_result", "id": call_id, "tool": tool.name,
+                  "ok": False, "error_class": "permanent", "repeated": True,
+                  "summary": _summarize(failed_permanently[args_key])})
+            return (f"TOOL ERROR ({tool.name}, permanent, REPEATED CALL): you already "
+                    f"called this tool with these EXACT arguments and it failed: "
+                    f"{_summarize(failed_permanently[args_key], 500)}\n"
+                    "Do NOT repeat this call. " + _ERROR_GUIDANCE["permanent"])
         attempt = 0
         waited = 0.0
         while True:
@@ -233,7 +310,10 @@ def instrument_tool(
                 # while backing off on a 429.
                 async with (semaphore or nullcontext()):
                     result = await tool.ainvoke(kwargs)
-            except Exception as exc:  # surface tool failure to the UI, keep researching
+            except Exception as exc:
+                # A failed call is a RESULT, not a run-ending event: the error text is
+                # returned to the model (with retry guidance) so it can self-correct —
+                # raising here would abort the whole research over one bad argument.
                 msg = str(exc)
                 low = msg.lower()
                 # Wait out a rate-limit signal rather than failing — but only within
@@ -245,11 +325,19 @@ def instrument_tool(
                         waited += delay
                         await asyncio.sleep(delay)
                         continue
+                classification = classify_tool_error(msg)
+                if classification == "permanent":
+                    if len(failed_permanently) >= 128:  # bound per-run memory
+                        failed_permanently.pop(next(iter(failed_permanently)))
+                    failed_permanently[args_key] = _strip_class_tag(msg)
                 if meter is not None:
                     meter.record_tool_result(ok=False)
                 emit({"type": f"{kind}_result", "id": call_id, "tool": tool.name,
-                      "ok": False, "summary": _summarize(msg)})
-                raise
+                      "ok": False, "error_class": classification,
+                      "summary": _summarize(msg)})
+                log.warning("TOOL ERROR (%s, %s): %s", tool.name, classification,
+                            _summarize(msg, 500))
+                return tool_error_text(tool.name, msg, classification)
             # Observability + source-level cap: record the RAW size (before capping) so the
             # run log shows what the tool actually returned, then bound it for the context.
             raw_rows = len(result) if isinstance(result, (list, tuple)) else None
