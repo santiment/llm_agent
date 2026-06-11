@@ -17,11 +17,14 @@ from __future__ import annotations
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 NUDGE_NAME = "dra_completion_nudge"
-# Budget middleware's wrap-up nudge name. Defined here (not in budget.py) to avoid a
-# circular import, and folded into the synthetic-name set below so an injected nudge is
-# never mistaken for the start of a new user turn.
+# Other middlewares' nudge names. Defined here (not in their own modules) to avoid
+# circular imports, and folded into the synthetic-name set below so an injected nudge is
+# never mistaken for the start of a new user turn. FINDINGS_NUDGE_NAME is injected into
+# SUB-AGENT state only (findings_gate.py) — registered here anyway so any middleware
+# that ever calls current_turn() on that state can't misread the bounce as a turn start.
 BUDGET_NUDGE_NAME = "dra_budget_nudge"
-_SYNTHETIC_NUDGE_NAMES = {NUDGE_NAME, BUDGET_NUDGE_NAME}
+FINDINGS_NUDGE_NAME = "dra_findings_format_nudge"
+_SYNTHETIC_NUDGE_NAMES = {NUDGE_NAME, BUDGET_NUDGE_NAME, FINDINGS_NUDGE_NAME}
 
 # Terminal/control tools — invoking these is how a turn *ends*, not "research work".
 _TERMINAL_TOOLS = {"submit_report", "request_clarification"}

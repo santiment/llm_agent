@@ -3,9 +3,12 @@ that keeps the agent portable.
 
 Resolution order for every field: per-run ``configurable`` override  ->  env var
 ->  default. The ``configurable`` keys accept BOTH this package's native names
-AND a set of compatibility aliases (``research_model``, ``final_report_model``,
-``apiKeys``, ``mcp_config``, ``mcp_prompt``) so an existing caller can adopt the
-agent with zero backend changes.
+AND a set of compatibility aliases (``apiKeys``, ``mcp_config``, ``mcp_prompt``)
+so an existing caller can adopt the agent with zero backend changes.
+
+Exception — models: chosen by tier NAME only (``model_tier`` / ``DRA_MODEL_TIER``);
+the models behind each name live in ``MODEL_TIERS`` (code). Per-model keys and env
+vars are deliberately not honored (legacy ones are ignored with a warning).
 """
 
 from __future__ import annotations
@@ -29,6 +32,49 @@ def _default_skills_dir() -> str:
 
 # Hostnames that resolve to cloud-metadata endpoints — never a legitimate MCP target.
 _BLOCKED_MCP_HOSTNAMES = {"metadata", "metadata.google.internal"}
+
+# Named model packages ("price tiers") — THE ONLY place models are chosen. Callers
+# and the environment select a package by NAME (configurable ``model_tier`` /
+# env ``DRA_MODEL_TIER``); individual models are not settable per run or per env, so
+# every model that can ever run is named here, in one reviewed place.
+# DEFAULT_MODEL_TIER applies when nothing is configured — the cheapest package, so a
+# bare checkout can't silently burn money; production callers opt UP explicitly.
+# To add a packaging: add an entry here, pick a name, document it in the README's
+# Model tiers table — callers then just set model_tier=<name>.
+# OpenRouter slugs; prices are $/M input/output as of 2026-06 — re-check when editing.
+MODEL_TIERS: dict[str, dict[str, str]] = {
+    # Rock bottom: cheapest tool-capable models everywhere (~$0.02 orchestrator per
+    # medium run). A flash-class orchestrator WILL plan worse and quit earlier — the
+    # force-completion / findings-gate / budget backstops keep runs honest, not great.
+    # For demos, smoke tests, and high-volume low-stakes ticks; not for decisions.
+    "extra-low": {
+        "research_model": "deepseek/deepseek-v4-flash",
+        "subagent_model": "openai/gpt-oss-120b",
+        "utility_model": "openai/gpt-oss-20b",
+    },
+    # Cheapest sane agent: ~$0.44/0.87 research, ~$0.10/0.20 below. deepseek-v4-flash
+    # streaming is force-disabled via streaming_denylist (known off-spec chunks).
+    "low": {
+        "research_model": "deepseek/deepseek-v4-pro",
+        "subagent_model": "deepseek/deepseek-v4-flash",
+        "utility_model": "deepseek/deepseek-v4-flash",
+    },
+    # The value sweet spot: current-gen flash orchestrator (~$1.50/9), cheap workers.
+    "mid": {
+        "research_model": "google/gemini-3.5-flash",
+        "subagent_model": "google/gemini-2.5-flash",
+        "utility_model": "deepseek/deepseek-v4-flash",
+    },
+    # Best research quality. Opus plans and synthesizes ONLY — sub-agent/utility stay
+    # sonnet/haiku tier on purpose (an Opus sub-agent fleet defeats the tiering).
+    "high": {
+        "research_model": "anthropic/claude-opus-4.8",
+        "subagent_model": "anthropic/claude-sonnet-4.6",
+        "utility_model": "anthropic/claude-haiku-4.5",
+    },
+}
+
+DEFAULT_MODEL_TIER = "extra-low"
 
 
 def _env(*names: str, default: str = "") -> str:
@@ -106,6 +152,16 @@ class ResearchConfig:
     tavily_api_key: str
     research_model: str
     report_model: str
+    # Model tiering — smart orchestrator, cheap sub-agents. The orchestrator plans,
+    # delegates and synthesizes on research_model; sub-agents run their tool loops on
+    # subagent_model (typically a tier down); utility_model is the floor (flash-class)
+    # for pure map/extract/verify work that needs no tool-loop judgment. All three are
+    # filled from the selected MODEL_TIERS package (DEFAULT_MODEL_TIER when none
+    # chosen) — never settable individually by env or caller. utility_model has no
+    # consumer yet — plumbed now so the verifier / compaction / map-worker features
+    # configure against a stable key.
+    subagent_model: str
+    utility_model: str
     temperature: float = 0.0
     search_max_results: int = 6
     max_concurrent_units: int = 3
@@ -192,11 +248,31 @@ class ResearchConfig:
                 log.warning("ignoring non-allowlisted base_url override: %s", requested_base)
             base_url = trusted_base
 
-        research_model = _strip_provider(
-            c.get("research_model") or _env("DRA_RESEARCH_MODEL", default="openai/gpt-4o"))
-        report_model = _strip_provider(
-            c.get("final_report_model") or c.get("report_model")
-            or _env("DRA_REPORT_MODEL", default=research_model))
+        # Named package (see MODEL_TIERS); the cheapest one when nothing is configured.
+        # Per-model keys/env still win slot-by-slot.
+        tier_name = (c.get("model_tier")
+                     or _env("DRA_MODEL_TIER", default=DEFAULT_MODEL_TIER)).strip().lower()
+        tier = MODEL_TIERS.get(tier_name)
+        if tier is None:
+            log.warning("unknown model_tier %r — using %r (known tiers: %s)",
+                        tier_name, DEFAULT_MODEL_TIER, ", ".join(sorted(MODEL_TIERS)))
+            tier = MODEL_TIERS[DEFAULT_MODEL_TIER]
+
+        # Models come ONLY from the tier package — deliberately no per-model env vars
+        # and no per-model configurable keys. The env and the caller pick a NAME
+        # (DRA_MODEL_TIER / configurable.model_tier); which models that name means is
+        # decided in code (MODEL_TIERS), in one reviewed place. Callers still sending
+        # the legacy per-model keys get a warning, not silent ignoring.
+        _ignored = [k for k in ("research_model", "subagent_model", "utility_model",
+                                "final_report_model", "report_model", "compression_model")
+                    if c.get(k)]
+        if _ignored:
+            log.warning("per-run model selection is disabled — ignoring %s; "
+                        "pick a package via configurable.model_tier instead", _ignored)
+        research_model = _strip_provider(tier["research_model"])
+        report_model = research_model  # reserved for a future dedicated synthesis step
+        subagent_model = _strip_provider(tier.get("subagent_model") or research_model)
+        utility_model = _strip_provider(tier.get("utility_model") or subagent_model)
 
         # MCP servers, in precedence order: native `mcp_servers`, compat single
         # `mcp_config`, `DRA_MCP_SERVERS` (JSON list of {label,url,...}), or a single
@@ -252,6 +328,8 @@ class ResearchConfig:
             tavily_api_key=tavily_key,
             research_model=research_model,
             report_model=report_model,
+            subagent_model=subagent_model,
+            utility_model=utility_model,
             temperature=float(c.get("temperature", 0.0) or 0.0),
             search_max_results=int(c.get("search_max_results", 6) or 6),
             max_concurrent_units=int(
@@ -287,9 +365,10 @@ class ResearchConfig:
                 c.get("max_react_tool_calls")
                 or c.get("max_tool_calls")
                 or _env("DRA_MAX_TOOL_CALLS")
-                or 80),
+                or cls.max_tool_calls),
             max_total_tokens=int(
-                c.get("max_total_tokens") or _env("DRA_MAX_TOTAL_TOKENS") or 2_000_000),
+                c.get("max_total_tokens") or _env("DRA_MAX_TOTAL_TOKENS")
+                or cls.max_total_tokens),
             max_result_chars=int(
                 c.get("max_result_chars") or _env("DRA_MAX_RESULT_CHARS") or 60_000),
             max_result_rows=int(

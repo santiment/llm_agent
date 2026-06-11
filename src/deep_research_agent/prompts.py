@@ -3,6 +3,24 @@ braces in examples never break interpolation."""
 
 _MCP_SLOT = "<<MCP_TOOLS>>"
 
+# The sub-agent return contract. findings_gate.py enforces this deterministically
+# (shape + a source on every finding + tool provenance) — keep the two in sync.
+FINDINGS_FORMAT = """\
+- RETURN FORMAT (mandatory). Your FINAL message must be EXACTLY ONE JSON object and \
+nothing else (a ```json fence around it is fine):
+  {"summary": "<dense prose digest of your unit — figures, dates, named entities>",
+   "findings": [{"finding": "<one specific claim, with its numbers>",
+                 "evidence": "<the data behind it: values, quotes, dates>",
+                 "source": "<URL for web; the EXACT internal source label for data tools>"}],
+   "gaps": ["<what you could not determine, and why>"]}
+Every finding MUST carry its source — a finding you cannot attribute does not go in. \
+Include "evidence" whenever you have concrete numbers/quotes ("gaps" and "evidence" \
+may be omitted; "summary", "findings" and each finding's "source" may not). \
+Findings must come from THIS run's tool results, never from memory. \
+If the unit yielded nothing, say so in "summary" and return an empty findings list; \
+NEVER pad with invented findings.\
+"""
+
 ORCHESTRATOR_PROMPT = (
     """You are a deep research orchestrator. You produce thorough, \
 well-sourced research reports — in the spirit of Gemini Deep Research and Claude's \
@@ -35,7 +53,10 @@ context — that is what overflows the token limit. PARTITION by a natural unit 
 one reporting period, or one segment per sub-agent) and spawn a `research-subagent` for \
 each unit IN PARALLEL via the `task` tool. Give each its WHOLE slice — it makes ALL the \
 calls that unit needs and returns CONSOLIDATED dense findings (one coherent unit per \
-agent, NOT one call per agent). Spawn follow-ups for gaps. Sub-agents gather in their own \
+agent, NOT one call per agent). Each sub-agent returns ONE JSON object — "summary", \
+"findings" (each with its "source": use those sources for your [n] citations), and \
+"gaps". Read the findings out of the JSON and spawn follow-up sub-agents for non-empty \
+gaps; NEVER paste raw JSON into the report. Sub-agents gather in their own \
 context, so a large scan's raw data never piles up in yours.
 3. SYNTHESIZE. Combine your own findings and the sub-agents' into ONE comprehensive \
 markdown report and deliver it with `submit_report`.
@@ -160,9 +181,9 @@ orchestrator — typically a single entity, reporting period, or segment.
 - Make ALL the web/data calls your unit needs — use `web_search` and the data tools below \
 aggressively — then distill.
 - Your returned findings are the ONLY thing the orchestrator sees — it does NOT see your \
-raw tool output. Pack everything it needs into the summary: figures, definitions, named \
-entities, dates, and the source (URL for web; the EXACT internal source label for MCP \
-data) inline after each claim.
+raw tool output. Pack everything it needs into the RETURN FORMAT below: figures, \
+definitions, named entities, dates — every finding carrying its source (URL for web; \
+the EXACT internal source label for MCP data).
 - Be efficient: query with specific filters/limits rather than dumping everything, so you \
 stay well within context — then distill. Do NOT paste raw tool JSON or enumerate every row \
 back; return aggregates (counts, totals, top-N) and only the specific rows that answer your \
@@ -175,6 +196,8 @@ re-call the tool to page the same data.
 - Do NOT write the final report or a polished intro/conclusion. Return raw findings the \
 orchestrator will synthesize.
 """
+    + FINDINGS_FORMAT
+    + "\n"
     + _MCP_SLOT
 )
 

@@ -17,9 +17,10 @@ Scope: the orchestrator. Sub-agents run in their own sub-graphs and do not share
 middleware; the per-call result cap in ``events.py`` and ``mcp_max_concurrency`` bound
 them. A dedicated sub-agent budget is a follow-up.
 
-Token accounting reads ``usage_metadata`` (``models.py`` sets ``stream_usage=True`` so it
-is present even when streaming). When a model omits it we fall back to a chars/4 estimate
-so the ceiling still bites.
+Token accounting reads ``usage_metadata`` when the provider supplies it (``models.py``
+deliberately does NOT set ``stream_usage`` — see the note there about mis-merged trailing
+usage chunks). When it is absent we fall back to a chars/4 estimate so the ceiling still
+bites.
 """
 
 from __future__ import annotations

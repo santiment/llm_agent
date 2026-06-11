@@ -21,6 +21,7 @@ from .citations import ResearchOutputMiddleware
 from .clarify_fallback import ClarificationFallbackMiddleware
 from .completion import ForceCompletionMiddleware
 from .config import ResearchConfig
+from .findings_gate import SubagentFindingsMiddleware
 from .metering import RunMeter, UsageMeterMiddleware
 from .models import build_chat_model
 from .prompts import describe_mcp_sources, orchestrator_prompt, subagent_prompt
@@ -57,11 +58,18 @@ async def make_graph(config: dict | None = None):
     # across orchestrator AND sub-agents) and UsageMeterMiddleware (reads it at run end).
     meter = RunMeter()
 
-    # The orchestrator AND sub-researchers must be tool-capable (web_search + MCP),
-    # so both run on the research model. report_model is reserved for a future
-    # dedicated synthesis step — using it (often a cheap "nano") for the tool loop
-    # makes the agent skip tools and terminate early.
+    # Model tiering — smart orchestrator, cheap sub-agents. The orchestrator plans,
+    # delegates and synthesizes on research_model; sub-agents run their tool loops on
+    # subagent_model (defaults to research_model, so unset = single-model behavior).
+    # Both must be tool-capable. report_model is reserved for a future dedicated
+    # synthesis step — using it (often a cheap "nano") for the tool loop makes the
+    # agent skip tools and terminate early.
     research_model = build_chat_model(cfg.research_model, cfg)
+    # Always a fresh build — never alias the orchestrator's instance on string-equal
+    # ids, so future per-tier kwargs (temperature, callbacks) can't be silently shared.
+    subagent_model = build_chat_model(cfg.subagent_model, cfg)
+    log.info("models: research=%s subagent=%s utility=%s (utility unused until a "
+             "consumer lands)", cfg.research_model, cfg.subagent_model, cfg.utility_model)
 
     tools = []
     search = build_search_tool(cfg)
@@ -98,7 +106,9 @@ async def make_graph(config: dict | None = None):
     # A sub-agent owns ONE UNIT of research (e.g. a single entity / period / segment): it makes
     # ALL the calls that unit needs in its OWN context and returns only consolidated dense
     # findings. So a large scan's raw output stays isolated per unit instead of piling into
-    # the orchestrator's context.
+    # the orchestrator's context. It runs on the (typically cheaper) subagent_model; the
+    # findings gate bounces a malformed handoff back once so unsourced findings from a weak
+    # model don't poison the report's citations.
     subagent_spec = {
         "name": "research-subagent",
         "description": (
@@ -108,7 +118,8 @@ async def make_graph(config: dict | None = None):
         ),
         "system_prompt": subagent_prompt(mcp_prompt),
         "tools": tools,
-        "model": research_model,
+        "model": subagent_model,
+        "middleware": [SubagentFindingsMiddleware()],
     }
     if skills:  # give the sub-agent the same routing skill it needs to execute
         subagent_spec["skills"] = skills
