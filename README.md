@@ -104,7 +104,7 @@ Stream with `stream_mode=["messages","updates","custom"]` and `stream_subgraphs=
 | `search_results` | `id`, `query`, `ok`, `count`, `results[].{title,url,domain,snippet}` | Favicon + title grid |
 | `source` | `title`, `url`, `domain` | Live citation list entry |
 | `mcp_call` | `id`, `tool`, `args` | MCP call row |
-| `mcp_result` | `id`, `tool`, `ok`, `summary` | MCP result row |
+| `mcp_result` | `id`, `tool`, `ok`, `summary`; on failure `error_class` = `permanent` \| `transient` \| `unknown` (+ `repeated` when an identical failed call was answered locally) | MCP result row |
 | `skill` | `name`, `path`, `state` | "Skill applied: `<name>`" indicator |
 | `report` | `markdown` | Final answer (also in state `final_report`) |
 | `usage` | `tool_calls`, `total_tokens`, `model_calls`, `limits{}`, … | Per-run ledger at run end (no UI; logging / cost tracking) |
@@ -159,6 +159,7 @@ To keep bare local runs from attempting an auth-less connect at all, leave `DRA_
 - Each call is bounded by a shared semaphore (`mcp_max_concurrency`) so the agent's fan-out can't exhaust the server's file descriptors; 429s back off and retry within `mcp_rate_limit_max_wait` rather than failing immediately.
 - SSRF guard: only `http(s)` schemes are allowed and link-local / cloud-metadata targets are refused. Loopback / private hosts are allowed (the internal gateway uses them).
 - Connection failures emit `status: mcp_error` (with detail) instead of failing silently — one unreachable server does not take down the others or the run.
+- A FAILED tool call never kills the run: the error is returned to the model as the tool result with retry guidance, classified `permanent` (validation / unknown names — fix the arguments, never retry) vs `transient` (one retry ok). Servers can tag explicitly by prefixing the error message with `[permanent]` / `[transient]`; an identical retry of a permanently-failed call is answered locally without hitting the server.
 
 ## Code execution, large results & budgets
 

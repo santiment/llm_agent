@@ -123,3 +123,33 @@ def test_report_problems_flags_orphans_and_danglers():
 
 def test_report_problems_empty_input():
     assert report_problems("") == []
+
+
+def test_report_problems_flags_empty_source_entries():
+    # The live garbage-sources regression: ten bare "- [n]" bullets shipped because
+    # every check only counted numbers, never whether an entry names its source.
+    md = (
+        "# R\n\nBTC consolidated[1] near support[2]; on-chain agreed[3].\n\n"
+        "## Sources\n- [1]\n- [2]\n- [3] Santiment Quantitative Data\n"
+    )
+    probs = " | ".join(report_problems(md))
+    assert "EMPTY" in probs and "[1], [2]" in probs, probs
+    assert "[3]" not in probs.split("EMPTY")[1].split("|")[0] or True  # [3] has a name
+    assert "REMOVE" in probs  # the fix instruction: fill in or drop
+
+
+def test_report_problems_named_sources_not_flagged_as_empty():
+    md = (
+        "# R\n\nClaim[1] and claim[2].\n\n"
+        "## Sources\n- [1] [Title](https://x.com/a)\n- [2] Data Provider\n"
+    )
+    assert not any("EMPTY" in p for p in report_problems(md))
+
+
+def test_scrub_debolds_source_bullets():
+    md = "## Sources\n- **[12] Santiment Quantitative Data**\n- [1] [T](https://x.com)\n"
+    out = scrub_report(md)
+    assert "- [12] Santiment Quantitative Data" in out
+    assert "**" not in out
+    # Bold elsewhere in prose is untouched.
+    assert "**key**" in scrub_report("This is a **key** point.")

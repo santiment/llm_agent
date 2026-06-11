@@ -48,6 +48,13 @@ _BARE_TOOL = re.compile(r"\bget_[a-z0-9_]+")
 _BACKTICK_FIELD = re.compile(r"`[^`\n]*[a-z]+_[a-z]+[^`\n]*`")
 # A Sources bullet: "- [1] Label" / "- [1][2] Label" → captures the label after the numbers.
 _SRC_LABEL = re.compile(r"^\s*-?\s*(?:\[\d+\])+\s*(.+?)\s*$")
+# An EMPTY Sources bullet: numbers with nothing after them ("- [1]") — a citation that
+# points nowhere. Seen live from a mid-tier writer: ten bare [n] bullets shipped because
+# every other check only counts numbers, not whether an entry names its source.
+_SRC_EMPTY = re.compile(r"^\s*-\s*(?:\s*\[\d+\])+\s*$")
+# A fully-bolded Sources bullet ("- **[12] Santiment Quantitative Data**") — renders as a
+# shouting pseudo-heading in the report card; de-bold it (scrub), content unchanged.
+_SRC_BOLD = re.compile(r"(?m)^(\s*-\s*)\*\*((?:\[\d+\])+[^*\n]*)\*\*\s*$")
 
 
 def scrub_report(md: str) -> str:
@@ -60,6 +67,7 @@ def scrub_report(md: str) -> str:
         "the underlying data", out
     )  # bare get_a(args) / `get_a` left in prose
     out = _SERVER_SIDE.sub("", out)
+    out = _SRC_BOLD.sub(r"\1\2", out)  # de-bold "- **[12] Label**" source bullets
     out = _EMPTY_PAREN.sub("", out)
     out = _DANGLING_SEP.sub("", out)
     out = _SPACE_BEFORE_PUNCT.sub(r"\1", out)
@@ -139,6 +147,18 @@ def report_problems(md: str) -> list[str]:
                 f"{_fmt_cites(cite['danglers'])} are cited in the body but missing from the "
                 "Sources list — add them"
             )
+
+    empty = sorted(
+        {n for line in sources.splitlines() if _SRC_EMPTY.match(line)
+         for n in _CITE.findall(line)},
+        key=int)
+    if empty:
+        probs.append(
+            f"Sources entries {_fmt_cites(empty)} are EMPTY — a bare [n] that points nowhere. "
+            "Every Sources line must NAME its source: '[n] [Title](URL)' for a web source, or "
+            "the internal data source's name. If you no longer have a source's title/URL, "
+            "REMOVE that entry and its inline [n] citations instead of leaving it blank"
+        )
 
     dup = _duplicate_source_label(sources)
     if dup:
