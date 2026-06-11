@@ -23,7 +23,20 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from deep_research_agent.citations import ResearchOutputMiddleware
 from deep_research_agent.completion import ForceCompletionMiddleware
-from deep_research_agent.turn import NUDGE_NAME, RESUBMIT_NUDGE_NAME, current_turn
+from deep_research_agent.turn import (
+    NUDGE_NAME,
+    RESUBMIT_NUDGE_NAME,
+    current_turn,
+    is_json_object_dump,
+)
+
+FINDINGS_JSON = (
+    '{"summary": "Bitcoin sentiment collapsed to extreme bearish in June 2026.",\n'
+    ' "findings": [{"finding": "sentiment_balance_total hit -267.83 on Jun 5",\n'
+    '   "evidence": "Jun 1=-155.23 ... Jun 5=-267.83 (min)",\n'
+    '   "source": "Santiment fetch_metric_data_tool — sentiment_balance_total"}],\n'
+    ' "gaps": []}'
+)
 
 PROSE_REPORT = (
     "Here's the summary of the 5 Santiment MCP metric calls:\n\n"
@@ -75,6 +88,36 @@ def test_direct_answer_without_research_is_untouched() -> None:
     assert mw.after_model(state, None) is None
 
 
+def test_json_blob_ending_gets_a_rewrite_nudge_not_verbatim() -> None:
+    # The leak: a cheap orchestrator dumps the sub-agent findings JSON instead of a
+    # report. It must be steered to WRITE markdown, never "resubmit verbatim" (which
+    # would put JSON in the report).
+    mw = ForceCompletionMiddleware()
+    update = mw.after_model(_state(*_WORK, AIMessage(FINDINGS_JSON)), None)
+    assert update and update.get("jump_to") == "model", update
+    msg = update["messages"][0].content
+    assert getattr(update["messages"][0], "name", None) == RESUBMIT_NUDGE_NAME
+    assert "markdown report" in msg and "Do NOT submit the JSON" in msg
+    assert "verbatim" not in msg  # the prose path's word must not appear here
+
+
+def test_json_blob_in_fence_is_detected() -> None:
+    assert is_json_object_dump(f"```json\n{FINDINGS_JSON}\n```")
+    assert is_json_object_dump(FINDINGS_JSON)
+    assert not is_json_object_dump(PROSE_REPORT)
+    assert not is_json_object_dump("# Title\n\nProse with a { brace } inside.")
+
+
+def test_json_blob_is_not_salvaged_as_report() -> None:
+    mw = ResearchOutputMiddleware(max_tool_calls=80, max_total_tokens=1_000_000)
+    state, reason, _ = mw._classify(
+        via_tool=False, researched=True, salvaged=False, clarified=False,
+        calls=7, tokens=10_000, nudges=0)
+    # With the JSON blob refused by the salvage, the run has no report -> honest error,
+    # NOT a JSON blob masquerading as a delivered report.
+    assert state == "error" and reason == "ended_without_report"
+
+
 def test_resubmit_nudge_is_not_a_turn_boundary() -> None:
     nudge = HumanMessage("resubmit", name=RESUBMIT_NUDGE_NAME)
     msgs = [HumanMessage("real turn"), AIMessage(PROSE_REPORT), nudge, AIMessage("x")]
@@ -97,6 +140,9 @@ def test_salvage_classifies_as_done_not_error() -> None:
 
 if __name__ == "__main__":
     test_prose_report_gets_one_resubmit_nudge()
+    test_json_blob_ending_gets_a_rewrite_nudge_not_verbatim()
+    test_json_blob_in_fence_is_detected()
+    test_json_blob_is_not_salvaged_as_report()
     test_persistent_prose_is_accepted_after_the_nudge()
     test_short_intent_stub_still_gets_the_regular_nudge()
     test_direct_answer_without_research_is_untouched()

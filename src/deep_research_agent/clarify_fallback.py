@@ -12,15 +12,18 @@ works even with models that under-use tools.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
 from .completion import _called
 from .events import emit
 from .turn import current_turn, did_research_work, text_of
+
+log = logging.getLogger("deep_research_agent.clarify")
 
 _MAX_QUESTIONS = 5
 
@@ -64,3 +67,32 @@ class ClarificationFallbackMiddleware(AgentMiddleware):
             return None
         emit({"type": "clarification", "questions": questions})
         return None
+
+
+class ClarificationGuardMiddleware(AgentMiddleware):
+    """Clarification is a TRIAGE-only step (before research). This blocks
+    ``request_clarification`` once research has started this turn — so a weak model that
+    melts down mid-run (e.g. confused by empty sub-agent results) can't pop a nonsensical
+    clarification card after minutes of work. The tool never executes, so no
+    ``clarification`` event is emitted; the model is told to finish instead.
+    """
+
+    async def awrap_tool_call(self, request, handler):
+        # langchain renamed this field `call` -> `tool_call`; read both defensively.
+        call = getattr(request, "tool_call", None) or getattr(request, "call", None) or {}
+        name = call.get("name", "") if isinstance(call, dict) else getattr(call, "name", "")
+        if name != "request_clarification":
+            return await handler(request)
+        state = getattr(request, "state", None)
+        messages = state.get("messages") if isinstance(state, dict) else None
+        if not did_research_work(current_turn(messages or [])):
+            return await handler(request)  # legitimate up-front clarification — allow it
+        call_id = call.get("id", "") if isinstance(call, dict) else getattr(call, "id", "")
+        log.warning("CLARIFY GUARD: blocked request_clarification after research began")
+        return ToolMessage(
+            content=(
+                "You have ALREADY started researching this turn, so it is too late to ask "
+                "the user to clarify — no question was shown to them. Do NOT ask the user "
+                "anything. Finish with the data you have; if a sub-agent returned empty, "
+                "gather that piece yourself, then deliver the report via `submit_report`."),
+            tool_call_id=call_id or "", name="request_clarification")

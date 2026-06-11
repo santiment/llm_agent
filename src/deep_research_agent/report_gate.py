@@ -41,7 +41,9 @@ class ReportQualityGateMiddleware(AgentMiddleware):
         self._revisions = 0
 
     def _call_of(self, request):
-        call = getattr(request, "call", None) or {}
+        # langchain renamed this field `call` -> `tool_call`; read both so a version
+        # bump can't silently turn this gate into a no-op (it did exactly that once).
+        call = getattr(request, "tool_call", None) or getattr(request, "call", None) or {}
         if isinstance(call, dict):
             return call.get("name", ""), (call.get("args") or {}), call.get("id", "")
         return (getattr(call, "name", ""), getattr(call, "args", {}) or {},

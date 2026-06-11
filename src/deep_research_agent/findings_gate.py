@@ -134,6 +134,29 @@ def _problems(obj: dict | None) -> list[str]:
     return problems
 
 
+def _unit_label(messages: list) -> str:
+    """A short label for the sub-agent's assigned unit — the orchestrator's task
+    description, i.e. the first real (non-nudge) human message in the sub-agent's state."""
+    for m in messages:
+        if isinstance(m, HumanMessage) and getattr(m, "name", None) != FINDINGS_NUDGE_NAME:
+            return text_of(m.content).strip()[:140]
+    return ""
+
+
+def _emit_findings_event(messages: list, obj: dict) -> None:
+    """Emit the validated findings as a typed ``subagent_findings`` event for the UI to
+    render as a folded table. Rides the same ``custom`` stream as the sub-agent's
+    mcp_call rows; a host that ignores the type loses nothing."""
+    findings = obj.get("findings")
+    emit({
+        "type": "subagent_findings",
+        "unit": _unit_label(messages),
+        "summary": str(obj.get("summary") or ""),
+        "findings": findings if isinstance(findings, list) else [],
+        "gaps": obj.get("gaps") if isinstance(obj.get("gaps"), list) else [],
+    })
+
+
 class SubagentFindingsMiddleware(AgentMiddleware):
     """Attached to the research sub-agent (``subagent_spec["middleware"]``), NOT the
     orchestrator. Stateless across invocations on purpose — one instance serves every
@@ -164,6 +187,10 @@ class SubagentFindingsMiddleware(AgentMiddleware):
                 "findings were returned without a single tool call this run — gather data "
                 "with the tools first; findings must come from tool results, not memory")
         if not problems:
+            # Accepted, valid findings — surface them as a structured event so the UI can
+            # render a folded findings table instead of the raw JSON that streams as
+            # thinking. Best-effort (no-op offline); never blocks the handoff.
+            _emit_findings_event(messages, obj)
             return None
 
         if count_nudges(messages, FINDINGS_NUDGE_NAME) >= MAX_FINDINGS_NUDGES:

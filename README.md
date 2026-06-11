@@ -86,12 +86,12 @@ Models are chosen by NAME only: `DRA_MODEL_TIER=mid` (or per-run `configurable.m
 
 | Tier | Research (orchestrator) | Sub-agent | Utility |
 |---|---|---|---|
-| `extra-low` | `deepseek/deepseek-v4-flash` (0.10/0.20) | `openai/gpt-oss-120b` (0.04/0.18) | `openai/gpt-oss-20b` (0.03/0.14) |
+| `extra-low` | `deepseek/deepseek-v4-flash` (0.10/0.20) | `deepseek/deepseek-v4-flash` (0.10/0.20) | `qwen/qwen3-30b-a3b-instruct-2507` (0.05/0.19) |
 | `low` | `deepseek/deepseek-v4-pro` (0.44/0.87) | `deepseek/deepseek-v4-flash` (0.10/0.20) | `deepseek/deepseek-v4-flash` |
 | `mid` | `google/gemini-3.5-flash` (1.50/9) | `google/gemini-2.5-flash` (0.30/2.50) | `deepseek/deepseek-v4-flash` |
 | `high` | `anthropic/claude-opus-4.8` (5/25) | `anthropic/claude-sonnet-4.6` (3/15) | `anthropic/claude-haiku-4.5` (1/5) |
 
-`extra-low` is rock bottom — cheapest tool-capable models everywhere (~$0.02 of orchestrator spend per medium run). Expect noticeably weaker planning and earlier give-ups; the force-completion / findings-gate / budget backstops keep runs honest, not great. For demos, smoke tests, and high-volume low-stakes scheduled ticks — not for decisions. `high` deliberately keeps sub-agent/utility at sonnet/haiku tier — Opus plans and synthesizes only; an Opus sub-agent fleet would defeat the tiering. To add your own packaging: add an entry to `MODEL_TIERS` (code), pick a name, and document it in this table — callers then select it with `DRA_MODEL_TIER=<name>`. An unknown tier name is ignored with a warning (plain defaults apply).
+`extra-low` is rock bottom — `deepseek-v4-flash` for both tool-loop roles (it's proven reliable here as this tier's orchestrator and the `low` tier's sub-agent, unlike the cheaper-but-flakier open-weight options that gave up mid-loop), so the sub-agent is never pricier than the orchestrator. Delegation still pays off via context isolation. ~$0.02 of orchestrator spend per medium run. Expect noticeably weaker planning and earlier give-ups than higher tiers; the force-completion / findings-gate / budget backstops keep runs honest, not great. For demos, smoke tests, and high-volume low-stakes scheduled ticks — not for decisions. `high` deliberately keeps sub-agent/utility at sonnet/haiku tier — Opus plans and synthesizes only; an Opus sub-agent fleet would defeat the tiering. To add your own packaging: add an entry to `MODEL_TIERS` (code), pick a name, and document it in this table — callers then select it with `DRA_MODEL_TIER=<name>`. An unknown tier name is ignored with a warning (plain defaults apply).
 
 ## Streaming event protocol
 
@@ -106,6 +106,7 @@ Stream with `stream_mode=["messages","updates","custom"]` and `stream_subgraphs=
 | `mcp_call` | `id`, `tool`, `args` | MCP call row |
 | `mcp_result` | `id`, `tool`, `ok`, `summary`; on failure `error_class` = `permanent` \| `transient` \| `unknown` (+ `repeated` when an identical failed call was answered locally) | MCP result row |
 | `skill` | `name`, `path`, `state` | "Skill applied: `<name>`" indicator |
+| `subagent_findings` | `unit`, `summary`, `findings[].{finding,evidence,source}`, `gaps[]` | Folded findings table (one per sub-agent); emitted when a sub-agent's findings validate |
 | `report` | `markdown` | Final answer (also in state `final_report`) |
 | `usage` | `tool_calls`, `total_tokens`, `model_calls`, `limits{}`, … | Per-run ledger at run end (no UI; logging / cost tracking) |
 | `status` | `state` = `mcp_ready` \| `mcp_error` \| `budget_soft` \| `budget_halt` \| `revising` \| `done` | Lifecycle / errors |

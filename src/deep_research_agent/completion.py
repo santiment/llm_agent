@@ -28,6 +28,7 @@ from .turn import (
     count_nudges,
     current_turn,
     did_research_work,
+    is_json_object_dump,
     text_of,
 )
 
@@ -52,6 +53,17 @@ _RESUBMIT = (
     "process view. Call `submit_report(report_markdown=...)` NOW with EXACTLY the text "
     "of your previous message, verbatim — change NOTHING, add NOTHING, do not apologize "
     "or comment. Just make the tool call."
+)
+
+# For the model that dumped a raw JSON object (often the sub-agent findings schema it
+# echoed) instead of a report: do NOT tell it to resubmit verbatim — that would put JSON
+# in the report. Tell it to WRITE the report from that data.
+_RESUBMIT_JSON = (
+    "You output a raw JSON object as your answer. That findings JSON is the sub-agents' "
+    "internal format for handing data to you — it is NOT the deliverable, and the user "
+    "must never see it. Write a READER-FACING markdown report FROM that data — prose, "
+    "with a single `#` title, inline [n] citations, and a `## Sources` section — and "
+    "deliver it with `submit_report(report_markdown=...)`. Do NOT submit the JSON itself."
 )
 
 
@@ -115,18 +127,26 @@ class ForceCompletionMiddleware(AgentMiddleware):
         # OUTSIDE the report channel (skipping the quality gate). One mechanical
         # resubmit-verbatim instruction; if the model still answers in prose, accept and
         # let the salvage deliver it (repeat nagging is what drives apology loops).
-        if _looks_delivered(content):
+        # A raw JSON blob (often the echoed findings schema) or a delivered-looking prose
+        # report ended the turn instead of a submit_report call. Both get ONE resubmit
+        # nudge, then are accepted (prose is salvaged; a JSON blob is dropped, not shown).
+        # JSON is its own branch — length-independent (a dump is never valid) — and gets a
+        # REWRITE-to-markdown instruction, NOT "resubmit verbatim" (which would ship JSON).
+        jsonish = is_json_object_dump(content)
+        if jsonish or _looks_delivered(content):
             if count_nudges(turn, RESUBMIT_NUDGE_NAME) >= MAX_RESUBMIT_NUDGES:
                 log.warning(
-                    "FORCE-COMPLETION: prose report persisted after resubmit nudge; "
-                    "accepting — citations salvage will deliver it")
+                    "FORCE-COMPLETION: %s answer persisted after resubmit nudge; accepting "
+                    "(prose is salvaged; a JSON blob is dropped, not shown as a report)",
+                    "JSON" if jsonish else "prose")
                 return None
+            msg = _RESUBMIT_JSON if jsonish else _RESUBMIT
             log.warning(
-                "FORCE-COMPLETION resubmit nudge: model wrote the report as plain text; "
-                "instructing a verbatim submit_report (content=%r)", content[:120])
+                "FORCE-COMPLETION resubmit nudge (%s): model answered without submit_report "
+                "(content=%r)", "json" if jsonish else "prose", content[:120])
             return {
                 "jump_to": "model",
-                "messages": [HumanMessage(content=_RESUBMIT, name=RESUBMIT_NUDGE_NAME)],
+                "messages": [HumanMessage(content=msg, name=RESUBMIT_NUDGE_NAME)],
             }
         # Per-turn nudge cap: count nudges already injected this turn (self-resetting).
         nudges = count_nudges(turn, NUDGE_NAME)

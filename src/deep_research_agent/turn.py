@@ -14,6 +14,9 @@ start of a new user turn (and so the per-turn nudge count self-resets each turn)
 
 from __future__ import annotations
 
+import json
+import re
+
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 NUDGE_NAME = "dra_completion_nudge"
@@ -96,6 +99,27 @@ def count_nudges(messages: list, name: str) -> int:
     """How many synthetic nudge HumanMessages with ``name`` were injected this turn."""
     return sum(1 for m in messages
                if isinstance(m, HumanMessage) and getattr(m, "name", None) == name)
+
+
+_JSON_FENCE = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.DOTALL)
+
+
+def is_json_object_dump(text: str) -> bool:
+    """True when a message is essentially a raw JSON object (optionally in a ```json
+    fence) rather than prose — e.g. a weak orchestrator echoing the sub-agent findings
+    schema ({"summary":…, "findings":[…]}) instead of writing a report. Used to steer it
+    to a markdown report, and to refuse salvaging the blob AS a report."""
+    t = (text or "").strip()
+    m = _JSON_FENCE.search(t)
+    if m:
+        t = m.group(1).strip()
+    if not t.startswith("{"):
+        return False
+    try:
+        return isinstance(json.loads(t), dict)
+    except ValueError:
+        # A streamed/truncated blob won't fully parse — sniff the findings shape instead.
+        return bool(re.match(r'\{\s*"(summary|findings)"\s*:', t))
 
 
 def text_of(content) -> str:

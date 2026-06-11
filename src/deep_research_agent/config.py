@@ -41,36 +41,42 @@ _BLOCKED_MCP_HOSTNAMES = {"metadata", "metadata.google.internal"}
 # bare checkout can't silently burn money; production callers opt UP explicitly.
 # To add a packaging: add an entry here, pick a name, document it in the README's
 # Model tiers table — callers then just set model_tier=<name>.
-# OpenRouter slugs; prices are $/M input/output as of 2026-06 — re-check when editing.
+# OpenRouter slugs. The inline ($in/$out per 1M tokens) figures were verified live on
+# 2026-06-11 — they DRIFT; re-check on OpenRouter before relying on them or editing.
 MODEL_TIERS: dict[str, dict[str, str]] = {
-    # Rock bottom: cheapest tool-capable models everywhere (~$0.02 orchestrator per
-    # medium run). A flash-class orchestrator WILL plan worse and quit earlier — the
-    # force-completion / findings-gate / budget backstops keep runs honest, not great.
-    # For demos, smoke tests, and high-volume low-stakes ticks; not for decisions.
+    # Rock bottom: deepseek-v4-flash for both tool-loop roles — it's already this tier's
+    # orchestrator AND the `low` tier's sub-agent, so it's proven reliable at the job
+    # here (unlike gpt-oss, which gave up and returned empty findings). Same model for
+    # both means the sub-agent is never pricier than the orchestrator, and delegation
+    # still pays off via context isolation (raw data stays in sub-agent contexts).
+    # Utility is a cheaper Qwen for input-heavy map/extract. The orchestrator still plans
+    # worse + quits earlier than higher tiers — the force-completion / findings-gate /
+    # budget backstops keep runs honest, not great. Demos, smoke tests, high-volume
+    # low-stakes ticks; not for decisions.
     "extra-low": {
-        "research_model": "deepseek/deepseek-v4-flash",
-        "subagent_model": "openai/gpt-oss-120b",
-        "utility_model": "openai/gpt-oss-20b",
+        "research_model": "deepseek/deepseek-v4-flash",            # $0.10 / $0.20
+        "subagent_model": "deepseek/deepseek-v4-flash",            # $0.10 / $0.20
+        "utility_model": "qwen/qwen3-30b-a3b-instruct-2507",       # $0.05 / $0.19
     },
-    # Cheapest sane agent: ~$0.44/0.87 research, ~$0.10/0.20 below. deepseek-v4-flash
+    # Cheapest sane agent: v4-pro orchestrator over v4-flash workers. deepseek-v4-flash
     # streaming is force-disabled via streaming_denylist (known off-spec chunks).
     "low": {
-        "research_model": "deepseek/deepseek-v4-pro",
-        "subagent_model": "deepseek/deepseek-v4-flash",
-        "utility_model": "deepseek/deepseek-v4-flash",
+        "research_model": "deepseek/deepseek-v4-pro",              # $0.44 / $0.87
+        "subagent_model": "deepseek/deepseek-v4-flash",            # $0.10 / $0.20
+        "utility_model": "deepseek/deepseek-v4-flash",             # $0.10 / $0.20
     },
-    # The value sweet spot: current-gen flash orchestrator (~$1.50/9), cheap workers.
+    # The value sweet spot: current-gen flash orchestrator, cheaper flash workers.
     "mid": {
-        "research_model": "google/gemini-3.5-flash",
-        "subagent_model": "google/gemini-2.5-flash",
-        "utility_model": "deepseek/deepseek-v4-flash",
+        "research_model": "google/gemini-3.5-flash",               # $1.50 / $9.00
+        "subagent_model": "google/gemini-2.5-flash",               # $0.30 / $2.50
+        "utility_model": "deepseek/deepseek-v4-flash",             # $0.10 / $0.20
     },
     # Best research quality. Opus plans and synthesizes ONLY — sub-agent/utility stay
     # sonnet/haiku tier on purpose (an Opus sub-agent fleet defeats the tiering).
     "high": {
-        "research_model": "anthropic/claude-opus-4.8",
-        "subagent_model": "anthropic/claude-sonnet-4.6",
-        "utility_model": "anthropic/claude-haiku-4.5",
+        "research_model": "anthropic/claude-opus-4.8",             # $5.00 / $25.00
+        "subagent_model": "anthropic/claude-sonnet-4.6",           # $3.00 / $15.00
+        "utility_model": "anthropic/claude-haiku-4.5",             # $1.00 / $5.00
     },
 }
 

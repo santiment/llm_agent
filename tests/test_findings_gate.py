@@ -138,6 +138,29 @@ def test_findings_nudge_is_not_a_turn_boundary() -> None:
     assert turn[0] is msgs[0], "findings nudge must not start a new turn"
 
 
+def test_accepted_findings_emit_structured_event(monkeypatch=None) -> None:
+    # On clean accept, a `subagent_findings` event fires carrying the parsed object +
+    # a unit label (the sub-agent's task assignment) — that's what the UI renders.
+    import deep_research_agent.findings_gate as fg
+
+    captured = []
+    orig = fg.emit
+    fg.emit = lambda ev: captured.append(ev)
+    try:
+        mw = SubagentFindingsMiddleware()
+        state = _state(HumanMessage("Research BTC on-chain activity"),
+                       ToolMessage("rows", tool_call_id="1"), AIMessage(VALID))
+        assert mw.after_model(state, None) is None  # accepted
+    finally:
+        fg.emit = orig
+
+    ev = next((e for e in captured if e.get("type") == "subagent_findings"), None)
+    assert ev, captured
+    assert ev["unit"] == "Research BTC on-chain activity"
+    assert ev["summary"] and isinstance(ev["findings"], list) and ev["findings"]
+    assert ev["findings"][0]["source"] == "Data Provider"
+
+
 if __name__ == "__main__":
     test_valid_findings_bare_fenced_and_prose_wrapped()
     test_empty_findings_list_is_allowed()
@@ -149,4 +172,5 @@ if __name__ == "__main__":
     test_valid_json_and_tool_calls_pass_through()
     test_provenance_findings_without_tools_bounce()
     test_findings_nudge_is_not_a_turn_boundary()
+    test_accepted_findings_emit_structured_event()
     print("OK — structured-findings gate verified.")

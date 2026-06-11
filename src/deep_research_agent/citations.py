@@ -27,8 +27,8 @@ from typing_extensions import NotRequired
 from .completion import MAX_NUDGES, _called, _looks_delivered
 from .events import domain_of, emit
 from .report_hygiene import lint_citations, scrub_report
-from .turn import (NUDGE_NAME, count_nudges, current_turn, did_research_work, text_of,
-                   tokens_in, tool_calls_in)
+from .turn import (NUDGE_NAME, count_nudges, current_turn, did_research_work,
+                   is_json_object_dump, text_of, tokens_in, tool_calls_in)
 
 log = logging.getLogger("deep_research_agent.citations")
 
@@ -102,7 +102,10 @@ class ResearchOutputMiddleware(AgentMiddleware):
                     txt = text_of(m.content)
                     if not txt.strip():
                         continue
-                    if _looks_delivered(txt):
+                    # Promote real prose only. A raw JSON blob (e.g. echoed findings
+                    # schema) is NOT a report — showing it as one is the garbage we're
+                    # guarding against; leave it unsalvaged so the run flags as an error.
+                    if _looks_delivered(txt) and not is_json_object_dump(txt):
                         report, salvaged = txt, True
                     break
 

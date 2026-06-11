@@ -18,7 +18,7 @@ from deepagents.backends.state import StateBackend
 
 from .budget import BudgetMiddleware
 from .citations import ResearchOutputMiddleware
-from .clarify_fallback import ClarificationFallbackMiddleware
+from .clarify_fallback import ClarificationFallbackMiddleware, ClarificationGuardMiddleware
 from .completion import ForceCompletionMiddleware
 from .config import ResearchConfig
 from .findings_gate import SubagentFindingsMiddleware
@@ -144,6 +144,9 @@ async def make_graph(config: dict | None = None):
             max_total_tokens=cfg.max_total_tokens,
         ),
         SkillUsageMiddleware(),
+        # Block request_clarification once research has started (TRIAGE-only), then the
+        # fallback that surfaces narrated questions as the clarification card.
+        ClarificationGuardMiddleware(),
         ClarificationFallbackMiddleware(),
         # Per-run usage ledger → `usage` event + "RESEARCH USAGE" log line.
         UsageMeterMiddleware(
