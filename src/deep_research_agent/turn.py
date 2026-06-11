@@ -24,7 +24,10 @@ NUDGE_NAME = "dra_completion_nudge"
 # that ever calls current_turn() on that state can't misread the bounce as a turn start.
 BUDGET_NUDGE_NAME = "dra_budget_nudge"
 FINDINGS_NUDGE_NAME = "dra_findings_format_nudge"
-_SYNTHETIC_NUDGE_NAMES = {NUDGE_NAME, BUDGET_NUDGE_NAME, FINDINGS_NUDGE_NAME}
+RESUBMIT_NUDGE_NAME = "dra_resubmit_nudge"
+_SYNTHETIC_NUDGE_NAMES = {
+    NUDGE_NAME, BUDGET_NUDGE_NAME, FINDINGS_NUDGE_NAME, RESUBMIT_NUDGE_NAME,
+}
 
 # Terminal/control tools — invoking these is how a turn *ends*, not "research work".
 _TERMINAL_TOOLS = {"submit_report", "request_clarification"}

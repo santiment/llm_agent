@@ -22,17 +22,36 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware, hook_config
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from .turn import NUDGE_NAME, current_turn, did_research_work, text_of
+from .turn import (
+    NUDGE_NAME,
+    RESUBMIT_NUDGE_NAME,
+    count_nudges,
+    current_turn,
+    did_research_work,
+    text_of,
+)
 
 log = logging.getLogger("deep_research_agent.completion")
 
 MAX_NUDGES = 4
+MAX_RESUBMIT_NUDGES = 1
 
 _NUDGE = (
     "You ended mid-research without delivering the report. Do NOT describe what you will "
     "do next — act now. Either call the appropriate research tool to continue, or, if "
     "research is complete, call `submit_report(report_markdown=...)` with the full report. "
     "A message that only states intent is not allowed."
+)
+
+# For the model that wrote the whole report as plain chat: a mechanical, verbatim-copy
+# instruction (easy even for flash-tier models). One shot — if it still answers in
+# prose, the citations salvage delivers the text rather than nagging into apology loops.
+_RESUBMIT = (
+    "Your answer was NOT delivered to the user — after research, the report must be "
+    "delivered via the `submit_report` tool; plain messages are hidden in the research-"
+    "process view. Call `submit_report(report_markdown=...)` NOW with EXACTLY the text "
+    "of your previous message, verbatim — change NOTHING, add NOTHING, do not apologize "
+    "or comment. Just make the tool call."
 )
 
 
@@ -91,17 +110,26 @@ class ForceCompletionMiddleware(AgentMiddleware):
         # Only an ending that follows real research work is a premature mid-research stall.
         if not did_research_work(turn):
             return None
-        # The model already produced a substantial report/answer as plain text (the
-        # citations fallback will surface it). Don't nag it to "deliver the report" —
-        # that is what drives the apology loop. Only short bare-intent stubs get nudged.
+        # The model produced a substantial report/answer as plain text. Don't accept it
+        # silently — the text would only reach the user via the citations salvage,
+        # OUTSIDE the report channel (skipping the quality gate). One mechanical
+        # resubmit-verbatim instruction; if the model still answers in prose, accept and
+        # let the salvage deliver it (repeat nagging is what drives apology loops).
         if _looks_delivered(content):
-            return None
+            if count_nudges(turn, RESUBMIT_NUDGE_NAME) >= MAX_RESUBMIT_NUDGES:
+                log.warning(
+                    "FORCE-COMPLETION: prose report persisted after resubmit nudge; "
+                    "accepting — citations salvage will deliver it")
+                return None
+            log.warning(
+                "FORCE-COMPLETION resubmit nudge: model wrote the report as plain text; "
+                "instructing a verbatim submit_report (content=%r)", content[:120])
+            return {
+                "jump_to": "model",
+                "messages": [HumanMessage(content=_RESUBMIT, name=RESUBMIT_NUDGE_NAME)],
+            }
         # Per-turn nudge cap: count nudges already injected this turn (self-resetting).
-        nudges = sum(
-            1
-            for m in turn
-            if isinstance(m, HumanMessage) and getattr(m, "name", None) == NUDGE_NAME
-        )
+        nudges = count_nudges(turn, NUDGE_NAME)
         if nudges >= MAX_NUDGES:
             # Prime "why did research stop early?" cause: the model kept ending with a bare
             # intent message and never called a tool or submit_report, so after MAX_NUDGES we

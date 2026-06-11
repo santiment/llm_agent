@@ -142,6 +142,10 @@ class ResearchOutputMiddleware(AgentMiddleware):
         }
         if end_state == "error":
             log.error("RUN ENDED WITHOUT REPORT: %s", summary)
+        elif reason == "report_salvaged":
+            # Delivered, but through the recovery path — count these per model/tier; a
+            # rising rate means the resubmit nudge isn't landing on that model.
+            log.warning("RUN END (%s): %s", reason, summary)
         else:
             log.info("RUN END (%s): %s", reason, summary)
         # Non-fatal quality signal: a delivered report whose inline [n] and Sources list don't
@@ -158,9 +162,9 @@ class ResearchOutputMiddleware(AgentMiddleware):
                   calls: int, tokens: int, nudges: int) -> tuple[str, str, str]:
         """Map the turn's end-state to ``(status_state, reason_code, human_detail)``.
 
-        Order matters: the first matching cause wins, most-specific first. A turn that did
-        research but never called ``submit_report`` is always an ``error`` — that is the
-        failure the operator wants surfaced, with the precise reason it happened."""
+        Order matters: the first matching cause wins, most-specific first. A research turn
+        with no report at all is an ``error``; a salvaged plain-text report counts as
+        ``done`` (the user got the content) under its own reason so it stays countable."""
         if via_tool:
             return "done", "report_delivered", "submit_report delivered the final report."
         if clarified:
@@ -177,8 +181,11 @@ class ResearchOutputMiddleware(AgentMiddleware):
                     f"Model kept stopping mid-research with no tool call; force-completion "
                     f"gave up after {MAX_NUDGES} nudges and it never called submit_report.")
         if salvaged:
-            return ("error", "report_as_plaintext",
-                    "Model wrote the report as a plain message instead of calling "
-                    "submit_report; salvaged it, but the delivery channel was wrong.")
+            # The content DID reach the user (recovered + scrubbed + emitted as the
+            # report) — a recovery, not a failure. Surfaced as "done" with its own
+            # reason so the UI stays calm while operators can still count occurrences.
+            return ("done", "report_salvaged",
+                    "Report recovered from a plain chat message (the model skipped "
+                    "submit_report despite the resubmit nudge); delivered normally.")
         return ("error", "ended_without_report",
                 "Turn ended after research with no submit_report and no salvageable report.")
