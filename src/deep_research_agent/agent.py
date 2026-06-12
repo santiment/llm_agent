@@ -27,7 +27,9 @@ from .models import build_chat_model
 from .prompts import describe_mcp_sources, orchestrator_prompt, subagent_prompt
 from .report_gate import ReportQualityGateMiddleware
 from .skill_usage import SkillUsageMiddleware
+from .events import instrument_tool
 from .tools.clarify import build_clarify_tool
+from .tools.custom import load_custom_tools
 from .tools.mcp import load_mcp_tools
 from .tools.report import build_submit_report_tool
 from .tools.search import build_search_tool
@@ -102,6 +104,16 @@ async def make_graph(config: dict | None = None):
     offload_sink = sandbox if (sandbox is not None and cfg.offload_results) else None
     tools.extend(await load_mcp_tools(cfg, meter, offload_sink=offload_sink))
     mcp_prompt = cfg.mcp_prompt or describe_mcp_sources(cfg.mcp_servers)
+
+    # Deployment-specific tools dropped into the gitignored custom_tools/ dir (no edits to
+    # this generic codebase). Same instrumentation as MCP tools, so a large result offloads
+    # to the sandbox file the `execute` tool reads back. Available to BOTH orchestrator and
+    # sub-agents (they share `tools`); the model discovers each via its own name/description.
+    for custom in load_custom_tools(cfg):
+        tools.append(instrument_tool(
+            custom, kind="tool",
+            max_result_chars=cfg.max_result_chars, max_result_rows=cfg.max_result_rows,
+            meter=meter, offload_sink=offload_sink, offload_dir=cfg.offload_dir))
 
     # A sub-agent owns ONE UNIT of research (e.g. a single entity / period / segment): it makes
     # ALL the calls that unit needs in its OWN context and returns only consolidated dense

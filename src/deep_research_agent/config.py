@@ -30,6 +30,12 @@ def _default_skills_dir() -> str:
     ``src/deep_research_agent/config.py`` -> project root is two parents up."""
     return str(Path(__file__).resolve().parents[2] / "skills")
 
+
+def _default_custom_tools_dir() -> str:
+    """The repo's ``./custom_tools`` directory — a gitignored drop-in folder for
+    deployment-specific tools. Same project-root anchoring as the skills dir."""
+    return str(Path(__file__).resolve().parents[2] / "custom_tools")
+
 # Hostnames that resolve to cloud-metadata endpoints — never a legitimate MCP target.
 _BLOCKED_MCP_HOSTNAMES = {"metadata", "metadata.google.internal"}
 
@@ -188,6 +194,11 @@ class ResearchConfig:
     # (tool-name prefix), ``url``, ``headers`` and optional ``tools`` allow-list.
     mcp_servers: list[dict] = field(default_factory=list)
     mcp_prompt: str = ""
+    # Gitignored drop-in directory of deployment-specific tools. Each ``*.py`` file that
+    # defines ``build_tools(cfg)`` (or ``build_tool(cfg)``) returning LangChain tool(s) is
+    # auto-loaded into the agent's tool list — no edits to this generic codebase. Absent
+    # dir = no custom tools. Override via ``DRA_CUSTOM_TOOLS_DIR``.
+    custom_tools_dir: str = ""
     # Directory of agent skills (folders each containing a SKILL.md). Loaded read-only
     # at startup. For now a single local dir; a future loader will layer system-wide +
     # per-user skills here.
@@ -352,6 +363,8 @@ class ResearchConfig:
                 or 120.0),
             mcp_servers=mcp_servers,
             mcp_prompt=c.get("mcp_prompt") or "",
+            custom_tools_dir=(c.get("custom_tools_dir") or _env("DRA_CUSTOM_TOOLS_DIR")
+                              or _default_custom_tools_dir()),
             skills_dir=c.get("skills_dir") or _env("DRA_SKILLS_DIR") or _default_skills_dir(),
             streaming=(
                 bool(c["streaming"]) if "streaming" in c

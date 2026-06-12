@@ -10,3 +10,6 @@ __pycache__/
 
 # uv
 .uv/
+
+# Deployment-specific drop-in tools (loaded at runtime, not committed)
+# custom_tools/

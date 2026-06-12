@@ -3,6 +3,7 @@
 # One-command dev bring-up for the deep-research-agent (LangGraph) service.
 #   ./run.sh                 sync deps, then start the LangGraph dev server on :2024
 #   ./run.sh ask "<question>" stream one research run against a RUNNING server
+#                            (long prompt? use a file: ./run.sh ask @prompt.txt)
 #   ./run.sh smoke           ask a canned question against a RUNNING server
 #   ./run.sh test            run the offline pytest suite (no API keys / network)
 #   ./run.sh --sync          force `uv sync --extra dev`, then start the server
@@ -27,7 +28,7 @@ case "${1:-up}" in
   ask)
     need_uv
     shift
-    [ "$#" -ge 1 ] || die 'usage: ./run.sh ask "<question>"'
+    [ "$#" -ge 1 ] || die 'usage: ./run.sh ask "<question>" | ./run.sh ask @prompt.txt'
     echo "▶ streaming run against ${BASE} (server must be up — ./run.sh)…"
     exec uv run python examples/client.py "$*"
     ;;

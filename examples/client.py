@@ -1,7 +1,10 @@
 """Minimal consumer — any app talks to the agent like this. No package import
 needed; it's just HTTP/SSE against the LangGraph server.
 
-    python examples/client.py "What are the recent trends across the tracked entities, and where can I find supporting data?"
+    python examples/client.py "What are the recent trends...?"   # inline
+    python examples/client.py @prompt.txt                        # read a file (long prompts)
+    python examples/client.py -                                  # read STDIN
+    cat prompt.txt | python examples/client.py                   # piped STDIN
 
 Shows the live event protocol: phase / search / mcp / sources, assistant
 thinking tokens, and the final report. Mirrors what your frontend renders.
@@ -9,8 +12,30 @@ thinking tokens, and the final report. Mirrors what your frontend renders.
 
 import asyncio
 import sys
+from pathlib import Path
 
 from langgraph_sdk import get_client
+
+_DEFAULT_Q = "Give me a deep research report on BDCs."
+
+
+def read_question(argv: list[str]) -> str:
+    """Resolve the prompt from an arg, an ``@file``, ``-``/pipe (STDIN), or default.
+
+    Long prompts are painful to paste into a single-line box (or quote on the
+    shell) — keep them in a file and pass ``@prompt.txt``, or pipe them in.
+    """
+    if len(argv) > 1 and argv[1] not in ("", "-"):
+        arg = argv[1]
+        if arg.startswith("@"):
+            return Path(arg[1:]).expanduser().read_text(encoding="utf-8").strip()
+        return arg
+    # No usable arg: read STDIN if it's piped or explicitly requested with "-".
+    if (len(argv) > 1 and argv[1] == "-") or not sys.stdin.isatty():
+        piped = sys.stdin.read().strip()
+        if piped:
+            return piped
+    return _DEFAULT_Q
 
 
 async def main(question: str) -> None:
@@ -56,5 +81,4 @@ async def main(question: str) -> None:
 
 
 if __name__ == "__main__":
-    q = sys.argv[1] if len(sys.argv) > 1 else "Give me a deep research report on BDCs."
-    asyncio.run(main(q))
+    asyncio.run(main(read_question(sys.argv)))
