@@ -9,8 +9,9 @@ description: >-
   vs a trailing baseline (percentiles, not adjectives), (2) organic vs manufactured (copies,
   channel/author concentration, acceleration shape), (3) narrative-vs-chain divergence (the crowd's
   concrete claims tested against on-chain flows), (4) crowd price-level clusters (the support /
-  targets people actually name). Delivers a positioning VERDICT with denominators and source links,
-  then answers follow-up questions on the same pulled data.
+  targets people actually name). Surfaces the dominant trending topics driving the spike (the "what
+  happened") and delivers a positioning VERDICT with denominators and source links, then answers
+  follow-up questions on the same pulled data.
 ---
 
 # Crowd positioning
@@ -71,10 +72,13 @@ social volume to find the peak) and **state the window you chose**.
    organic share from `copies`, top-channel / top-author concentration, and the acceleration shape
    from `volume_curve`. Recipe in `signals.md`. Output a percentage and a one-word verdict.
 
-4. **Extract the crowd's claims and price levels (signals 3 & 4).** From `trend_words` + the
-   `head`/`poles` text, list the 3–6 concrete, *checkable* claims (named actors, flows, events,
-   targets) and ignore vague mood. For monster windows, partition the messages file by `source` and
-   spawn one `research-subagent` per slice (`task`) to pull claims + verbatim quotes in parallel,
+4. **Discover the topics, claims, and price levels.** Start from the full-population `trend_words`
+   — that IS the discovery: rank the dominant themes by their count/share of volume (the number
+   carries it, the sampled text only explains each). Group raw trend words into 3–6 themes and give
+   each one line of what's actually being said. From those themes + the `head`/`poles` text, pull
+   the concrete, *checkable* claims (named actors, flows, events, targets) for signal 3 and drop
+   vague mood. For monster windows, partition the messages file by `source` and spawn one
+   `research-subagent` per slice (`task`) to extract themes + claims + verbatim quotes in parallel,
    then merge. In `execute`, extract price numbers from message text and cluster them into levels
    (recipe in `signals.md`).
 
@@ -98,6 +102,11 @@ Lead with the verdict. Every bullet carries its denominator/baseline.
 - **POSITIONING VERDICT** — 1–2 lines: direction (long / short / split), conviction, *and the
   extremeness percentile*. "Crowd is aggressively long $X at a 94th-pct social spike; 68% organic,
   accelerating; chain confirms accumulation." This is the line they paid for — make it stand alone.
+- **WHAT'S DRIVING IT** — the 3–6 dominant topics from the full-population `trend_words`, each as
+  *theme → share/count of volume → one line of what's being said*. This answers "what happened"; it
+  is the discovery layer, so it leads the body. Keep it signal-flavored — every theme carries its
+  number; rank by share, not by how interesting the quote is. Flag any topic where the crowd splits
+  (both sides, which has more voices) using the `head`/`poles` strata.
 - **EXTREME?** — social volume Nth pct of trailing 90d (z=…); dominance Nth pct; sentiment skew
   N% bull vs M% trailing median. Spike vs baseline, always.
 - **ORGANIC?** — % organic (unique/total), top-3 channels = N% of volume, max copies ×N,
