@@ -115,9 +115,12 @@ Lead with the verdict. Every bullet carries its denominator/baseline.
   (the number) / unverifiable*. Lead with any divergence — it's the highest-value finding here.
 - **CROWD PRICE LEVELS** — clustered: support @ L1 (N mentions), current, resistance/target @ L2
   (M mentions). Where the crowd places its line.
-- **WHERE IT'S HAPPENING** — top channels/threads by volume with links (the `head` messages' `url`s
-  and `top_channels`); this is the "where was it discussed most" deliverable. Internal social data
-  has no URL — cite it as "Santiment social messages" per the citation rules.
+- **WHERE IT'S HAPPENING** — the "where was it discussed most" deliverable. Name only sources a
+  reader can open: **twitter accounts** (`twitter.com/<screen_name>`) and **subreddits**
+  (`reddit.com/r/<sub>`), plus any `head`-message `url`s. Do **not** print telegram/discord channel
+  IDs (raw numeric `chat_id`s — unvisitable, meaningless to a reader); report those as an aggregate
+  ("3 telegram channels ≈ 40% of volume") without the id. Internal social data has no URL — cite it
+  as "Santiment social messages" per the citation rules.
 - **The denominator, always:** "based on N sampled of M matching, sources: …".
 
 ## Discipline (the anti-journalism rules)
