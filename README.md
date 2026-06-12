@@ -127,6 +127,25 @@ When a request is ambiguous (unclear scope, timeframe, entity, or goal) the orch
 
 Skills are folders under `./skills/`, each with a `SKILL.md` (progressive-disclosure instructions the agent reads on demand). They're mounted **read-only** at the virtual path `/skills/`; the agent reads them via `read_file("/skills/<name>/SKILL.md")` while its own scratch files stay in an ephemeral state backend. The first time a skill is read in a turn, a `skill` event fires ("Skill applied: `<name>`"). Point elsewhere with `DRA_SKILLS_DIR` / `configurable.skills_dir`; if the directory is absent the agent runs normally with no skills.
 
+## Custom tools
+
+Add a deployment-specific tool without touching the generic codebase: drop a `*.py` file in `./custom_tools/` and restart. Each file subclasses `CustomTool` — set `name` / `description`, implement `run` — and the loader auto-discovers it, infers the arg schema from `run`'s typed params, and gives it to the orchestrator **and** every sub-agent.
+
+```python
+# custom_tools/weather.py
+from deep_research_agent.tools.custom import CustomTool
+
+class WeatherNow(CustomTool):
+    name = "weather_now"
+    description = "Current weather for a city. Cite as 'OpenWeather'."
+
+    async def run(self, city: str) -> str:   # sync def works too
+        # self.cfg is the run config; return a string (hardcoded here as an example)
+        return f"{city}: 21°C, clear skies, humidity 48%. Source: OpenWeather."
+```
+
+`run` may be sync or `async`; `self.cfg` is the live `ResearchConfig`. **Return value:** the model always sees a string — return a `str` (JSON-encode structured data yourself), or a `list`/`dict` and the framework JSON-encodes it for you; a large `list` of rows is offloaded to a file the `execute` tool reads back. Override `enabled(cls, cfg) -> bool` to load conditionally (e.g. only when an env var is set). Copy `custom_tools/_template.py` to start; for dynamic cases a `build_tools(cfg)` / `build_tool(cfg)` factory returning LangChain tools is also accepted. Point elsewhere with `DRA_CUSTOM_TOOLS_DIR`. Full guide: [`docs/CUSTOM_TOOLS.md`](docs/CUSTOM_TOOLS.md).
+
 ## Wiring into an existing app
 
 It speaks the LangGraph HTTP/SSE API, so any consumer (the included `examples/client.py`, the JS `@langchain/langgraph-sdk`, or raw SSE) works. To wire it into an existing deployment:
@@ -192,6 +211,8 @@ src/deep_research_agent/
   tools/mcp.py        MCP loader + per-call instrumentation, concurrency + 429 backoff
   tools/clarify.py    request_clarification tool → clarification event
   tools/report.py     submit_report tool — the single explicit deliverable → report event
+  tools/custom.py     CustomTool base class + drop-in loader for custom_tools/
+custom_tools/         drop-in deployment-specific tools (CustomTool subclasses), auto-loaded
 skills/               agent skills (each a folder with SKILL.md), mounted read-only at /skills/
 examples/client.py    reference SSE consumer
 ```

@@ -145,21 +145,26 @@ def _load_one(path: str, cfg: object) -> list[BaseTool]:
     spec.loader.exec_module(module)
 
     base = os.path.basename(path)
-    tools: list[BaseTool] = []
-    tools.extend(_tools_from_classes(module, cfg, base))
-    tools.extend(_tools_from_factory(module, cfg, base))
+    classes = _custom_tool_classes(module)
+    factory = _find_factory(module)
 
-    if not tools:
+    tools: list[BaseTool] = _tools_from_classes(classes, cfg, base)
+    if factory is not None:
+        tools.extend(_call_factory(factory, cfg))
+
+    # Warn only when the file declares NO tool at all. A class that is gated off by
+    # enabled() / fails to build, or a factory that legitimately returns [] (its own
+    # gating), is NOT a misconfigured plugin — don't cry wolf on every run.
+    if not classes and factory is None:
         log.warning("custom tool plugin %s defines no CustomTool subclass and no %s — "
                     "skipped", base, " or ".join(_FACTORY_NAMES))
     return tools
 
 
-def _tools_from_classes(module: object, cfg: object, plugin: str) -> list[BaseTool]:
-    """Find every concrete ``CustomTool`` subclass DEFINED in ``module`` (not the
-    imported base, not ones imported from elsewhere), instantiate it with ``cfg``,
-    and convert it to a LangChain tool. One bad class is skipped, not fatal."""
-    out: list[BaseTool] = []
+def _custom_tool_classes(module: object) -> list[type]:
+    """Concrete ``CustomTool`` subclasses DEFINED in ``module`` — not the imported
+    base, not abstract ones, not classes imported from elsewhere."""
+    out: list[type] = []
     for obj in vars(module).values():
         if not (isinstance(obj, type) and issubclass(obj, CustomTool)):
             continue
@@ -167,6 +172,14 @@ def _tools_from_classes(module: object, cfg: object, plugin: str) -> list[BaseTo
             continue
         if getattr(obj, "__module__", None) != getattr(module, "__name__", None):
             continue  # imported into the file, not defined here
+        out.append(obj)
+    return out
+
+
+def _tools_from_classes(classes: list[type], cfg: object, plugin: str) -> list[BaseTool]:
+    """Gate, instantiate, and convert each class. One bad class is skipped, not fatal."""
+    out: list[BaseTool] = []
+    for obj in classes:
         try:
             if not obj.enabled(cfg):
                 log.info("custom tool %s.%s disabled by enabled() — skipped", plugin, obj.__name__)
@@ -192,13 +205,15 @@ def _tool_from_instance(instance: CustomTool) -> BaseTool:
         func=run, name=instance.name, description=instance.description)
 
 
-def _tools_from_factory(module: object, cfg: object, plugin: str) -> list[BaseTool]:
-    """Call a ``build_tools`` / ``build_tool`` factory if the file defines one."""
-    factory = next(
+def _find_factory(module: object):
+    """The ``build_tools`` / ``build_tool`` factory the file defines, or ``None``."""
+    return next(
         (getattr(module, n) for n in _FACTORY_NAMES if callable(getattr(module, n, None))),
         None)
-    if factory is None:
-        return []
+
+
+def _call_factory(factory, cfg: object) -> list[BaseTool]:
+    """Run a factory and normalize its result to a list (``None`` -> ``[]``)."""
     result = factory(cfg)
     if result is None:
         return []

@@ -11,6 +11,7 @@ See ``docs/CUSTOM_TOOLS.md`` for the full guide.
 
 from __future__ import annotations
 
+import json
 import os
 
 from deep_research_agent.tools.custom import CustomTool
@@ -41,14 +42,35 @@ class MyTool(CustomTool):
         Declare typed parameters (``query: str``, ``limit: int = 10``) — their
         names, types, and defaults become the arg schema the model fills in.
         Avoid ``**kwargs`` (it produces no schema). May be sync ``def`` or
-        ``async def``. Return a string (preferred) or JSON-serializable value.
+        ``async def``.
 
         ``self.cfg`` is the ResearchConfig for this run — read API keys / URLs /
         flags off it or the environment.
+
+        RETURN FORMAT — the model always ends up seeing a STRING. You may return:
+          - a ``str`` (recommended). For structured data, ``json.dumps(...)`` it
+            yourself, like the hardcoded example below.
+          - a ``list`` (ideally of dicts) — auto JSON-encoded; ALSO the best shape
+            for large tabular results: the agent offloads it to a file (row count,
+            columns, head) the ``execute`` tool reads back instead of flooding the
+            context.
+          - any other JSON-serializable value (``dict`` etc.) — auto JSON-encoded.
+        Put numbers/facts the model should cite right in the returned text.
         """
         # token = os.environ.get("MY_API_KEY")
-        # ... do the work, hit an API, etc. ...
-        return f"got query={query!r} limit={limit}"
+        # ... do the real work (hit an API, query a DB, etc.) ...
+
+        # A perfectly valid hardcoded result — swap this for the real call. Returning
+        # a JSON string keeps structured fields legible to the model.
+        return json.dumps({
+            "query": query,
+            "limit": limit,
+            "results": [
+                {"title": "Example result A", "score": 0.92},
+                {"title": "Example result B", "score": 0.81},
+            ],
+            "source": "My Source (cite this)",
+        })
 
     @classmethod
     def enabled(cls, cfg) -> bool:
