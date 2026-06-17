@@ -137,13 +137,46 @@ crowd support, **above** = resistance / targets. Report the top few by mention c
 `trend_words` entry that is a bare number is a level — fold it in. If a value inside the band looks
 like a year, sanity-check it isn't a date before reporting it as a level.
 
-## Corroborate & visualize (optional tools)
+## In-report charts (embedded SVG, rendered server-side)
 
-- **`trending_stories` / `combined_trends`** — confirm the spike is a real, captured trend and
-  cross-check your `trend_words`; the stories also give **linkable source URLs** for the report.
+Charts go **inside the report** as a fenced ` ```chart ` block holding a small JSON spec; the renderer
+turns it into a crisp SVG. A malformed block just shows as code, so nothing breaks. Two types — add a
+chart only **when it carries the verdict**, never by reflex.
+
+**1. The spike, made visual (the main one).** When the report leads on a social-volume or
+-dominance spike, show it: pull `social_volume_total` (or `social_dominance_total`) over the
+window **±~30 days of context** at a daily/4h interval (~60–180 points — downsample if finer), and
+emit a line chart with the spike window shaded. Put it in the EXTREME? section next to the percentile.
+
+```chart
+{"type":"line","title":"SOL social volume — 30d around the spike","metric":"social_volume_total","points":[{"t":1717459200,"v":120},{"t":1717545600,"v":138}],"spike":{"from":1718064000,"to":1718150400}}
+```
+
+- `points` = `[{t, v}]` with `t` a **UNIX timestamp (seconds)** and `v` the value (aliases: `time`/`x`,
+  `value`/`y`). A flat `points` array is one series; for two series use
+  `"series":[{"label":...,"points":[...]}, …]` — but keep one **unit** per chart (don't mix volume and
+  dominance on one axis; emit two charts if you want both).
+- `spike: {from, to}` (unix seconds) shades the queried window so the before/after reads at a glance.
+- Needs ≥2 points or it's dropped. This is the chart for "is the spike extreme, and what's the
+  before/after".
+
+**2. Source mix (pie), when the spread is itself a finding.** One platform carrying the spike, or an
+unusually broad/narrow split. Build slices from full-population `stats["by_source"]` (source → count),
+NOT the sample. Put it in WHERE IT'S HAPPENING.
+
+```chart
+{"type":"pie","title":"Messages by source","slices":[{"label":"telegram","value":4120},{"label":"twitter","value":2890},{"label":"reddit","value":1450}]}
+```
+
+- `slices` = `[{label, value}]` (aliases: `data` for `slices`, `count`/`name` for `value`/`label`).
+- Use **source platforms** (telegram / twitter / reddit / …), never individual `chat_id`s. The
+  renderer sorts by size, folds the long tail into "Other", and labels each slice's %.
+
+## Corroborate (non-chart tools)
+
+- **`trending_stories` / `combined_trends`** — confirm the spike is a real, captured trend, cross-check
+  your `trend_words`, and supply **linkable story URLs** for the report.
 - **`assets_by_metric`** — the cross-sectional baseline for signal 1 (above).
-- **`show_chart`** (if the Santiment MCP exposes it) — render the social-volume-vs-price overlay so
-  the report carries visual evidence of the spike and how price reacted.
 
 ## Notes
 

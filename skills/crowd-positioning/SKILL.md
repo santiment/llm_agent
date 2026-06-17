@@ -108,7 +108,9 @@ Lead with the verdict. Every bullet carries its denominator/baseline.
   number; rank by share, not by how interesting the quote is. Flag any topic where the crowd splits
   (both sides, which has more voices) using the `head`/`poles` strata.
 - **EXTREME?** — social volume Nth pct of trailing 90d (z=…); dominance Nth pct; sentiment skew
-  N% bull vs M% trailing median. Spike vs baseline, always.
+  N% bull vs M% trailing median. Spike vs baseline, always. When the spike is the story, embed a
+  line chart of `social_volume_total` (or dominance) over the window **±~30d**, with the spike window
+  shaded — a fenced ` ```chart ` block built from `fetch_metric_data` points (recipe in `signals.md`).
 - **ORGANIC?** — % organic (unique/total), top-3 channels = N% of volume, max copies ×N,
   acceleration (rising / peaked / fading). Verdict: organic / mixed / manufactured.
 - **NARRATIVE vs CHAIN** — one row per checkable claim: *claim → chain metric → confirmed / diverges
@@ -120,7 +122,10 @@ Lead with the verdict. Every bullet carries its denominator/baseline.
   (`reddit.com/r/<sub>`), plus any `head`-message `url`s. Do **not** print telegram/discord channel
   IDs (raw numeric `chat_id`s — unvisitable, meaningless to a reader); report those as an aggregate
   ("3 telegram channels ≈ 40% of volume") without the id. Internal social data has no URL — cite it
-  as "Santiment social messages" per the citation rules.
+  as "Santiment social messages" per the citation rules. **When the source mix is itself a finding**
+  (one platform carries the spike, or it's strikingly spread), embed a pie of messages-by-source
+  here — a fenced ` ```chart ` block built from `stats.by_source` (recipe in `signals.md`). Only when
+  it adds signal; skip it when the split is unremarkable. This is the one chart the report uses.
 - **The denominator, always:** "based on N sampled of M matching, sources: …".
 
 ## Discipline (the anti-journalism rules)

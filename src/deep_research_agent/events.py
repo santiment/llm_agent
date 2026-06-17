@@ -13,6 +13,7 @@ Render mapping (Claude / Gemini deep-research UIs):
     ``tool_result``    -> MCP call rows
   - ``source``         -> registered citation (for the live source list)
   - ``skill``          -> a skill being applied ("Skill: data-provider")
+  - ``chart``          -> an inline price/metric chart (render-ready series)
   - ``report``         -> final markdown answer (also persisted in state)
   - ``status``         -> lifecycle: researching | writing | done | error
 
@@ -246,6 +247,57 @@ def _offload_result(
     return stub, note
 
 
+def _maybe_chart_event(result: Any, call_id: str) -> dict[str, Any] | None:
+    """Build a ``chart`` protocol event from a chart-shaped tool result, or ``None``.
+
+    Recognizes the render-ready shape ``{"slug","range","series":[{"data":[...]}, …]}``
+    that a charting tool (e.g. ``show_chart``) returns — STRUCTURALLY, with no
+    tool-name coupling, so the agent core stays generic. Tolerates the result
+    arriving as a JSON string, a dict, or a ``(content, artifact)`` tuple from the
+    MCP adapter. Never raises — charting is best-effort observability, so a parse
+    miss just yields no chart, never a broken run."""
+    try:
+        candidates: list[Any] = list(result) if isinstance(result, (list, tuple)) else [result]
+        for cand in candidates:
+            obj = cand
+            if isinstance(obj, str):
+                try:
+                    obj = json.loads(obj)
+                except (ValueError, TypeError):
+                    continue
+            # A LangChain text content block — {"type": "text", "text": "<json>"} —
+            # is how MCP content arrives when there's no structured artifact; parse it.
+            if isinstance(obj, dict) and "series" not in obj and isinstance(obj.get("text"), str):
+                try:
+                    obj = json.loads(obj["text"])
+                except (ValueError, TypeError):
+                    pass
+            # Unwrap one common nesting level (structured-content envelopes).
+            if isinstance(obj, dict) and "series" not in obj:
+                for key in ("structuredContent", "structured_content", "data", "result"):
+                    inner = obj.get(key)
+                    if isinstance(inner, dict) and "series" in inner:
+                        obj = inner
+                        break
+            if not isinstance(obj, dict):
+                continue
+            series = obj.get("series")
+            if not (isinstance(series, list) and series and all(
+                    isinstance(s, dict) and isinstance(s.get("data"), list) for s in series)):
+                continue
+            return {
+                "type": "chart",
+                "id": call_id,
+                "slug": obj.get("slug"),
+                "range": obj.get("range"),
+                "summary": obj.get("summary") if isinstance(obj.get("summary"), dict) else None,
+                "series": series,
+            }
+        return None
+    except Exception:
+        return None
+
+
 def instrument_tool(
     tool: BaseTool,
     kind: str = "tool",
@@ -308,8 +360,27 @@ def instrument_tool(
                 # The semaphore (a shared, fixed-size queue) is held only for the
                 # duration of the call — released on exit so we never hold a slot
                 # while backing off on a 429.
+                #
+                # MCP tools surface STRUCTURED data (e.g. a chart's render-ready
+                # `series`) as a content_and_artifact result — the structured payload
+                # lives in the ToolMessage's artifact, NOT its content. A plain-dict
+                # ainvoke returns only the content and DROPS the artifact, so for those
+                # tools invoke via a ToolCall and keep the artifact. The model-facing
+                # `result` (the message content) is identical either way.
+                chart_src = None
                 async with (semaphore or nullcontext()):
-                    result = await tool.ainvoke(kwargs)
+                    if getattr(tool, "response_format", None) == "content_and_artifact":
+                        tm = await tool.ainvoke(
+                            {"name": tool.name, "args": kwargs, "id": call_id,
+                             "type": "tool_call"})
+                        result = getattr(tm, "content", tm)
+                        # The artifact is a TypedDict ({"structured_content": ...}) on
+                        # the adapter, but tolerate an attr-style object too.
+                        art = getattr(tm, "artifact", None)
+                        chart_src = (art.get("structured_content") if isinstance(art, dict)
+                                     else getattr(art, "structured_content", None))
+                    else:
+                        result = await tool.ainvoke(kwargs)
             except Exception as exc:
                 # A failed call is a RESULT, not a run-ending event: the error text is
                 # returned to the model (with retry guidance) so it can self-correct —
@@ -338,6 +409,14 @@ def instrument_tool(
                 log.warning("TOOL ERROR (%s, %s): %s", tool.name, classification,
                             _summarize(msg, 500))
                 return tool_error_text(tool.name, msg, classification)
+            # A chart-shaped result (e.g. `show_chart`'s render-ready series) becomes an
+            # inline `chart` event a UI can draw — from the structured artifact when the
+            # MCP tool provided one, else the raw content; before any capping/offload,
+            # and best-effort so it never affects the run.
+            chart_evt = _maybe_chart_event(
+                chart_src if chart_src is not None else result, call_id)
+            if chart_evt is not None:
+                emit(chart_evt)
             # Observability + source-level cap: record the RAW size (before capping) so the
             # run log shows what the tool actually returned, then bound it for the context.
             raw_rows = len(result) if isinstance(result, (list, tuple)) else None

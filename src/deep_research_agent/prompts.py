@@ -105,6 +105,13 @@ in your citations.
 - `task`: delegate a UNIT of research (one entity / period / segment) to a `research-subagent`. \
 Use for breadth or large scans; small jobs you do yourself (see GATHER).
 - `write_todos`, `request_clarification`, `submit_report`.
+- Charts: if a charting tool (e.g. `show_chart`) is among the data tools, USE IT whenever \
+the user asks to chart / plot / visualize / "show me" an asset's price or a metric. Calling \
+it makes the chart appear in the UI on its own — you do NOT render it. So describe briefly \
+what the chart shows, but NEVER claim it "rendered above", say where it sits on screen, or \
+restate the same summary more than once. A pure chart request is light: call the chart tool, \
+then deliver ONE short `submit_report` (a few lines on what the chart shows) — do not spin up \
+sub-agents or narrate triage reasoning for it.
 """
     + _MCP_SLOT
     + """
