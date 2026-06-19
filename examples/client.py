@@ -38,14 +38,14 @@ def read_question(argv: list[str]) -> str:
     return _DEFAULT_Q
 
 
-async def main(question: str) -> None:
-    client = get_client(url="http://127.0.0.1:2024")
-    thread = await client.threads.create()
-
+async def stream_turn(client, thread_id: str, content: str) -> list[str]:
+    """Stream one run on ``thread_id``. Returns the clarifying questions the agent is
+    waiting on (``[]`` if it finished without asking)."""
+    pending: list[str] = []
     async for chunk in client.runs.stream(
-        thread["thread_id"],
+        thread_id,
         "deep_research_agent",
-        input={"messages": [{"role": "user", "content": question}]},
+        input={"messages": [{"role": "user", "content": content}]},
         # per-run overrides; omit to use the server's .env defaults
         config={"configurable": {
             "research_model": "openai/gpt-4o",
@@ -58,7 +58,12 @@ async def main(question: str) -> None:
         if chunk.event == "custom":
             d = chunk.data
             t = d.get("type")
-            if t == "phase":
+            if t == "clarification":
+                pending = [q for q in d.get("questions", []) if q]
+                print("\n❓ Clarifying questions:")
+                for i, q in enumerate(pending, 1):
+                    print(f"  {i}. {q}")
+            elif t == "phase":
                 print(f"\n### {d.get('title')} [{d.get('status')}]")
             elif t == "search_query":
                 print(f"  🔎 {d['query']}")
@@ -78,6 +83,32 @@ async def main(question: str) -> None:
                 content = m.get("content") if isinstance(m, dict) else None
                 if isinstance(content, str):
                     print(content, end="", flush=True)
+    return pending
+
+
+def collect_answers(questions: list[str]) -> str:
+    """Prompt for each answer and pair it back with its question. Sending the bare
+    answers ("the first") loses meaning — the agent can't tell which option "the first"
+    refers to — so the reply restates every question alongside its answer."""
+    lines = ["Answers to your clarifying questions:"]
+    for i, q in enumerate(questions, 1):
+        ans = input(f"  {i}. {q}\n     > ").strip()
+        lines.append(f"{i}. Q: {q}\n   A: {ans or '(no preference)'}")
+    return "\n".join(lines)
+
+
+async def main(question: str) -> None:
+    client = get_client(url="http://127.0.0.1:2024")
+    thread = await client.threads.create()
+
+    content = question
+    while True:
+        # Re-running on the SAME thread_id appends to the persisted message history,
+        # so the agent resumes with the full prior context (questions + answers).
+        pending = await stream_turn(client, thread["thread_id"], content)
+        if not pending:
+            break
+        content = collect_answers(pending)
 
 
 if __name__ == "__main__":

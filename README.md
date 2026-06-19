@@ -99,7 +99,7 @@ Stream with `stream_mode=["messages","updates","custom"]` and `stream_subgraphs=
 
 | `type` | Key fields | Renders as |
 |---|---|---|
-| `clarification` | `questions[]` | Question card; input re-enabled (user replies on the same thread) |
+| `clarification` | `questions[]` | Question card; input re-enabled. On submit, reply on the **same thread** with each answer paired to its question (`1. Q: … A: …`) — not bare answers |
 | `search_query` | `id`, `query`, `source` | Globe row |
 | `search_results` | `id`, `query`, `ok`, `count`, `results[].{title,url,domain,snippet}` | Favicon + title grid |
 | `source` | `title`, `url`, `domain` | Live citation list entry |
@@ -121,7 +121,17 @@ Final thread state also exposes `final_report` (string) and `sources` (`[{index,
 
 ## Clarifying questions
 
-When a request is ambiguous (unclear scope, timeframe, entity, or goal) the orchestrator calls `request_clarification` up front, emits a `clarification` event, and stops. The user's reply lands on the **same thread** as the next message, so the agent then has the Q&A in context and proceeds to research. A deterministic fallback (`ClarificationFallbackMiddleware`) emits the same event if a model narrates questions in prose without calling the tool, so the card always appears regardless of model.
+When a request is ambiguous (unclear scope, timeframe, entity, or goal) the orchestrator calls `request_clarification` up front, emits a `clarification` event, and stops.
+
+**The reply must pair each answer with its question.** The frontend collects the answers and sends them back on the **same thread** as one user message restating each question with its answer — e.g.:
+
+```
+Answers to your clarifying questions:
+1. Q: Scope to US-listed BDCs or global? A: US-listed
+2. Q: Timeframe? A: last 12 months
+```
+
+Sending bare answers (`"the first"`) loses meaning — without the question the agent can't tell what "the first" refers to. As insurance the `request_clarification` tool also echoes the questions into its own result, so they stay in context even if history is trimmed. The user's reply lands on the same thread, so the agent then has the full Q&A in context and proceeds to research. A deterministic fallback (`ClarificationFallbackMiddleware`) emits the same event if a model narrates questions in prose without calling the tool, so the card always appears regardless of model. See `examples/client.py` for the round-trip.
 
 ## Skills
 
