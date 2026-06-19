@@ -66,6 +66,8 @@ Resolution order for every field: per-run `configurable` override â†’ env var â†
 | `DRA_SKILLS_DIR` | `./skills` | Directory of agent skills (see below) |
 | `DRA_STREAMING` | `true` | Token-by-token streaming; set `false` for models with off-spec streaming chunks |
 | `DRA_STREAMING_DENYLIST` | `deepseek-v4-flash` | Comma-separated model-name substrings that force `streaming` off |
+| `DRA_PROMPT_CACHING` | `true` | Inject `cache_control` breakpoints (system prompt + a rolling conversation prefix) so the re-sent prefix is cached â€” big input-token savings. Applies to the models in `DRA_CACHE_BREAKPOINT_MODELS`; providers that cache automatically need nothing |
+| `DRA_CACHE_BREAKPOINT_MODELS` | `claude,anthropic` | Comma-separated model-id substrings whose providers cache ONLY with explicit `cache_control` breakpoints (data-driven, no vendor hardcoded). Add a family to opt it in |
 | `DRA_RECURSION_LIMIT` | `4500` | LangGraph super-step ceiling for the orchestrator loop (caps loops, not tool calls) |
 | `DRA_MAX_TOOL_CALLS` | `200` | Cumulative tool-call ceiling per run (BudgetMiddleware) before a hard stop |
 | `DRA_MAX_TOTAL_TOKENS` | `4000000` | Cumulative token ceiling per run; soft wrap-up nudge at 75%, hard stop at 100% |
@@ -78,7 +80,7 @@ Resolution order for every field: per-run `configurable` override â†’ env var â†
 | `LLM_SANDBOX_NETWORK` | `false` | Allow outbound network from inside the sandbox |
 | `LLM_SANDBOX_SESSION_TIMEOUT` | `900` | Sandbox session timeout (seconds) |
 
-Per-run `configurable` keys mirror these: `model_tier`, `apiKeys.{OPENAI_API_KEY,TAVILY_API_KEY}`, `base_url` (allowlisted only), `temperature`, `search_max_results`, `max_concurrent_research_units`, `mcp_servers` / `mcp_config`, `mcp_prompt`, `mcp_max_concurrency`, `mcp_rate_limit_max_wait`, `skills_dir`, `streaming`, `streaming_denylist`, `recursion_limit`, `max_tool_calls`, `max_total_tokens`, `max_result_chars`, `max_result_rows`, `offload_results`, `offload_dir`, `sandbox_url`, `sandbox_token`, `sandbox_network`, `sandbox_session_timeout`.
+Per-run `configurable` keys mirror these: `model_tier`, `apiKeys.{OPENAI_API_KEY,TAVILY_API_KEY}`, `base_url` (allowlisted only), `temperature`, `search_max_results`, `max_concurrent_research_units`, `mcp_servers` / `mcp_config`, `mcp_prompt`, `mcp_max_concurrency`, `mcp_rate_limit_max_wait`, `skills_dir`, `streaming`, `streaming_denylist`, `prompt_caching`, `cache_breakpoint_models`, `recursion_limit`, `max_tool_calls`, `max_total_tokens`, `max_result_chars`, `max_result_rows`, `offload_results`, `offload_dir`, `sandbox_url`, `sandbox_token`, `sandbox_network`, `sandbox_session_timeout`.
 
 ### Model tiers (price packages)
 

@@ -212,6 +212,20 @@ class ResearchConfig:
     # dropped, stalling the loop. Streaming is force-disabled for matches (models.py).
     # Override via DRA_STREAMING_DENYLIST (comma-separated substrings).
     streaming_denylist: list[str] = field(default_factory=lambda: ["deepseek-v4-flash"])
+    # Prompt caching. The re-sent prompt prefix (system prompt + tool defs + the growing
+    # transcript) is cached so repeat reads bill far cheaper — big input-token savings on the
+    # orchestrator's long tool loop and on multi-turn threads. Some providers cache it
+    # automatically; others do so ONLY when the request carries explicit `cache_control`
+    # breakpoints (see cache_breakpoint_models). When True (default) we inject those breakpoints
+    # for the models that need them. Disable via DRA_PROMPT_CACHING=false.
+    prompt_caching: bool = True
+    # Model-id substrings whose providers cache the prefix ONLY with explicit `cache_control`
+    # breakpoints (others cache automatically and need nothing injected). Data, not a hardcoded
+    # vendor check — the agent stays provider-agnostic: add a family here and it gets breakpoints
+    # too. Default covers the Claude family, the common case today. Same denylist-style pattern
+    # as streaming_denylist. Override via DRA_CACHE_BREAKPOINT_MODELS (comma-separated).
+    cache_breakpoint_models: list[str] = field(
+        default_factory=lambda: ["claude", "anthropic"])
     # LangGraph super-step ceiling for the orchestrator (agent.py clamps deepagents' 9_999).
     # ~7 super-steps per ReAct loop here, so this caps loops, not tool calls. Must stay ABOVE
     # max_tool_calls × steps-per-loop so BudgetMiddleware — the real runaway guard — binds
@@ -377,6 +391,18 @@ class ResearchConfig:
                 else [s.strip().lower() for s in
                       _env("DRA_STREAMING_DENYLIST", default="deepseek-v4-flash").split(",")
                       if s.strip()]
+            ),
+            prompt_caching=(
+                bool(c["prompt_caching"]) if "prompt_caching" in c
+                else _env("DRA_PROMPT_CACHING", default="true").strip().lower()
+                not in ("0", "false", "no", "off")
+            ),
+            cache_breakpoint_models=(
+                [s.strip().lower() for s in c["cache_breakpoint_models"] if str(s).strip()]
+                if isinstance(c.get("cache_breakpoint_models"), list)
+                else [s.strip().lower() for s in
+                      _env("DRA_CACHE_BREAKPOINT_MODELS",
+                           default="claude,anthropic").split(",") if s.strip()]
             ),
             recursion_limit=int(
                 c.get("recursion_limit") or _env("DRA_RECURSION_LIMIT") or 4500),

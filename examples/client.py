@@ -16,7 +16,7 @@ from pathlib import Path
 
 from langgraph_sdk import get_client
 
-_DEFAULT_Q = "Give me a deep research report on BDCs."
+_DEFAULT_Q = "Give me a deep research report on XYZ."
 
 
 def read_question(argv: list[str]) -> str:
