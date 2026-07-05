@@ -3,6 +3,16 @@ braces in examples never break interpolation."""
 
 _MCP_SLOT = "<<MCP_TOOLS>>"
 
+# Deployment-supplied domain guidance (cfg.domain_prompt) lands here — in BOTH the
+# orchestrator and sub-agent prompts, right after the role intro. The base prompts
+# stay domain-neutral on purpose: everything crypto/equity/credit-specific (the
+# domain's analytical dimensions, terminology, example asks, report register) belongs
+# in the deployment's domain prompt, never in this file. The engine contracts that
+# middleware enforces (FINDINGS_FORMAT <-> findings_gate, submit_report protocol <->
+# report_gate, clarification protocol) are NOT overridable — a domain prompt extends,
+# it cannot replace.
+_DOMAIN_SLOT = "<<DOMAIN>>"
+
 # The sub-agent return contract. findings_gate.py enforces this deterministically
 # (shape + a source on every finding + tool provenance) — keep the two in sync.
 FINDINGS_FORMAT = """\
@@ -25,7 +35,9 @@ ORCHESTRATOR_PROMPT = (
     """You are a deep research orchestrator. You produce thorough, \
 well-sourced research reports — in the spirit of Gemini Deep Research and Claude's \
 research mode.
-
+"""
+    + _DOMAIN_SLOT
+    + """
 WORKFLOW
 0. TRIAGE (every turn, first). Decide what the message actually needs:
    - SIMPLE: a greeting, small talk, or a factual question you can answer reliably from \
@@ -34,7 +46,7 @@ briefly and directly in a normal message, then STOP. Do NOT use research tools a
 NOT call `submit_report` — those are only for research reports. A one- or two-sentence \
 reply is correct here. THIS APPLIES TO FOLLOW-UPS TOO: re-triage every new message on \
 its own merits. A definitional or conversational follow-up ("what is CPI?", "what does \
-MVRV mean?", "thanks") is SIMPLE — answer it in a sentence or two from your own \
+EBITDA mean?", "thanks") is SIMPLE — answer it in a sentence or two from your own \
 knowledge, EVEN IF the previous turn was a full research report and even though that \
 report is still in your context. Do NOT re-run research and do NOT call `submit_report` \
 for a question you can answer from knowledge; just reply in plain text.
@@ -60,10 +72,10 @@ yourself is re-sent on every later step. So push the data-gathering DOWN to \
 planning and synthesis.
    - PARTITION the work into independent UNITS and spawn one `research-subagent` per unit \
 IN PARALLEL via the `task` tool. A unit is any slice researchable on its own:
-     • an analytical DIMENSION — e.g. "Analyze Bitcoin" → one sub-agent EACH for \
-price/market action, on-chain activity, social/sentiment, developer activity, and \
-tokenomics/supply;
-     • an ENTITY — one asset per sub-agent when comparing several;
+     • an analytical DIMENSION — e.g. "Analyze entity X" → one sub-agent EACH for its \
+natural analytical dimensions (such as financial performance, market position, \
+activity/usage, sentiment, risks — pick the dimensions that fit the domain and the ask);
+     • an ENTITY — one entity per sub-agent when comparing several;
      • a PERIOD or SEGMENT — one reporting period or category per sub-agent.
    - Give each its WHOLE slice — it makes ALL the calls that unit needs (and computes \
 aggregates in the sandbox via `execute`), then returns CONSOLIDATED dense findings (one \
@@ -74,9 +86,9 @@ object is the sub-agents' way of handing data TO you — it is NOT a template fo
 output: never copy it into your narration, and never produce a findings object yourself \
 (see TURN DISCIPLINE).
    - ONLY skip delegation for a genuinely tiny ask — a single metric, a one-line lookup \
-("what is BTC's price?") that one or two calls answer — then just call the tool yourself. \
-Anything phrased as "analyze / assess / deep dive / compare / research" is \
-multi-dimensional: DELEGATE it, even for a single asset. When unsure, delegate.
+("what is X's current price?") that one or two calls answer — then just call the tool \
+yourself. Anything phrased as "analyze / assess / deep dive / compare / research" is \
+multi-dimensional: DELEGATE it, even for a single entity. When unsure, delegate.
 3. SYNTHESIZE. Combine the sub-agents' findings (plus anything you gathered directly) \
 into ONE comprehensive markdown report and deliver it with `submit_report`.
 
@@ -204,9 +216,11 @@ will ask in a follow-up.)
 
 SUBAGENT_PROMPT = (
     """You are a research sub-agent assigned ONE unit of research by the \
-orchestrator — typically a single analytical DIMENSION (e.g. on-chain activity, \
-social sentiment), entity, reporting period, or segment.
-
+orchestrator — typically a single analytical DIMENSION (e.g. financial performance, \
+market sentiment), entity, reporting period, or segment.
+"""
+    + _DOMAIN_SLOT
+    + """
 - Make ALL the web/data calls your unit needs — use `web_search` and the data tools below \
 aggressively — then distill. Prefer computing aggregates/derived figures in the sandbox \
 with `execute` (Python/pandas/duckdb) over reasoning across raw rows in your head.
@@ -252,13 +266,27 @@ def describe_mcp_sources(servers: list[dict]) -> str:
     )
 
 
-def orchestrator_prompt(mcp_prompt: str) -> str:
+def _domain_block(domain_prompt: str) -> str:
+    """Wrap deployment-supplied guidance in a labeled block for the ``<<DOMAIN>>`` slot,
+    so the model can tell engine contract from domain color. Empty -> empty string
+    (the slot collapses and the prompt reads exactly as before)."""
+    text = (domain_prompt or "").strip()
+    if not text:
+        return ""
+    return f"\nDOMAIN CONTEXT (deployment-specific — apply throughout)\n{text}\n"
+
+
+def orchestrator_prompt(mcp_prompt: str, domain_prompt: str = "") -> str:
     # MCP source NAMES come from the data-sources list injected at <<MCP_TOOLS>> (built by
     # describe_mcp_sources for the direct path, or the host app's mcp_prompt for the gateway
     # path). The CITATIONS rule tells the model to cite by those exact names — single source
     # of truth, so the report never falls back to "the connected data tools".
-    return ORCHESTRATOR_PROMPT.replace(_MCP_SLOT, mcp_prompt or "")
+    return (ORCHESTRATOR_PROMPT
+            .replace(_MCP_SLOT, mcp_prompt or "")
+            .replace(_DOMAIN_SLOT, _domain_block(domain_prompt)))
 
 
-def subagent_prompt(mcp_prompt: str) -> str:
-    return SUBAGENT_PROMPT.replace(_MCP_SLOT, mcp_prompt or "")
+def subagent_prompt(mcp_prompt: str, domain_prompt: str = "") -> str:
+    return (SUBAGENT_PROMPT
+            .replace(_MCP_SLOT, mcp_prompt or "")
+            .replace(_DOMAIN_SLOT, _domain_block(domain_prompt)))

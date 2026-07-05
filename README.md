@@ -63,7 +63,10 @@ Resolution order for every field: per-run `configurable` override → env var �
 | `DRA_MCP_BEARER` | — | Bearer token attached to every MCP server lacking explicit auth |
 | `DRA_MCP_MAX_CONCURRENCY` | `10` | Hard ceiling on simultaneous MCP calls across the whole run |
 | `DRA_MCP_RATE_LIMIT_MAX_WAIT` | `120` | Per-call 429 backoff budget (seconds) before the call fails |
-| `DRA_SKILLS_DIR` | `./skills` | Directory of agent skills (see below) |
+| `DRA_SKILLS_DIR` | `./skills` | Directory of agent skills (see below); in an installed package the default is off — set explicitly |
+| `DRA_CUSTOM_TOOLS_DIR` | `./custom_tools` | Directory of drop-in deployment tools (see Custom tools); same installed-package rule |
+| `DRA_DOMAIN_PROMPT` | — | Deployment/domain guidance injected into both system prompts (see Domain prompt) |
+| `DRA_DOMAIN_PROMPT_FILE` | — | Path to a file with the same; inline `DRA_DOMAIN_PROMPT` wins |
 | `DRA_STREAMING` | `true` | Token-by-token streaming; set `false` for models with off-spec streaming chunks |
 | `DRA_STREAMING_DENYLIST` | `deepseek-v4-flash` | Comma-separated model-name substrings that force `streaming` off |
 | `DRA_RECURSION_LIMIT` | `4500` | LangGraph super-step ceiling for the orchestrator loop (caps loops, not tool calls) |
@@ -132,6 +135,12 @@ Answers to your clarifying questions:
 ```
 
 Sending bare answers (`"the first"`) loses meaning — without the question the agent can't tell what "the first" refers to. As insurance the `request_clarification` tool also echoes the questions into its own result, so they stay in context even if history is trimmed. The user's reply lands on the same thread, so the agent then has the full Q&A in context and proceeds to research. A deterministic fallback (`ClarificationFallbackMiddleware`) emits the same event if a model narrates questions in prose without calling the tool, so the card always appears regardless of model. See `examples/client.py` for the round-trip.
+
+## Domain prompt
+
+The base system prompts are deliberately **domain-neutral** — they carry the research workflow and the engine contracts (findings format, `submit_report` protocol, clarification protocol) that the middleware enforces. Everything specific to *your* deployment's domain — the analytical dimensions that matter (e.g. on-chain activity and tokenomics for crypto; yield and non-accruals for credit), terminology, example asks, report register — goes in the **domain prompt**, injected into both the orchestrator's and the sub-agents' system prompts as a labeled `DOMAIN CONTEXT` block.
+
+Set it per run (`configurable.domain_prompt`), inline (`DRA_DOMAIN_PROMPT`), or from a file (`DRA_DOMAIN_PROMPT_FILE=/path/to/domain.md` — the usual place for anything longer than a sentence). Empty = the slot collapses and the base prompt runs as-is. The domain prompt **extends** the base prompt; the engine contracts are not replaceable — don't restate workflow, citation, or output rules in it, just the domain color.
 
 ## Skills
 

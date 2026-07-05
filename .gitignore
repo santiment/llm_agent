@@ -13,3 +13,8 @@ __pycache__/
 
 # Deployment-specific drop-in tools (loaded at runtime, not committed)
 # custom_tools/
+.DS_Store
+
+# langgraph dev local runtime state (checkpoints, ops, vector store — may hold
+# conversation data; never commit)
+.langgraph_api/

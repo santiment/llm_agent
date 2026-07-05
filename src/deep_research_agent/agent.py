@@ -128,7 +128,7 @@ async def make_graph(config: dict | None = None):
             "or segment — making ALL the web/MCP calls that unit needs, and returns "
             "consolidated dense findings with sources. Spawn one per unit, in parallel."
         ),
-        "system_prompt": subagent_prompt(mcp_prompt),
+        "system_prompt": subagent_prompt(mcp_prompt, cfg.domain_prompt),
         "tools": tools,
         "model": subagent_model,
         "middleware": [SubagentFindingsMiddleware()],
@@ -175,7 +175,7 @@ async def make_graph(config: dict | None = None):
     agent = create_deep_agent(
         model=research_model,
         tools=[*tools, build_clarify_tool(), build_submit_report_tool()],
-        system_prompt=orchestrator_prompt(mcp_prompt),
+        system_prompt=orchestrator_prompt(mcp_prompt, cfg.domain_prompt),
         subagents=subagents,
         middleware=middleware,
         skills=skills,

@@ -25,16 +25,28 @@ from urllib.parse import urlparse
 log = logging.getLogger("deep_research_agent.config")
 
 
-def _default_skills_dir() -> str:
-    """The repo's ``./skills`` directory. This file lives at
-    ``src/deep_research_agent/config.py`` -> project root is two parents up."""
-    return str(Path(__file__).resolve().parents[2] / "skills")
+def _repo_dir(name: str) -> str:
+    """Path to a repo-root content dir (``skills/``, ``custom_tools/``) when running
+    from a checkout — this file lives at ``src/deep_research_agent/config.py``, so the
+    project root is two parents up. When the package is INSTALLED as a dependency,
+    ``parents[2]`` is site-packages and no such dir exists — return "" (feature off)
+    rather than a garbage path; deployments point ``DRA_SKILLS_DIR`` /
+    ``DRA_CUSTOM_TOOLS_DIR`` at their own content explicitly."""
+    d = Path(__file__).resolve().parents[2] / name
+    return str(d) if d.is_dir() else ""
 
 
-def _default_custom_tools_dir() -> str:
-    """The repo's ``./custom_tools`` directory — a gitignored drop-in folder for
-    deployment-specific tools. Same project-root anchoring as the skills dir."""
-    return str(Path(__file__).resolve().parents[2] / "custom_tools")
+def _read_prompt_file(path: str) -> str:
+    """Contents of an operator-supplied prompt file (``DRA_DOMAIN_PROMPT_FILE``), or
+    "" when unset or unreadable — a missing file must degrade to 'no domain prompt',
+    never take the server down at import/config time."""
+    if not path:
+        return ""
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        log.warning("cannot read prompt file %s: %s", path, exc)
+        return ""
 
 # Hostnames that resolve to cloud-metadata endpoints — never a legitimate MCP target.
 _BLOCKED_MCP_HOSTNAMES = {"metadata", "metadata.google.internal"}
@@ -194,6 +206,14 @@ class ResearchConfig:
     # (tool-name prefix), ``url``, ``headers`` and optional ``tools`` allow-list.
     mcp_servers: list[dict] = field(default_factory=list)
     mcp_prompt: str = ""
+    # Deployment-specific guidance injected into BOTH system prompts at the <<DOMAIN>>
+    # slot (prompts.py wraps it in a labeled DOMAIN CONTEXT block): the domain's
+    # analytical dimensions, terminology, example asks, report register. This EXTENDS
+    # the base prompt; the engine contracts the middleware enforces (findings format,
+    # submit_report protocol, clarification protocol) are not replaceable. Resolution:
+    # configurable ``domain_prompt`` -> env ``DRA_DOMAIN_PROMPT`` (inline text) ->
+    # env ``DRA_DOMAIN_PROMPT_FILE`` (path, read at config time).
+    domain_prompt: str = ""
     # Gitignored drop-in directory of deployment-specific tools. Each ``*.py`` file that
     # defines ``build_tools(cfg)`` (or ``build_tool(cfg)``) returning LangChain tool(s) is
     # auto-loaded into the agent's tool list — no edits to this generic codebase. Absent
@@ -363,9 +383,11 @@ class ResearchConfig:
                 or 120.0),
             mcp_servers=mcp_servers,
             mcp_prompt=c.get("mcp_prompt") or "",
+            domain_prompt=(c.get("domain_prompt") or _env("DRA_DOMAIN_PROMPT")
+                           or _read_prompt_file(_env("DRA_DOMAIN_PROMPT_FILE"))),
             custom_tools_dir=(c.get("custom_tools_dir") or _env("DRA_CUSTOM_TOOLS_DIR")
-                              or _default_custom_tools_dir()),
-            skills_dir=c.get("skills_dir") or _env("DRA_SKILLS_DIR") or _default_skills_dir(),
+                              or _repo_dir("custom_tools")),
+            skills_dir=c.get("skills_dir") or _env("DRA_SKILLS_DIR") or _repo_dir("skills"),
             streaming=(
                 bool(c["streaming"]) if "streaming" in c
                 else _env("DRA_STREAMING", default="true").strip().lower()
