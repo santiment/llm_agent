@@ -14,24 +14,54 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from functools import lru_cache
+from typing import NamedTuple
 
-# TODO: Do not expect all tools to be named get_x
+# Tool names leak into reports in several shapes; handle each, since the model varies
+# the delimiter (parentheses one run, an em-dash list the next). Which names to scrub
+# comes from the RUN's actually-loaded tools (``tool_names`` — agent.py passes the
+# search/MCP/custom tool list), so the scrub works for any deployment's naming scheme.
+# The legacy ``get_*`` family is always matched as a fallback. PROSE SAFETY: only
+# snake_case names (containing "_") are scrubbed — a plain-word tool name like
+# "screener" is a real English word, and stripping it would damage prose, so it is
+# deliberately ignored here (the prompt rules remain its only guard).
+_GET_TOKEN = r"get_[a-z0-9_]+"
 
-# Data-layer tool names all share the `get_*` prefix, which never occurs in real prose — so
-# stripping them is safe. They leak in several shapes; handle each, since the model varies the
-# delimiter (parentheses one run, an em-dash list the next).
-#
-# 1. A parenthetical tool list: "Data Provider (get_x, get_y)".
-_TOOL_PAREN = re.compile(r"\s*\([^()]*\bget_[a-z0-9_]+[^()]*\)")
-# 2. A tool list introduced by a separator (—, –, :, -) running to end of line:
-#    "Data Provider — get_x, get_y, get_z".
-_TOOL_LIST_SUFFIX = re.compile(
-    r"(?m)\s*[—–:\-]\s*`?get_[a-z0-9_]+`?(?:\s*\([^()]*\))?"
-    r"(?:\s*,\s*`?get_[a-z0-9_]+`?(?:\s*\([^()]*\))?)*\s*$"
-)
-# 3. A bare inline tool call or backticked name left in prose: "get_records(date)",
-#    "`get_records`". Neutralized to a readable phrase (rare; the prompt handles the body).
-_TOOL_ID = re.compile(r"`?\bget_[a-z0-9_]+`?(?:\s*\([^()]*\))?")
+
+def _scrub_token(tool_names: tuple[str, ...]) -> str:
+    """Alternation regex matching any scrubbable tool name (longest first, so a name
+    that prefixes another can't shadow it), plus the ``get_*`` fallback family."""
+    names = sorted(
+        {n for n in tool_names if "_" in n and re.fullmatch(r"[A-Za-z0-9_]+", n)},
+        key=len, reverse=True)
+    return "(?:" + "|".join([*(re.escape(n) for n in names), _GET_TOKEN]) + ")"
+
+
+class _Patterns(NamedTuple):
+    paren: re.Pattern         # 1. parenthetical tool list: "Data Provider (get_x, get_y)"
+    list_suffix: re.Pattern   # 2. separator-introduced list to EOL: "Data Provider — get_x, get_y"
+    tool_id: re.Pattern       # 3. bare inline call / backticked name: "get_x(date)", "`get_x`"
+    bare: re.Pattern          # lint: any tool name in the report body
+
+
+@lru_cache(maxsize=8)  # one entry per distinct run tool-set; tiny
+def _patterns(tool_names: tuple[str, ...]) -> _Patterns:
+    tok = _scrub_token(tool_names)
+    return _Patterns(
+        paren=re.compile(rf"\s*\([^()]*\b{tok}\b[^()]*\)"),
+        list_suffix=re.compile(
+            rf"(?m)\s*[—–:\-]\s*`?{tok}\b`?(?:\s*\([^()]*\))?"
+            rf"(?:\s*,\s*`?{tok}\b`?(?:\s*\([^()]*\))?)*\s*$"),
+        tool_id=re.compile(rf"`?\b{tok}\b`?(?:\s*\([^()]*\))?"),
+        bare=re.compile(rf"\b{tok}\b"),
+    )
+
+
+def _names_key(tool_names) -> tuple[str, ...]:
+    """Normalize any iterable of names to the hashable, order-independent cache key."""
+    return tuple(sorted(set(tool_names or ())))
+
+
 # Stray implementation adjective.
 _SERVER_SIDE = re.compile(r"\s*\bserver-side\b")
 # Artifacts left by the removals above.
@@ -42,9 +72,8 @@ _MULTISPACE = re.compile(r"[ \t]{2,}")
 
 _CITE = re.compile(r"\[(\d+)\]")
 _SOURCES_HEADING = re.compile(r"(?im)^\s{0,3}#{1,6}\s*sources\b.*$")
-# A bare data-layer tool name left in prose, and a backticked field/identifier (snake_case)
-# — both are machinery that must not appear in the report body.
-_BARE_TOOL = re.compile(r"\bget_[a-z0-9_]+")
+# A backticked field/identifier (snake_case) — machinery that must not appear in the
+# report body. (Bare tool names are matched by the per-run ``_patterns().bare``.)
 _BACKTICK_FIELD = re.compile(r"`[^`\n]*[a-z]+_[a-z]+[^`\n]*`")
 # A Sources bullet: "- [1] Label" / "- [1][2] Label" → captures the label after the numbers.
 _SRC_LABEL = re.compile(r"^\s*-?\s*(?:\[\d+\])+\s*(.+?)\s*$")
@@ -57,13 +86,16 @@ _SRC_EMPTY = re.compile(r"^\s*-\s*(?:\s*\[\d+\])+\s*$")
 _SRC_BOLD = re.compile(r"(?m)^(\s*-\s*)\*\*((?:\[\d+\])+[^*\n]*)\*\*\s*$")
 
 
-def scrub_report(md: str) -> str:
-    """Remove leaked data-layer machinery from report markdown. Idempotent and prose-safe."""
+def scrub_report(md: str, tool_names=()) -> str:
+    """Remove leaked data-layer machinery from report markdown. Idempotent and prose-safe.
+    ``tool_names`` is the run's loaded tool list (snake_case names are scrubbed exactly;
+    the ``get_*`` family always matches as a fallback)."""
     if not md:
         return md
-    out = _TOOL_PAREN.sub("", md)  # (get_a, get_b)
-    out = _TOOL_LIST_SUFFIX.sub("", out)  # — get_a, get_b   /   : get_a, get_b
-    out = _TOOL_ID.sub(
+    pats = _patterns(_names_key(tool_names))
+    out = pats.paren.sub("", md)  # (get_a, get_b)
+    out = pats.list_suffix.sub("", out)  # — get_a, get_b   /   : get_a, get_b
+    out = pats.tool_id.sub(
         "the underlying data", out
     )  # bare get_a(args) / `get_a` left in prose
     out = _SERVER_SIDE.sub("", out)
@@ -117,7 +149,7 @@ def _duplicate_source_label(sources: str) -> str | None:
     return None
 
 
-def report_problems(md: str) -> list[str]:
+def report_problems(md: str, tool_names=()) -> list[str]:
     """Presentation-contract violations a research report must NOT ship with — limited to the
     ones the AUTHORING model can fix because it knows which claim maps to which source (inline
     citations, source grouping) or how to reword machinery (field/tool names). Returns a list
@@ -167,8 +199,8 @@ def report_problems(md: str) -> list[str]:
             f"and group its numbers (e.g. '[1][2][3] {dup}')"
         )
 
-    if _BARE_TOOL.search(body):
-        probs.append("remove tool/function names (get_*) from the report body")
+    if _patterns(_names_key(tool_names)).bare.search(body):
+        probs.append("remove tool/function names from the report body")
 
     fields = list(dict.fromkeys(_BACKTICK_FIELD.findall(body)))
     if fields:

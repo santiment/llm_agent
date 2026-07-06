@@ -16,19 +16,10 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage
 
 from .events import emit
-from .turn import current_turn
+from .turn import current_turn, tc_args, tc_name
 
 # Matches the mount prefix used in agent.build_skills (CompositeBackend route).
 _SKILLS_MARKER = "/skills/"
-
-
-def _tc_name(tc: Any) -> str:
-    return (tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")) or ""
-
-
-def _tc_args(tc: Any) -> dict:
-    args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
-    return args if isinstance(args, dict) else {}
 
 
 def _skill_name_from_path(path: str) -> str | None:
@@ -47,9 +38,9 @@ def _skill_reads(message: Any) -> list[tuple[str, str]]:
     if not isinstance(message, AIMessage):
         return out
     for tc in getattr(message, "tool_calls", None) or []:
-        if _tc_name(tc) != "read_file":
+        if tc_name(tc) != "read_file":
             continue
-        args = _tc_args(tc)
+        args = tc_args(tc)
         path = str(args.get("file_path") or args.get("path") or "")
         name = _skill_name_from_path(path)
         if name:

@@ -2,8 +2,9 @@
 
 ``make_graph`` is a per-run config-factory, so one ``RunMeter`` is created per run and
 shared by:
-  - the MCP tool wrapper (``events.instrument_tool``) — counts every MCP call and its raw
-    result size, across the orchestrator AND all sub-agents (they share the tool objects);
+  - the instrumented tools — MCP + custom via ``events.instrument_tool``, web search via
+    ``build_search_tool`` — counting every call and its raw result size, across the
+    orchestrator AND all sub-agents (they share the tool objects);
   - ``UsageMeterMiddleware.after_agent`` — reads the meter at run end and adds token /
     model-call counts from the orchestrator's messages, then emits a ``usage`` event and
     logs one ``RESEARCH USAGE`` line.

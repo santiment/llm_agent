@@ -24,11 +24,12 @@ from langchain.agents.middleware import AgentMiddleware, AgentState
 from langchain_core.messages import AIMessage, ToolMessage
 from typing_extensions import NotRequired
 
-from .completion import MAX_NUDGES, _called, _looks_delivered
+from .completion import MAX_NUDGES
 from .events import domain_of, emit
 from .report_hygiene import lint_citations, scrub_report
-from .turn import (NUDGE_NAME, count_nudges, current_turn, did_research_work,
-                   is_json_object_dump, text_of, tokens_in, tool_calls_in)
+from .turn import (NUDGE_NAME, called, count_nudges, current_turn, did_research_work,
+                   is_json_object_dump, looks_delivered, tc_args, tc_name, text_of,
+                   tokens_in, tool_calls_in)
 
 log = logging.getLogger("deep_research_agent.citations")
 
@@ -45,10 +46,8 @@ def _report_from_submit(messages: list) -> str:
         if not isinstance(m, AIMessage):
             continue
         for tc in getattr(m, "tool_calls", None) or []:
-            name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
-            if name == "submit_report":
-                args = (tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})) or {}
-                rep = args.get("report_markdown")
+            if tc_name(tc) == "submit_report":
+                rep = tc_args(tc).get("report_markdown")
                 if isinstance(rep, str) and rep.strip():
                     return rep
     return ""
@@ -62,12 +61,13 @@ class ResearchState(AgentState):
 class ResearchOutputMiddleware(AgentMiddleware):
     state_schema = ResearchState
 
-    def __init__(self, *, max_tool_calls: int, max_total_tokens: int) -> None:
+    def __init__(self, *, max_tool_calls: int, max_total_tokens: int, tool_names=()) -> None:
         super().__init__()
         # Ceilings are needed to distinguish "ran out of budget" from "just gave up" when
         # classifying WHY a run ended without a report.
         self.max_tool_calls = max_tool_calls
         self.max_total_tokens = max_total_tokens
+        self.tool_names = tuple(tool_names or ())
 
     def after_agent(self, state: dict, runtime) -> dict[str, Any] | None:
         # Scope to the CURRENT turn only — a thread accumulates messages across runs,
@@ -105,14 +105,14 @@ class ResearchOutputMiddleware(AgentMiddleware):
                     # Promote real prose only. A raw JSON blob (e.g. echoed findings
                     # schema) is NOT a report — showing it as one is the garbage we're
                     # guarding against; leave it unsalvaged so the run flags as an error.
-                    if _looks_delivered(txt) and not is_json_object_dump(txt):
+                    if looks_delivered(txt) and not is_json_object_dump(txt):
                         report, salvaged = txt, True
                     break
 
         # Deterministic last-mile hygiene: strip any leaked data-layer machinery so the
         # persisted final_report (and the salvage emit below) match what submit_report already
         # scrubbed on its live emit. Idempotent, so double-scrubbing the submit path is safe.
-        report = scrub_report(report)
+        report = scrub_report(report, self.tool_names)
 
         # submit_report already emitted the live `report` event; only emit on fallback.
         if report and not via_tool:
@@ -130,7 +130,7 @@ class ResearchOutputMiddleware(AgentMiddleware):
         last_ai = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
         end_state, reason, detail = self._classify(
             via_tool=via_tool, researched=researched, salvaged=salvaged,
-            clarified=_called(messages, "request_clarification"),
+            clarified=called(messages, "request_clarification"),
             calls=calls, tokens=tokens, nudges=nudges)
 
         cite = lint_citations(report)

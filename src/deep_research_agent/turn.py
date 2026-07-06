@@ -45,8 +45,57 @@ def current_turn(messages: list) -> list:
     return list(messages)
 
 
-def _tc_name(tc) -> str:
+def tc_name(tc) -> str:
+    """Name of a tool call, whether it is a dict or an object (both shapes occur)."""
     return (tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")) or ""
+
+
+def tc_args(tc) -> dict:
+    """Args of a tool call (same dict-or-object duality), always a dict."""
+    args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
+    return args if isinstance(args, dict) else {}
+
+
+def tool_call_of(request) -> tuple[str, dict, str]:
+    """``(name, args, id)`` of a ``wrap_tool_call`` request's tool call.
+
+    langchain renamed the request field ``call`` -> ``tool_call``; read both so a
+    version bump can't silently turn a gate into a no-op (it did exactly that once).
+    This shim lives HERE, once — every middleware that intercepts tool calls goes
+    through it, so the next rename is a one-line fix."""
+    call = getattr(request, "tool_call", None) or getattr(request, "call", None) or {}
+    if isinstance(call, dict):
+        return (call.get("name") or "", call.get("args") or {}, call.get("id") or "")
+    return (getattr(call, "name", "") or "", getattr(call, "args", None) or {},
+            getattr(call, "id", "") or "")
+
+
+def called(messages: list, name: str) -> bool:
+    """True if a tool with ``name`` was invoked anywhere in the given messages."""
+    for m in messages:
+        if isinstance(m, ToolMessage) and getattr(m, "name", "") == name:
+            return True
+        if isinstance(m, AIMessage):
+            for tc in getattr(m, "tool_calls", None) or []:
+                if tc_name(tc) == name:
+                    return True
+    return False
+
+
+def looks_delivered(content: str) -> bool:
+    """True when a final text is itself a delivered report/answer, not a bare intent
+    stub. The model is supposed to deliver via `submit_report`, but some models write the
+    report as a plain message instead — the citations fallback still surfaces it, so
+    nudging it to "deliver the report" just nags an already-answered model into apology
+    loops. Heuristic: substantial length, a markdown heading, or a Sources section."""
+    t = content.strip()
+    if len(t) >= 400:  # a real report is long; an intent stub ("I will now…") is short
+        return True
+    if re.search(r"(?m)^\s*#{1,3}\s", t):  # markdown heading → a report body
+        return True
+    if re.search(r"(?im)^\s*#*\s*sources\b", t):  # a Sources section
+        return True
+    return False
 
 
 def did_research_work(messages: list) -> bool:
@@ -61,7 +110,7 @@ def did_research_work(messages: list) -> bool:
             return True
         if isinstance(m, AIMessage):
             for tc in getattr(m, "tool_calls", None) or []:
-                if _tc_name(tc) not in _TERMINAL_TOOLS:
+                if tc_name(tc) not in _TERMINAL_TOOLS:
                     return True
     return False
 
