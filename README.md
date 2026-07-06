@@ -100,8 +100,11 @@ Models are chosen by NAME only: `DRA_MODEL_TIER=mid` (or per-run `configurable.m
 
 Stream with `stream_mode=["messages","updates","custom"]` and `stream_subgraphs=True`. The `custom` channel carries protocol events (each a JSON object with `type`); the `messages` channel carries assistant **thinking** tokens for the collapsible pane.
 
+The contract is pinned in code: `events.EVENT_SCHEMAS` registers every type's required keys, `emit` warns on drift, and tests enforce both. Every run opens with a `run_start` handshake — check `protocol_version` there (bumped only on breaking shape changes; additive keys/types don't bump) instead of failing mid-render on an unfamiliar shape.
+
 | `type` | Key fields | Renders as |
 |---|---|---|
+| `run_start` | `protocol_version`, `engine_version` | Version handshake, first event of every run (no UI) |
 | `clarification` | `questions[]` | Question card; input re-enabled. On submit, reply on the **same thread** with each answer paired to its question (`1. Q: … A: …`) — not bare answers |
 | `search_query` | `id`, `query`, `source` | Globe row |
 | `search_results` | `id`, `query`, `ok`, `count`, `results[].{title,url,domain,snippet}` | Favicon + title grid |

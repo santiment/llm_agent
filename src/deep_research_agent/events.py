@@ -19,6 +19,15 @@ Render mapping (Claude / Gemini deep-research UIs):
 Assistant *reasoning* prose (the italic narration between steps) is NOT a custom
 event — it streams on the ``messages`` channel as normal AI tokens, so the UI
 puts it in the "show thinking process" pane.
+
+THE CONTRACT IS CODE, not just this docstring: ``EVENT_SCHEMAS`` below registers every
+event type and its required keys, and ``emit`` warns (never raises) when an event
+misses its shape or uses an unregistered type — so drift shows up in this repo's logs
+and tests, not in a consumer's broken UI. Versioning for consumers: every run opens
+with a ``run_start`` event carrying ``protocol_version`` (bump it on any BREAKING shape
+change — a removed/renamed key or type; additions are compatible and don't bump) and
+``engine_version`` (the installed package version), so a frontend can pin what it
+understands and detect mismatch at run start instead of failing mid-render.
 """
 
 from __future__ import annotations
@@ -35,6 +44,57 @@ from urllib.parse import urlparse
 from langchain_core.tools import BaseTool, StructuredTool
 
 log = logging.getLogger("deep_research_agent.events")
+
+# Bump ONLY on a breaking change to a shipped event's shape (removed/renamed key or
+# type). Additive keys and new event types are backward-compatible — no bump.
+PROTOCOL_VERSION = 1
+
+
+def engine_version() -> str:
+    """Installed package version for the run_start handshake ('unknown' in odd
+    environments — the event must never fail over metadata lookup)."""
+    try:
+        from importlib.metadata import version
+
+        return version("deep-research-agent")
+    except Exception:
+        return "unknown"
+
+
+# type -> keys every event of that type MUST carry (beyond "type"). Optional keys are
+# deliberately not listed — consumers must tolerate extras. ``emit`` checks each event
+# against this registry and WARNS on violation; it never raises (observability must not
+# break a run). Adding an event type without registering it here is itself a warning.
+EVENT_SCHEMAS: dict[str, frozenset[str]] = {
+    "run_start": frozenset({"protocol_version", "engine_version"}),
+    "search_query": frozenset({"id", "query"}),
+    "search_results": frozenset({"id", "query", "ok", "results"}),
+    "source": frozenset({"title", "url", "domain"}),
+    "mcp_call": frozenset({"id", "tool", "args"}),
+    "mcp_result": frozenset({"id", "tool", "ok"}),
+    "tool_call": frozenset({"id", "tool", "args"}),
+    "tool_result": frozenset({"id", "tool", "ok"}),
+    "skill": frozenset({"name", "path", "state"}),
+    "report": frozenset({"markdown"}),
+    "status": frozenset({"state"}),
+    "clarification": frozenset({"questions"}),
+    "usage": frozenset({"tool_calls", "input_tokens", "output_tokens",
+                        "total_tokens", "limits"}),
+    "subagent_findings": frozenset({"unit", "summary", "findings", "gaps"}),
+}
+
+
+def _check_shape(event: dict[str, Any]) -> None:
+    etype = event.get("type")
+    required = EVENT_SCHEMAS.get(etype or "")
+    if required is None:
+        log.warning("EVENT PROTOCOL: unregistered event type %r — register it in "
+                    "EVENT_SCHEMAS", etype)
+        return
+    missing = required - event.keys()
+    if missing:
+        log.warning("EVENT PROTOCOL: %r event missing required keys %s",
+                    etype, sorted(missing))
 
 
 def new_id() -> str:
@@ -61,6 +121,7 @@ def _writer():
 
 def emit(event: dict[str, Any]) -> None:
     """Push one protocol event onto the ``custom`` stream channel (no-op offline)."""
+    _check_shape(event)
     w = _writer()
     if w is not None:
         try:

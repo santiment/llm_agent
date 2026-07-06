@@ -26,7 +26,7 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, ToolMessage
 
-from .events import emit
+from .events import PROTOCOL_VERSION, emit, engine_version
 from .turn import current_turn
 
 log = logging.getLogger("deep_research_agent.usage")
@@ -55,7 +55,8 @@ class RunMeter:
 
 
 class UsageMeterMiddleware(AgentMiddleware):
-    """Emit a per-run ``usage`` event + ``RESEARCH USAGE`` log at the end of every run."""
+    """Emit the ``run_start`` version handshake at the start and a per-run ``usage``
+    event + ``RESEARCH USAGE`` log at the end of every run."""
 
     def __init__(self, meter: RunMeter, *, max_tool_calls: int,
                  max_total_tokens: int, recursion_limit: int) -> None:
@@ -64,6 +65,14 @@ class UsageMeterMiddleware(AgentMiddleware):
         self.max_tool_calls = max_tool_calls
         self.max_total_tokens = max_total_tokens
         self.recursion_limit = recursion_limit
+
+    def before_agent(self, state: dict, runtime) -> dict[str, Any] | None:
+        # Version handshake, first event of every run: a consumer pins the
+        # protocol_version it renders and can flag a mismatch up-front instead of
+        # breaking on an unfamiliar shape mid-run.
+        emit({"type": "run_start", "protocol_version": PROTOCOL_VERSION,
+              "engine_version": engine_version()})
+        return None
 
     def after_agent(self, state: dict, runtime) -> dict[str, Any] | None:
         msgs = current_turn(state.get("messages") or [])
