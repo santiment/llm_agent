@@ -45,7 +45,7 @@ class _Patterns(NamedTuple):
 
 
 @lru_cache(maxsize=8)  # one entry per distinct run tool-set; tiny
-def _patterns(tool_names: tuple[str, ...]) -> _Patterns:
+def _compile(tool_names: tuple[str, ...]) -> _Patterns:
     tok = _scrub_token(tool_names)
     return _Patterns(
         paren=re.compile(rf"\s*\([^()]*\b{tok}\b[^()]*\)"),
@@ -57,9 +57,10 @@ def _patterns(tool_names: tuple[str, ...]) -> _Patterns:
     )
 
 
-def _names_key(tool_names) -> tuple[str, ...]:
-    """Normalize any iterable of names to the hashable, order-independent cache key."""
-    return tuple(sorted(set(tool_names or ())))
+def _patterns(tool_names) -> _Patterns:
+    """Compiled patterns for a run's tool-set. Takes ANY iterable and normalizes it to
+    the hashable, order-independent cache key, so callers just pass their tool names."""
+    return _compile(tuple(sorted(set(tool_names or ()))))
 
 
 # Stray implementation adjective.
@@ -92,7 +93,7 @@ def scrub_report(md: str, tool_names=()) -> str:
     the ``get_*`` family always matches as a fallback)."""
     if not md:
         return md
-    pats = _patterns(_names_key(tool_names))
+    pats = _patterns(tool_names)
     out = pats.paren.sub("", md)  # (get_a, get_b)
     out = pats.list_suffix.sub("", out)  # — get_a, get_b   /   : get_a, get_b
     out = pats.tool_id.sub(
@@ -199,7 +200,7 @@ def report_problems(md: str, tool_names=()) -> list[str]:
             f"and group its numbers (e.g. '[1][2][3] {dup}')"
         )
 
-    if _patterns(_names_key(tool_names)).bare.search(body):
+    if _patterns(tool_names).bare.search(body):
         probs.append("remove tool/function names from the report body")
 
     fields = list(dict.fromkeys(_BACKTICK_FIELD.findall(body)))

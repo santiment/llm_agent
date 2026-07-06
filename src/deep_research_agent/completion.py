@@ -91,16 +91,14 @@ class ForceCompletionMiddleware(AgentMiddleware):
         # Only an ending that follows real research work is a premature mid-research stall.
         if not did_research_work(turn):
             return None
-        # The model produced a substantial report/answer as plain text. Don't accept it
-        # silently — the text would only reach the user via the citations salvage,
-        # OUTSIDE the report channel (skipping the quality gate). One mechanical
-        # resubmit-verbatim instruction; if the model still answers in prose, accept and
-        # let the salvage deliver it (repeat nagging is what drives apology loops).
-        # A raw JSON blob (often the echoed findings schema) or a delivered-looking prose
-        # report ended the turn instead of a submit_report call. Both get ONE resubmit
-        # nudge, then are accepted (prose is salvaged; a JSON blob is dropped, not shown).
-        # JSON is its own branch — length-independent (a dump is never valid) — and gets a
-        # REWRITE-to-markdown instruction, NOT "resubmit verbatim" (which would ship JSON).
+        # A delivered-looking prose report, or a raw JSON blob (often the echoed findings
+        # schema), ended the turn instead of a submit_report call. Don't accept either
+        # silently: the text would reach the user only via the citations salvage, OUTSIDE
+        # the report channel (skipping the quality gate). Both get ONE resubmit nudge,
+        # then are accepted — repeat nagging is what drives apology loops (prose is
+        # salvaged; a JSON blob is dropped, not shown). JSON is its own branch, length-
+        # independent (a dump is never valid), and gets a REWRITE-to-markdown instruction
+        # rather than "resubmit verbatim", which would ship the JSON as the report.
         jsonish = is_json_object_dump(content)
         if jsonish or looks_delivered(content):
             if count_nudges(turn, RESUBMIT_NUDGE_NAME) >= MAX_RESUBMIT_NUDGES:

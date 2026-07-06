@@ -1,9 +1,11 @@
 """Drop-in loader for deployment-specific tools.
 
 Keeps the agent generic: any environment-specific tool lives as a ``*.py`` file
-in the gitignored ``custom_tools/`` directory (``cfg.custom_tools_dir``) instead
-of being hard-coded here. Adding a tool needs NO change to config / agent /
-prompts — drop a file in, restart.
+in the ``custom_tools/`` directory (``cfg.custom_tools_dir``) instead of being
+hard-coded here. Adding a tool needs NO change to config / agent / prompts —
+drop a file in, restart. The files in this repo's ``custom_tools/`` are
+committed; a deployment that would rather keep its own out of git can point
+``DRA_CUSTOM_TOOLS_DIR`` elsewhere or uncomment the rule in ``.gitignore``.
 
 There are two ways to declare a tool in a plugin file. Pick whichever fits.
 
@@ -146,11 +148,15 @@ def _load_one(path: str, cfg: object) -> list[BaseTool]:
 
     base = os.path.basename(path)
     classes = _custom_tool_classes(module)
-    factory = _find_factory(module)
+    # The escape hatch: a build_tools/build_tool factory returning tool(s), or None.
+    factory = next((getattr(module, n) for n in _FACTORY_NAMES
+                    if callable(getattr(module, n, None))), None)
 
     tools: list[BaseTool] = _tools_from_classes(classes, cfg, base)
     if factory is not None:
-        tools.extend(_call_factory(factory, cfg))
+        made = factory(cfg)
+        if made is not None:
+            tools.extend(made if isinstance(made, (list, tuple)) else [made])
 
     # Warn only when the file declares NO tool at all. A class that is gated off by
     # enabled() / fails to build, or a factory that legitimately returns [] (its own
@@ -203,18 +209,3 @@ def _tool_from_instance(instance: CustomTool) -> BaseTool:
             coroutine=run, name=instance.name, description=instance.description)
     return StructuredTool.from_function(
         func=run, name=instance.name, description=instance.description)
-
-
-def _find_factory(module: object):
-    """The ``build_tools`` / ``build_tool`` factory the file defines, or ``None``."""
-    return next(
-        (getattr(module, n) for n in _FACTORY_NAMES if callable(getattr(module, n, None))),
-        None)
-
-
-def _call_factory(factory, cfg: object) -> list[BaseTool]:
-    """Run a factory and normalize its result to a list (``None`` -> ``[]``)."""
-    result = factory(cfg)
-    if result is None:
-        return []
-    return list(result) if isinstance(result, (list, tuple)) else [result]

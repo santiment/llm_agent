@@ -13,10 +13,9 @@ from __future__ import annotations
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import AIMessage
 
 from .events import emit
-from .turn import current_turn, tc_args, tc_name
+from .turn import current_turn, tool_calls_of
 
 # Matches the mount prefix used in agent.build_skills (CompositeBackend route).
 _SKILLS_MARKER = "/skills/"
@@ -35,12 +34,9 @@ def _skill_name_from_path(path: str) -> str | None:
 def _skill_reads(message: Any) -> list[tuple[str, str]]:
     """``(skill_name, path)`` for every ``read_file`` call in an AIMessage hitting a skill."""
     out: list[tuple[str, str]] = []
-    if not isinstance(message, AIMessage):
-        return out
-    for tc in getattr(message, "tool_calls", None) or []:
-        if tc_name(tc) != "read_file":
+    for tool, args in tool_calls_of(message):
+        if tool != "read_file":
             continue
-        args = tc_args(tc)
         path = str(args.get("file_path") or args.get("path") or "")
         name = _skill_name_from_path(path)
         if name:

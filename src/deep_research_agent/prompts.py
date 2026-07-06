@@ -128,7 +128,7 @@ arithmetic or "simulating" a program in your head.
 - LARGE RESULTS ARE SAVED TO FILES. When a data tool returns a lot of rows, the result is \
 written to a file (its path, row count, columns and a small preview are shown to you) \
 instead of being pasted inline. To use that data, load the FILE with the `execute` tool \
-(Python/pandas or duckdb over the JSON) and compute aggregates / joins / filters THERE — \
+(Python + pandas/numpy over the JSON) and compute aggregates / joins / filters THERE — \
 this is exactly how you handle scale (e.g. a large cross-entity sweep). Do NOT re-call the \
 tool to page the same rows, and do NOT guess at the contents — read the file.
 - NEVER claim or imply you ran code unless you truly executed it and are showing its real \
@@ -223,7 +223,7 @@ market sentiment), entity, reporting period, or segment.
     + """
 - Make ALL the web/data calls your unit needs — use `web_search` and the data tools below \
 aggressively — then distill. Prefer computing aggregates/derived figures in the sandbox \
-with `execute` (Python/pandas/duckdb) over reasoning across raw rows in your head.
+with `execute` (Python + pandas/numpy) over reasoning across raw rows in your head.
 - Your returned findings are the ONLY thing the orchestrator sees — it does NOT see your \
 raw tool output. Pack everything it needs into the RETURN FORMAT below: figures, \
 definitions, named entities, dates — every finding carrying its source (URL for web; \
@@ -235,7 +235,7 @@ unit.
 - Run code for real or not at all: only report output you ACTUALLY got from executing it (the \
 `execute` tool). If you can't run it, say so and show the code unrun — never invent results.
 - LARGE RESULTS ARE SAVED TO FILES: when a data tool returns many rows you get a file path + \
-preview, not the rows. Load the file with `execute` (Python/duckdb) and compute there; don't \
+preview, not the rows. Load the file with `execute` (Python/pandas) and compute there; don't \
 re-call the tool to page the same data.
 - Do NOT write the final report or a polished intro/conclusion. Return raw findings the \
 orchestrator will synthesize.
@@ -266,27 +266,25 @@ def describe_mcp_sources(servers: list[dict]) -> str:
     )
 
 
-def _domain_block(domain_prompt: str) -> str:
-    """Wrap deployment-supplied guidance in a labeled block for the ``<<DOMAIN>>`` slot,
-    so the model can tell engine contract from domain color. Empty -> empty string
-    (the slot collapses and the prompt reads exactly as before)."""
-    text = (domain_prompt or "").strip()
-    if not text:
-        return ""
-    return f"\nDOMAIN CONTEXT (deployment-specific — apply throughout)\n{text}\n"
+def _render(template: str, mcp_prompt: str, domain_prompt: str) -> str:
+    """Fill a prompt's two slots.
+
+    MCP source NAMES come from the data-sources list injected at ``<<MCP_TOOLS>>`` (built
+    by describe_mcp_sources for the direct path, or the host app's mcp_prompt for the
+    gateway path). The CITATIONS rule tells the model to cite by those exact names —
+    single source of truth, so the report never falls back to "the connected data tools".
+
+    Deployment guidance goes into ``<<DOMAIN>>`` inside a labeled block, so the model can
+    tell engine contract from domain color. No domain prompt -> the slot collapses and
+    the prompt reads exactly as it did before the feature existed."""
+    domain = (domain_prompt or "").strip()
+    block = f"\nDOMAIN CONTEXT (deployment-specific — apply throughout)\n{domain}\n" if domain else ""
+    return template.replace(_MCP_SLOT, mcp_prompt or "").replace(_DOMAIN_SLOT, block)
 
 
 def orchestrator_prompt(mcp_prompt: str, domain_prompt: str = "") -> str:
-    # MCP source NAMES come from the data-sources list injected at <<MCP_TOOLS>> (built by
-    # describe_mcp_sources for the direct path, or the host app's mcp_prompt for the gateway
-    # path). The CITATIONS rule tells the model to cite by those exact names — single source
-    # of truth, so the report never falls back to "the connected data tools".
-    return (ORCHESTRATOR_PROMPT
-            .replace(_MCP_SLOT, mcp_prompt or "")
-            .replace(_DOMAIN_SLOT, _domain_block(domain_prompt)))
+    return _render(ORCHESTRATOR_PROMPT, mcp_prompt, domain_prompt)
 
 
 def subagent_prompt(mcp_prompt: str, domain_prompt: str = "") -> str:
-    return (SUBAGENT_PROMPT
-            .replace(_MCP_SLOT, mcp_prompt or "")
-            .replace(_DOMAIN_SLOT, _domain_block(domain_prompt)))
+    return _render(SUBAGENT_PROMPT, mcp_prompt, domain_prompt)

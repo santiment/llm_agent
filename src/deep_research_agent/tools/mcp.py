@@ -14,7 +14,7 @@ import logging
 from langchain_core.tools import BaseTool
 
 from ..config import ResearchConfig
-from ..events import emit, instrument_tool
+from ..events import emit, instrument_tool, result_handling
 
 log = logging.getLogger("deep_research_agent.mcp")
 
@@ -85,11 +85,7 @@ async def load_mcp_tools(
             instrument_tool(
                 t, kind="mcp", semaphore=gate,
                 rate_limit_max_wait=cfg.mcp_rate_limit_max_wait,
-                max_result_chars=cfg.max_result_chars,
-                max_result_rows=cfg.max_result_rows,
-                meter=meter,
-                offload_sink=offload_sink,
-                offload_dir=cfg.offload_dir,
+                **result_handling(cfg, meter, offload_sink),
             )
             for t in tools
         )

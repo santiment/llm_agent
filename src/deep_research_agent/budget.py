@@ -80,43 +80,24 @@ class BudgetMiddleware(AgentMiddleware):
             else "tokens"
         )
         reason = f"{calls}/{self.max_tool_calls} tool calls, ~{tokens:,}/{self.max_total_tokens:,} tokens"
+
+        def status(state: str) -> None:
+            emit({"type": "status", "state": state, "reason": which,
+                  "tool_calls": calls, "tokens": tokens})
+
         if over_hard:
             # Guaranteed stop. after_agent salvages what was gathered; we add no message
             # so the salvage picks the model's last real text, not a synthetic stub.
             log.warning("BUDGET HARD STOP (%s): %s — ending run", which, reason)
-            emit(
-                {
-                    "type": "status",
-                    "state": "budget_halt",
-                    "reason": which,
-                    "tool_calls": calls,
-                    "tokens": tokens,
-                }
-            )
+            status("budget_halt")
             return {"jump_to": "end"}
 
         # SOFT: ask the model to wrap up and deliver — once (capped), then let the hard
         # ceiling stop it if it ignores us.
-        nudges = count_nudges(turn, BUDGET_NUDGE_NAME)
-        if nudges >= MAX_BUDGET_NUDGES:
-            log.warning(
-                "BUDGET SOFT: nudge cap reached (%s); awaiting hard stop", reason
-            )
+        if count_nudges(turn, BUDGET_NUDGE_NAME) >= MAX_BUDGET_NUDGES:
+            log.warning("BUDGET SOFT: nudge cap reached (%s); awaiting hard stop", reason)
             return None
         log.warning("BUDGET SOFT (%s): nudging to wrap up — %s", which, reason)
-        emit(
-            {
-                "type": "status",
-                "state": "budget_soft",
-                "reason": which,
-                "tool_calls": calls,
-                "tokens": tokens,
-            }
-        )
-        return {
-            "messages": [
-                HumanMessage(
-                    content=_WRAP_UP.format(reason=reason), name=BUDGET_NUDGE_NAME
-                )
-            ]
-        }
+        status("budget_soft")
+        return {"messages": [HumanMessage(content=_WRAP_UP.format(reason=reason),
+                                          name=BUDGET_NUDGE_NAME)]}

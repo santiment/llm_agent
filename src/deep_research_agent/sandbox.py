@@ -13,12 +13,13 @@ means making it the agent's default backend. Three pieces:
   - `SandboxCompositeBackend(CompositeBackend, SandboxBackendProtocol)` — keeps `/skills/`
     routing while still being recognized as a sandbox so `execute` turns on (it delegates
     execute/id to the sandbox default).
-  - `SandboxCleanupMiddleware` — destroys the run's session in `after_agent` (the service's
-    own session timeout is the backstop).
+  - `SandboxCleanupMiddleware` — destroys the run's session in `after_agent`/`aafter_agent`
+    (the service's own session timeout is the backstop).
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -152,15 +153,28 @@ class SandboxCompositeBackend(CompositeBackend, SandboxBackendProtocol):
 
 
 class SandboxCleanupMiddleware(AgentMiddleware):
-    """Destroy the per-run sandbox session at the end of the run."""
+    """Destroy the per-run sandbox session at the end of the run.
+
+    Both hooks are defined: langchain prefers ``aafter_agent`` on the async path (the
+    one `make_graph` actually runs) and falls back to ``after_agent`` for sync callers.
+    The async one MUST offload to a thread — ``close`` is a sync HTTP DELETE with a 15 s
+    timeout, and a stalled sandbox would otherwise block the event loop that long.
+    """
 
     def __init__(self, backend: HttpSandboxBackend) -> None:
         super().__init__()
         self._backend = backend
 
-    def after_agent(self, state: dict, runtime) -> dict[str, Any] | None:
+    def _close(self) -> None:
         try:
             self._backend.close()
         except Exception as exc:  # never break a run on cleanup
             log.warning("sandbox cleanup failed: %s", exc)
+
+    def after_agent(self, state: dict, runtime) -> dict[str, Any] | None:
+        self._close()
+        return None
+
+    async def aafter_agent(self, state: dict, runtime) -> dict[str, Any] | None:
+        await asyncio.to_thread(self._close)
         return None

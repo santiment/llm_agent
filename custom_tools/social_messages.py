@@ -1,7 +1,9 @@
 """Custom (deployment-specific) tool: Santiment social messages.
 
-Drop-in plugin auto-loaded by ``deep_research_agent.tools.custom`` — this file is
-NOT committed (custom_tools/ is gitignored), so the agent codebase stays generic.
+Drop-in plugin auto-loaded by ``deep_research_agent.tools.custom``. It lives here
+rather than in the agent's source tree so the codebase itself stays generic: nothing
+under ``src/`` knows this tool exists, and a deployment without ``DRA_METRICS_HUB_URL``
+never loads it.
 
 Exposes a `social_messages` tool that POSTs to metrics-hub-server's
 ``/sample_documents`` for a stratified sample of raw social posts about a coin

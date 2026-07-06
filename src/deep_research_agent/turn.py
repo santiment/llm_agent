@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+from typing import Iterator
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
@@ -70,16 +71,31 @@ def tool_call_of(request) -> tuple[str, dict, str]:
             getattr(call, "id", "") or "")
 
 
+def tool_calls_of(message) -> Iterator[tuple[str, dict]]:
+    """``(name, args)`` for every tool call an AIMessage requested; nothing for any
+    other message type. The ONE place that knows tool_calls may be absent and that each
+    entry is dict-or-object — every caller that reads a requested call goes through it."""
+    if not isinstance(message, AIMessage):
+        return
+    for tc in getattr(message, "tool_calls", None) or []:
+        yield tc_name(tc), tc_args(tc)
+
+
+def tool_names_in(messages: list) -> Iterator[str]:
+    """Every tool invocation visible in ``messages``, as a name: a returned ToolMessage,
+    or a tool call the model requested on an AIMessage. ONE definition of "the agent
+    invoked a tool", so the questions asked of it below can't drift apart."""
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            yield getattr(m, "name", "") or ""
+        else:
+            for name, _args in tool_calls_of(m):
+                yield name
+
+
 def called(messages: list, name: str) -> bool:
     """True if a tool with ``name`` was invoked anywhere in the given messages."""
-    for m in messages:
-        if isinstance(m, ToolMessage) and getattr(m, "name", "") == name:
-            return True
-        if isinstance(m, AIMessage):
-            for tc in getattr(m, "tool_calls", None) or []:
-                if tc_name(tc) == name:
-                    return True
-    return False
+    return any(n == name for n in tool_names_in(messages))
 
 
 def looks_delivered(content: str) -> bool:
@@ -105,14 +121,7 @@ def did_research_work(messages: list) -> bool:
     This is the line between a *research report* (must be delivered via submit_report)
     and a *direct conversational answer* (a simple question answered from knowledge,
     which legitimately ends the turn as plain text — no report card, no nudging)."""
-    for m in messages:
-        if isinstance(m, ToolMessage) and getattr(m, "name", "") not in _TERMINAL_TOOLS:
-            return True
-        if isinstance(m, AIMessage):
-            for tc in getattr(m, "tool_calls", None) or []:
-                if tc_name(tc) not in _TERMINAL_TOOLS:
-                    return True
-    return False
+    return any(n not in _TERMINAL_TOOLS for n in tool_names_in(messages))
 
 
 _CHARS_PER_TOKEN = 4  # fallback estimate when usage_metadata is absent

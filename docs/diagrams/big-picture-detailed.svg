@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1140 600" width="1140" height="600" font-family="Inter, 'Segoe UI', system-ui, sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <!-- run container -->
+  <rect x="170" y="40" width="800" height="470" rx="16" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <text x="188" y="64" fill="#94a3b8" font-size="13" font-weight="600" letter-spacing="1">ONE RESEARCH RUN</text>
+
+  <!-- user question -->
+  <rect x="20" y="208" width="132" height="60" rx="12" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="86" y="243" text-anchor="middle" fill="#0f172a" font-size="15" font-weight="600">Your question</text>
+  <line x1="152" y1="238" x2="226" y2="238" stroke="#475569" stroke-width="2" marker-end="url(#a)"/>
+
+  <!-- orchestrator -->
+  <rect x="230" y="150" width="270" height="160" rx="14" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="365" y="184" text-anchor="middle" fill="#1e3a8a" font-size="17" font-weight="700">ORCHESTRATOR</text>
+  <text x="365" y="206" text-anchor="middle" fill="#1e40af" font-size="13">smart model</text>
+  <text x="365" y="242" text-anchor="middle" fill="#1e3a8a" font-size="14" font-weight="600">triage · plan</text>
+  <text x="365" y="266" text-anchor="middle" fill="#1e3a8a" font-size="14" font-weight="600">gather · synthesize</text>
+
+  <!-- ReAct self-loop -->
+  <path d="M325,310 C325,352 405,352 405,310" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#a)"/>
+  <text x="365" y="346" text-anchor="middle" fill="#475569" font-size="12">ReAct loop</text>
+
+  <!-- sub-agents (stacked) -->
+  <rect x="666" y="148" width="258" height="120" rx="14" fill="#d1fae5" stroke="#10b981" stroke-width="1.5"/>
+  <rect x="658" y="155" width="258" height="120" rx="14" fill="#d1fae5" stroke="#10b981" stroke-width="1.5"/>
+  <rect x="650" y="162" width="258" height="120" rx="14" fill="#d1fae5" stroke="#10b981" stroke-width="1.5"/>
+  <text x="779" y="194" text-anchor="middle" fill="#065f46" font-size="16" font-weight="700">research-subagents</text>
+  <text x="779" y="216" text-anchor="middle" fill="#047857" font-size="13">cheap model · isolated context</text>
+  <text x="779" y="244" text-anchor="middle" fill="#047857" font-size="13">one unit each, in parallel</text>
+
+  <!-- orchestrator <-> subagents -->
+  <line x1="500" y1="198" x2="648" y2="198" stroke="#475569" stroke-width="2" marker-end="url(#a)"/>
+  <text x="574" y="188" text-anchor="middle" fill="#475569" font-size="12">task — partition the work</text>
+  <line x1="648" y1="252" x2="502" y2="252" stroke="#475569" stroke-width="2" marker-end="url(#a)"/>
+  <text x="574" y="270" text-anchor="middle" fill="#475569" font-size="12">findings JSON · every claim sourced</text>
+
+  <!-- shared tools -->
+  <rect x="230" y="372" width="678" height="70" rx="12" fill="#fef3c7" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="248" y="398" fill="#92400e" font-size="14" font-weight="700">Shared tools</text>
+  <text x="248" y="423" fill="#92400e" font-size="13">web_search · MCP data · custom tools · execute (sandbox) · file read/write</text>
+
+  <!-- tool usage arrows -->
+  <line x1="262" y1="310" x2="262" y2="370" stroke="#475569" stroke-width="2" marker-end="url(#a)"/>
+  <text x="252" y="346" text-anchor="end" fill="#475569" font-size="12">targeted calls</text>
+  <line x1="800" y1="282" x2="800" y2="370" stroke="#475569" stroke-width="2" marker-end="url(#a)"/>
+  <text x="812" y="330" fill="#475569" font-size="12">all the digging</text>
+
+  <!-- final report (out of run) -->
+  <rect x="1000" y="210" width="122" height="62" rx="12" fill="#ede9fe" stroke="#8b5cf6" stroke-width="1.5"/>
+  <text x="1061" y="246" text-anchor="middle" fill="#5b21b6" font-size="15" font-weight="600">Final report</text>
+  <path d="M365,150 L365,72 L1061,72 L1061,208" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#a)"/>
+  <text x="713" y="63" text-anchor="middle" fill="#475569" font-size="13" font-weight="600">submit_report</text>
+
+  <!-- live stream -->
+  <rect x="170" y="540" width="952" height="46" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="646" y="568" text-anchor="middle" fill="#475569" font-size="13">Live stream:  phase · search · tool_call · source · chart · report · usage  →  any UI</text>
+  <line x1="430" y1="510" x2="430" y2="538" stroke="#475569" stroke-width="2" marker-end="url(#a)"/>
+  <text x="442" y="528" fill="#475569" font-size="12">events</text>
+</svg>

@@ -20,6 +20,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 log = logging.getLogger("deep_research_agent.config")
@@ -51,50 +52,38 @@ def _read_prompt_file(path: str) -> str:
 # Hostnames that resolve to cloud-metadata endpoints — never a legitimate MCP target.
 _BLOCKED_MCP_HOSTNAMES = {"metadata", "metadata.google.internal"}
 
-# Named model packages ("price tiers") — THE ONLY place models are chosen. Callers
-# and the environment select a package by NAME (configurable ``model_tier`` /
-# env ``DRA_MODEL_TIER``); individual models are not settable per run or per env, so
-# every model that can ever run is named here, in one reviewed place.
-# DEFAULT_MODEL_TIER applies when nothing is configured — the cheapest package, so a
-# bare checkout can't silently burn money; production callers opt UP explicitly.
-# To add a packaging: add an entry here, pick a name, document it in the README's
-# Model tiers table — callers then just set model_tier=<name>.
-# OpenRouter slugs. The inline ($in/$out per 1M tokens) figures were verified live on
-# 2026-06-11 — they DRIFT; re-check on OpenRouter before relying on them or editing.
+# Default for the ``streaming_denylist`` field — a module constant so the field default
+# and the resolver share ONE list instead of repeating the model substring.
+_DEFAULT_STREAMING_DENYLIST = ["deepseek-v4-flash"]
+
+# Named model packages ("price tiers") — the ONLY place models are chosen; callers pick a
+# package by name (``model_tier`` / ``DRA_MODEL_TIER``), never a model. See README for what
+# each tier is for. Inline $in/$out per 1M tokens, verified 2026-07-30 (they drift);
+# tests/test_model_tiering.py parses them and fails if a fleet outprices its planner, if a
+# tier undercuts the one below it, or if a slug carries no price.
 MODEL_TIERS: dict[str, dict[str, str]] = {
-    # Rock bottom: deepseek-v4-flash for both tool-loop roles — it's already this tier's
-    # orchestrator AND the `low` tier's sub-agent, so it's proven reliable at the job
-    # here (unlike gpt-oss, which gave up and returned empty findings). Same model for
-    # both means the sub-agent is never pricier than the orchestrator, and delegation
-    # still pays off via context isolation (raw data stays in sub-agent contexts).
-    # Utility is a cheaper Qwen for input-heavy map/extract. The orchestrator still plans
-    # worse + quits earlier than higher tiers — the force-completion / findings-gate /
-    # budget backstops keep runs honest, not great. Demos, smoke tests, high-volume
-    # low-stakes ticks; not for decisions.
+    # mimo-v2.5 is absent from _DEFAULT_STREAMING_DENYLIST, so this default tier's planner
+    # streams — add it there if tool_calls come back doubled or dropped.
     "extra-low": {
-        "research_model": "deepseek/deepseek-v4-flash",            # $0.10 / $0.20
-        "subagent_model": "deepseek/deepseek-v4-flash",            # $0.10 / $0.20
+        "research_model": "xiaomi/mimo-v2.5",                      # $0.14 / $0.28
+        "subagent_model": "deepseek/deepseek-v4-flash",            # $0.14 / $0.28
         "utility_model": "qwen/qwen3-30b-a3b-instruct-2507",       # $0.05 / $0.19
     },
-    # Cheapest sane agent: v4-pro orchestrator over v4-flash workers. deepseek-v4-flash
-    # streaming is force-disabled via streaming_denylist (known off-spec chunks).
     "low": {
-        "research_model": "deepseek/deepseek-v4-pro",              # $0.44 / $0.87
-        "subagent_model": "deepseek/deepseek-v4-flash",            # $0.10 / $0.20
-        "utility_model": "deepseek/deepseek-v4-flash",             # $0.10 / $0.20
+        "research_model": "deepseek/deepseek-v4-pro",              # $0.43 / $0.87
+        "subagent_model": "deepseek/deepseek-v4-flash",            # $0.14 / $0.28
+        "utility_model": "deepseek/deepseek-v4-flash",             # $0.14 / $0.28
     },
-    # The value sweet spot: current-gen flash orchestrator, cheaper flash workers.
     "mid": {
-        "research_model": "google/gemini-3.5-flash",               # $1.50 / $9.00
-        "subagent_model": "google/gemini-2.5-flash",               # $0.30 / $2.50
-        "utility_model": "deepseek/deepseek-v4-flash",             # $0.10 / $0.20
+        "research_model": "google/gemini-3.6-flash",               # $1.50 / $7.50
+        "subagent_model": "xiaomi/mimo-v2.5",                      # $0.14 / $0.28
+        "utility_model": "deepseek/deepseek-v4-flash",             # $0.14 / $0.28
     },
-    # Best research quality. Opus plans and synthesizes ONLY — sub-agent/utility stay
-    # sonnet/haiku tier on purpose (an Opus sub-agent fleet defeats the tiering).
+    # Utility is long-context by design: that slot maps/extracts, so context binds, not depth.
     "high": {
-        "research_model": "anthropic/claude-opus-4.8",             # $5.00 / $25.00
-        "subagent_model": "anthropic/claude-sonnet-4.6",           # $3.00 / $15.00
-        "utility_model": "anthropic/claude-haiku-4.5",             # $1.00 / $5.00
+        "research_model": "anthropic/claude-sonnet-5",             # $2.00 / $10.00
+        "subagent_model": "moonshotai/kimi-k2.6",                  # $0.65 / $2.72
+        "utility_model": "google/gemini-3.5-flash-lite",           # $0.30 / $2.50
     },
 }
 
@@ -107,6 +96,33 @@ def _env(*names: str, default: str = "") -> str:
         if v:
             return v
     return default
+
+
+def _pick(c: dict, *keys: str, env: str = "", default: Any = None) -> Any:
+    """Resolve ONE field: first ``configurable`` key that was supplied (listed in
+    precedence order, so a compat alias can precede the native name), then ``env``,
+    then ``default`` — which is always the dataclass field default, so a knob's
+    default is written exactly once.
+
+    "Supplied" means not ``None`` and not "" (an unset env var reads as ""). Unlike
+    the ``or`` chain this replaces, an explicit ``0`` / ``False`` therefore WINS
+    instead of silently falling back — ``max_retries=0`` means retries off."""
+    for k in keys:
+        v = c.get(k)
+        if v is not None and v != "":
+            return v
+    v = os.environ.get(env) if env else None
+    return default if v in (None, "") else v
+
+
+def _flag(c: dict, *keys: str, env: str = "", default: bool) -> bool:
+    """A boolean knob, resolved by ``_pick``. Env vars (and any other string) are
+    truthy unless they read as an explicit off — one parse for every flag, so
+    ``DRA_STREAMING`` and ``LLM_SANDBOX_NETWORK`` can't disagree on what "no" means."""
+    v = _pick(c, *keys, env=env, default=default)
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "no", "off")
+    return bool(v)
 
 
 def _allowed_base_urls() -> set[str]:
@@ -187,8 +203,15 @@ class ResearchConfig:
     subagent_model: str
     utility_model: str
     temperature: float = 0.0
+    # Per-HTTP-request ceiling (seconds) and retry count on every model call. Without an
+    # explicit timeout the OpenAI client's default applies to a request that a proxied
+    # provider can stall far longer on — one hung call would otherwise pin a research unit
+    # (and its concurrency slot) for the rest of the run. Retries cover transient 429/5xx
+    # and are what the SDK already does between attempts with backoff; 0 disables them.
+    # Override via DRA_REQUEST_TIMEOUT / DRA_MAX_RETRIES.
+    request_timeout: float = 180.0
+    max_retries: int = 3
     search_max_results: int = 6
-    max_concurrent_units: int = 3
     # Hard ceiling on SIMULTANEOUS MCP tool calls across the whole run (orchestrator +
     # all parallel sub-researchers share it). langchain-mcp-adapters opens a NEW
     # streamable_http connection per call, so without this the agent's fan-out can open
@@ -214,10 +237,11 @@ class ResearchConfig:
     # configurable ``domain_prompt`` -> env ``DRA_DOMAIN_PROMPT`` (inline text) ->
     # env ``DRA_DOMAIN_PROMPT_FILE`` (path, read at config time).
     domain_prompt: str = ""
-    # Gitignored drop-in directory of deployment-specific tools. Each ``*.py`` file that
-    # defines ``build_tools(cfg)`` (or ``build_tool(cfg)``) returning LangChain tool(s) is
-    # auto-loaded into the agent's tool list — no edits to this generic codebase. Absent
-    # dir = no custom tools. Override via ``DRA_CUSTOM_TOOLS_DIR``.
+    # Drop-in directory of deployment-specific tools. Each ``*.py`` file that subclasses
+    # ``CustomTool`` — or defines ``build_tools(cfg)`` / ``build_tool(cfg)`` returning
+    # LangChain tool(s) — is auto-loaded into the agent's tool list, with no edits to this
+    # generic codebase. Absent dir = no custom tools. Point ``DRA_CUSTOM_TOOLS_DIR`` at a
+    # deployment's own directory to load tools that live outside this repo.
     custom_tools_dir: str = ""
     # Directory of agent skills (folders each containing a SKILL.md). Loaded read-only
     # at startup. For now a single local dir; a future loader will layer system-wide +
@@ -231,7 +255,8 @@ class ResearchConfig:
     # DOUBLED metadata (finish_reason "stopstop", doubled model_name) and tool_calls get
     # dropped, stalling the loop. Streaming is force-disabled for matches (models.py).
     # Override via DRA_STREAMING_DENYLIST (comma-separated substrings).
-    streaming_denylist: list[str] = field(default_factory=lambda: ["deepseek-v4-flash"])
+    streaming_denylist: list[str] = field(
+        default_factory=lambda: list(_DEFAULT_STREAMING_DENYLIST))
     # LangGraph super-step ceiling for the orchestrator (agent.py clamps deepagents' 9_999).
     # ~7 super-steps per ReAct loop here, so this caps loops, not tool calls. Must stay ABOVE
     # max_tool_calls × steps-per-loop so BudgetMiddleware — the real runaway guard — binds
@@ -255,9 +280,9 @@ class ResearchConfig:
     # container's persistent /workspace, so a later `execute` call can read the files back.
     offload_results: bool = True
     offload_dir: str = "/workspace/data"
-    # Code-execution sandbox sidecar (projects/llm_sandbox). When sandbox_url is set, the
-    # agent's DEFAULT filesystem backend becomes the sandbox and deepagents' `execute` tool is
-    # enabled — the model runs REAL shell/python/js in the container. Empty → in-memory
+    # Code-execution sandbox sidecar (the separate llm-sandbox service). When sandbox_url is
+    # set, the agent's DEFAULT filesystem backend becomes the sandbox and deepagents' `execute`
+    # tool is enabled — the model runs REAL shell/python in the container. Empty → in-memory
     # StateBackend (no execution). sandbox_token must match the service's LLM_SANDBOX_TOKEN.
     sandbox_url: str = ""
     sandbox_token: str = ""
@@ -286,7 +311,7 @@ class ResearchConfig:
             base_url = trusted_base
 
         # Named package (see MODEL_TIERS); the cheapest one when nothing is configured.
-        # Per-model keys/env still win slot-by-slot.
+        # A name is the ONLY model input there is — see the note below on legacy keys.
         tier_name = (c.get("model_tier")
                      or _env("DRA_MODEL_TIER", default=DEFAULT_MODEL_TIER)).strip().lower()
         tier = MODEL_TIERS.get(tier_name)
@@ -359,6 +384,14 @@ class ResearchConfig:
             safe_servers.append(s)
         mcp_servers = safe_servers
 
+        # Every remaining field resolves through _pick / _flag: configurable key(s) ->
+        # env var -> the dataclass default (`cls.<field>`, so no default is written twice).
+        # A denylist supplied by the caller is a list; from the env it is comma-separated.
+        denylist = _pick(c, "streaming_denylist", env="DRA_STREAMING_DENYLIST",
+                         default=_DEFAULT_STREAMING_DENYLIST)
+        if isinstance(denylist, str):
+            denylist = denylist.split(",")
+
         return cls(
             openai_api_key=openai_key,
             base_url=base_url,
@@ -367,66 +400,56 @@ class ResearchConfig:
             report_model=report_model,
             subagent_model=subagent_model,
             utility_model=utility_model,
-            temperature=float(c.get("temperature", 0.0) or 0.0),
-            search_max_results=int(c.get("search_max_results", 6) or 6),
-            max_concurrent_units=int(
-                c.get("max_concurrent_research_units")
-                or c.get("max_concurrent_units")
-                or 3),
-            mcp_max_concurrency=max(1, int(
-                c.get("mcp_max_concurrency")
-                or _env("DRA_MCP_MAX_CONCURRENCY")
-                or 10)),
-            mcp_rate_limit_max_wait=float(
-                c.get("mcp_rate_limit_max_wait")
-                or _env("DRA_MCP_RATE_LIMIT_MAX_WAIT")
-                or 120.0),
+            temperature=float(_pick(c, "temperature", default=cls.temperature)),
+            request_timeout=float(_pick(
+                c, "request_timeout", env="DRA_REQUEST_TIMEOUT",
+                default=cls.request_timeout)),
+            max_retries=max(0, int(_pick(
+                c, "max_retries", env="DRA_MAX_RETRIES", default=cls.max_retries))),
+            search_max_results=int(_pick(
+                c, "search_max_results", default=cls.search_max_results)),
+            mcp_max_concurrency=max(1, int(_pick(
+                c, "mcp_max_concurrency", env="DRA_MCP_MAX_CONCURRENCY",
+                default=cls.mcp_max_concurrency))),
+            mcp_rate_limit_max_wait=float(_pick(
+                c, "mcp_rate_limit_max_wait", env="DRA_MCP_RATE_LIMIT_MAX_WAIT",
+                default=cls.mcp_rate_limit_max_wait)),
             mcp_servers=mcp_servers,
             mcp_prompt=c.get("mcp_prompt") or "",
-            domain_prompt=(c.get("domain_prompt") or _env("DRA_DOMAIN_PROMPT")
+            domain_prompt=(_pick(c, "domain_prompt", env="DRA_DOMAIN_PROMPT", default="")
                            or _read_prompt_file(_env("DRA_DOMAIN_PROMPT_FILE"))),
-            custom_tools_dir=(c.get("custom_tools_dir") or _env("DRA_CUSTOM_TOOLS_DIR")
-                              or _repo_dir("custom_tools")),
-            skills_dir=c.get("skills_dir") or _env("DRA_SKILLS_DIR") or _repo_dir("skills"),
-            streaming=(
-                bool(c["streaming"]) if "streaming" in c
-                else _env("DRA_STREAMING", default="true").strip().lower()
-                not in ("0", "false", "no", "off")
-            ),
-            streaming_denylist=(
-                [s.strip().lower() for s in c["streaming_denylist"] if str(s).strip()]
-                if isinstance(c.get("streaming_denylist"), list)
-                else [s.strip().lower() for s in
-                      _env("DRA_STREAMING_DENYLIST", default="deepseek-v4-flash").split(",")
-                      if s.strip()]
-            ),
-            recursion_limit=int(
-                c.get("recursion_limit") or _env("DRA_RECURSION_LIMIT") or 4500),
-            max_tool_calls=int(
-                c.get("max_react_tool_calls")
-                or c.get("max_tool_calls")
-                or _env("DRA_MAX_TOOL_CALLS")
-                or cls.max_tool_calls),
-            max_total_tokens=int(
-                c.get("max_total_tokens") or _env("DRA_MAX_TOTAL_TOKENS")
-                or cls.max_total_tokens),
-            max_result_chars=int(
-                c.get("max_result_chars") or _env("DRA_MAX_RESULT_CHARS") or 60_000),
-            max_result_rows=int(
-                c.get("max_result_rows") or _env("DRA_MAX_RESULT_ROWS") or 1000),
-            offload_results=(
-                bool(c["offload_results"]) if "offload_results" in c
-                else _env("DRA_OFFLOAD_RESULTS", default="true").strip().lower()
-                not in ("0", "false", "no", "off")
-            ),
-            offload_dir=c.get("offload_dir") or _env("DRA_OFFLOAD_DIR") or "/workspace/data",
-            sandbox_url=(c.get("sandbox_url") or _env("LLM_SANDBOX_URL") or "").rstrip("/"),
-            sandbox_token=c.get("sandbox_token") or _env("LLM_SANDBOX_TOKEN") or "",
-            sandbox_network=(
-                bool(c["sandbox_network"]) if "sandbox_network" in c
-                else _env("LLM_SANDBOX_NETWORK", default="false").strip().lower()
-                in ("1", "true", "yes", "on")
-            ),
-            sandbox_session_timeout=int(
-                c.get("sandbox_session_timeout") or _env("LLM_SANDBOX_SESSION_TIMEOUT") or 900),
+            custom_tools_dir=_pick(c, "custom_tools_dir", env="DRA_CUSTOM_TOOLS_DIR",
+                                   default=_repo_dir("custom_tools")),
+            skills_dir=_pick(c, "skills_dir", env="DRA_SKILLS_DIR",
+                             default=_repo_dir("skills")),
+            streaming=_flag(c, "streaming", env="DRA_STREAMING", default=cls.streaming),
+            streaming_denylist=[s.strip().lower() for s in denylist if str(s).strip()],
+            recursion_limit=int(_pick(
+                c, "recursion_limit", env="DRA_RECURSION_LIMIT",
+                default=cls.recursion_limit)),
+            max_tool_calls=int(_pick(
+                c, "max_react_tool_calls", "max_tool_calls", env="DRA_MAX_TOOL_CALLS",
+                default=cls.max_tool_calls)),
+            max_total_tokens=int(_pick(
+                c, "max_total_tokens", env="DRA_MAX_TOTAL_TOKENS",
+                default=cls.max_total_tokens)),
+            max_result_chars=int(_pick(
+                c, "max_result_chars", env="DRA_MAX_RESULT_CHARS",
+                default=cls.max_result_chars)),
+            max_result_rows=int(_pick(
+                c, "max_result_rows", env="DRA_MAX_RESULT_ROWS",
+                default=cls.max_result_rows)),
+            offload_results=_flag(c, "offload_results", env="DRA_OFFLOAD_RESULTS",
+                                  default=cls.offload_results),
+            offload_dir=_pick(c, "offload_dir", env="DRA_OFFLOAD_DIR",
+                              default=cls.offload_dir),
+            sandbox_url=str(_pick(c, "sandbox_url", env="LLM_SANDBOX_URL",
+                                  default=cls.sandbox_url)).rstrip("/"),
+            sandbox_token=_pick(c, "sandbox_token", env="LLM_SANDBOX_TOKEN",
+                                default=cls.sandbox_token),
+            sandbox_network=_flag(c, "sandbox_network", env="LLM_SANDBOX_NETWORK",
+                                  default=cls.sandbox_network),
+            sandbox_session_timeout=int(_pick(
+                c, "sandbox_session_timeout", env="LLM_SANDBOX_SESSION_TIMEOUT",
+                default=cls.sandbox_session_timeout)),
         )

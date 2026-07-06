@@ -28,8 +28,8 @@ from .completion import MAX_NUDGES
 from .events import domain_of, emit
 from .report_hygiene import lint_citations, scrub_report
 from .turn import (NUDGE_NAME, called, count_nudges, current_turn, did_research_work,
-                   is_json_object_dump, looks_delivered, tc_args, tc_name, text_of,
-                   tokens_in, tool_calls_in)
+                   is_json_object_dump, looks_delivered, text_of, tokens_in,
+                   tool_calls_in, tool_calls_of)
 
 log = logging.getLogger("deep_research_agent.citations")
 
@@ -43,11 +43,9 @@ def _clean_url(u: str) -> str:
 def _report_from_submit(messages: list) -> str:
     """The argument of the most-recent submit_report tool call, if any."""
     for m in reversed(messages):
-        if not isinstance(m, AIMessage):
-            continue
-        for tc in getattr(m, "tool_calls", None) or []:
-            if tc_name(tc) == "submit_report":
-                rep = tc_args(tc).get("report_markdown")
+        for name, args in tool_calls_of(m):
+            if name == "submit_report":
+                rep = args.get("report_markdown")
                 if isinstance(rep, str) and rep.strip():
                     return rep
     return ""
