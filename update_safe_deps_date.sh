@@ -8,10 +8,14 @@
 # "now - 14 days" expression), hence this script: it rewrites the date to
 # (today - SAFE_DEPS_AGE_DAYS, default 14) and you re-lock.
 #
+# The date is an INPUT to uv's version resolution and uv.lock records which date it
+# was resolved under — so committing a moved date WITHOUT the re-locked uv.lock fails
+# CI (`uv lock --check`). Use --lock, and commit pyproject.toml + uv.lock together.
+#
 # Usage:
-#   ./update_safe_deps_date.sh            # update the date only
-#   ./update_safe_deps_date.sh --lock     # ...then run `uv lock` and `uv sync`
-#   SAFE_DEPS_AGE_DAYS=30 ./update_safe_deps_date.sh   # wider window
+#   ./update_safe_deps_date.sh --lock     # move the date, re-lock, sync (the normal path)
+#   ./update_safe_deps_date.sh            # move the date only — you MUST `uv lock` after
+#   SAFE_DEPS_AGE_DAYS=30 ./update_safe_deps_date.sh --lock   # wider window
 set -euo pipefail
 cd "$(dirname "$0")"
 

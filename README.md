@@ -80,6 +80,17 @@ Two guards in `pyproject.toml`:
 - **Freshness window** — `[tool.uv] exclude-newer` makes uv refuse any distribution *published* in the last ~2 weeks, so a freshly-hijacked package release can't reach this project before the ecosystem notices. uv only takes a static timestamp, so the date is hardcoded; move it forward with `./update_safe_deps_date.sh` (sets it to today − 14 days; `--lock` also re-locks and syncs). CI's `uv lock --check` fails if the lock and the window drift apart.
 - **Framework caps** — `deepagents<0.7` and `langchain<2`, because the engine reaches into their internals (middleware hooks, backends, the `tool_call` request field) and a mid-range bump has silently no-op'd a gate before. Raising a cap is a deliberate act: bump, re-lock, run the suite.
 
+**How `pyproject.toml` and `uv.lock` relate** (and why CI checks them as a pair): `pyproject.toml` states what the project *wants* — loose version ranges, plus the freshness date; `uv.lock` records what was *actually picked* — exact versions and checksums for every package (dependencies of dependencies included), so every machine installs identical bits. The freshness date is an **input** to that picking, and the lock records which date it was resolved under. Moving the date without re-locking therefore desyncs the two files, and CI's `uv lock --check` ("would re-resolving change the lock?") fails — that failure is the guard working, not noise.
+
+The rule: never change the date (or any dependency bound) alone. Either run
+
+```bash
+./update_safe_deps_date.sh --lock    # moves the date + re-locks + syncs
+uv run pytest tests/ -q              # confirm the refreshed versions still pass
+```
+
+or follow a manual `pyproject.toml` edit with `uv lock && uv sync --extra dev` and the tests — then commit `pyproject.toml` and `uv.lock` **together**.
+
 ## Configuration
 
 Resolution order for every field: per-run `configurable` override → env var → default. `configurable` accepts both this package's native keys and compatibility aliases (`apiKeys`, `mcp_config`, `max_react_tool_calls`) so an existing caller can adopt the agent with zero backend changes. Legacy *model* keys are the exception — they are ignored with a warning, see [Model tiers](#model-tiers-price-packages).
