@@ -25,7 +25,7 @@ cd "$(dirname "$0")"
 SANDBOX_REPO="${LLM_SANDBOX_REPO:-../llm_sandbox}"
 SANDBOX_URL="${LLM_SANDBOX_URL:-http://127.0.0.1:8900}"
 AGENT_HOST="${DRA_HOST:-127.0.0.1}"
-AGENT_PORT="${PORT:-2024}"
+AGENT_PORT="${DRA_PORT:-${PORT:-2024}}"
 AGENT_URL="http://${AGENT_HOST}:${AGENT_PORT}"
 LOGDIR="$(mktemp -d "${TMPDIR:-/tmp}/llm-stack.XXXXXX")"
 
@@ -40,11 +40,14 @@ cleanup() {
   [ -n "$AGENT_PID" ] && kill "$AGENT_PID" 2>/dev/null || true
   if [ -n "$SANDBOX_PID" ]; then
     say "stopping sandbox service…"
+    # `uv run` is a supervisor: killing it usually takes uvicorn with it, but not always.
+    # A survivor would hold :8900 and silently serve the NEXT run. Record its children
+    # BEFORE the kill (they get reparented after) and kill those exact PIDs — a
+    # machine-wide `pkill -f uvicorn...` here could take down a SECOND stack's sandbox.
+    kids="$(pgrep -P "$SANDBOX_PID" 2>/dev/null || true)"
     kill "$SANDBOX_PID" 2>/dev/null || true
     wait "$SANDBOX_PID" 2>/dev/null || true
-    # `uv run` is a supervisor: killing it usually takes uvicorn with it, but not always.
-    # A survivor would hold :8900 and silently serve the NEXT run, so match it exactly.
-    pkill -f 'uvicorn llm_sandbox.app:app' 2>/dev/null || true
+    for pid in $kids; do kill "$pid" 2>/dev/null || true; done
     # Sessions are auto-reaped by their own `sleep <timeout>`, but a killed service leaves
     # them running until then — drop them now so the next run starts clean.
     "$SANDBOX_REPO/run.sh" clean >/dev/null 2>&1 || true

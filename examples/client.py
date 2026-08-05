@@ -22,10 +22,13 @@ from langgraph_sdk import get_client
 
 _DEFAULT_Q = "Give me a deep research report on BDCs."
 
-# run.sh advertises DRA_HOST/PORT; honour them here too, or a non-default server silently
-# gets no traffic while this client talks to a dead 127.0.0.1:2024.
+# run.sh advertises DRA_HOST/DRA_PORT; honour them here too, or a non-default server
+# silently gets no traffic while this client talks to a dead 127.0.0.1:2024. Bare PORT
+# is a compatibility fallback — it's a name every other tool also uses.
 BASE_URL = os.environ.get(
-    "DRA_URL", f"http://{os.environ.get('DRA_HOST', '127.0.0.1')}:{os.environ.get('PORT', '2024')}")
+    "DRA_URL",
+    f"http://{os.environ.get('DRA_HOST', '127.0.0.1')}"
+    f":{os.environ.get('DRA_PORT') or os.environ.get('PORT') or '2024'}")
 
 # The protocol version this client understands. The agent opens every run with a
 # `run_start` event carrying its own; a mismatch means the shape of later events may have

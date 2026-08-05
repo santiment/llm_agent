@@ -115,13 +115,28 @@ def _pick(c: dict, *keys: str, env: str = "", default: Any = None) -> Any:
     return default if v in (None, "") else v
 
 
+_FLAG_ON = ("1", "true", "yes", "on")
+_FLAG_OFF = ("0", "false", "no", "off")
+
+
 def _flag(c: dict, *keys: str, env: str = "", default: bool) -> bool:
-    """A boolean knob, resolved by ``_pick``. Env vars (and any other string) are
-    truthy unless they read as an explicit off — one parse for every flag, so
-    ``DRA_STREAMING`` and ``LLM_SANDBOX_NETWORK`` can't disagree on what "no" means."""
+    """A boolean knob, resolved by ``_pick``. One parse for every flag, so
+    ``DRA_STREAMING`` and ``LLM_SANDBOX_NETWORK`` can't disagree on what "no" means.
+
+    Only an explicit on/off spelling flips the value; anything else (a typo like
+    ``flase``) keeps the DEFAULT, with a warning. This matters most for a
+    security-relevant flag whose default is off — ``LLM_SANDBOX_NETWORK=flase``
+    must not silently open the sandbox's network."""
     v = _pick(c, *keys, env=env, default=default)
     if isinstance(v, str):
-        return v.strip().lower() not in ("0", "false", "no", "off")
+        s = v.strip().lower()
+        if s in _FLAG_ON:
+            return True
+        if s in _FLAG_OFF:
+            return False
+        log.warning("unrecognized boolean %r for %s — keeping default %s",
+                    v, keys[0] if keys else env, default)
+        return default
     return bool(v)
 
 

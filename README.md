@@ -29,7 +29,7 @@ cp .env.example .env          # set OPENAI_API_KEY, TAVILY_API_KEY (+ optional D
 | `./run.sh doctor` | Check deps, `.env` keys, whether the server is up, and whether the sandbox is reachable — starts nothing. |
 | `./run.sh test` | Sync, then run the offline `pytest` suite (no API keys / network). |
 
-Host/port follow `DRA_HOST` (default `127.0.0.1`) and `PORT` (default `2024`). `ask`/`smoke` need the server up in another shell first — or use `run-stack.sh` below, which starts everything for you.
+Host/port follow `DRA_HOST` (default `127.0.0.1`) and `DRA_PORT` (default `2024`; bare `PORT` still works). `ask`/`smoke` need the server up in another shell first — or use `run-stack.sh` below, which starts everything for you.
 
 ### `run-stack.sh` — agent + sandbox together
 

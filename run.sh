@@ -21,7 +21,9 @@ cd "$(dirname "$0")"
 if [ -f .env ]; then set -a; . ./.env || true; set +a; fi
 
 HOST="${DRA_HOST:-127.0.0.1}"
-PORT="${PORT:-2024}"
+# DRA_PORT is the native knob; bare PORT still honoured for compatibility, but it's a
+# name every other tool also uses, so don't rely on it.
+PORT="${DRA_PORT:-${PORT:-2024}}"
 BASE="http://${HOST}:${PORT}"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -59,8 +61,8 @@ case "${1:-up}" in
     [ -n "${TAVILY_API_KEY:-}" ] && echo "✓ TAVILY_API_KEY set" || echo "  TAVILY_API_KEY unset — web search disabled"
     echo
     echo "  server        ${BASE} $(server_up && echo '(up)' || echo '(not running — ./run.sh)')"
-    # The execute tool is opt-in: unset URL means the agent silently runs code in-process
-    # instead, which is a very different security story than "sandboxed".
+    # The execute tool is opt-in: unset URL means NO code execution at all — the agent
+    # falls back to an in-memory file backend and the `execute` tool never loads.
     if [ -z "${LLM_SANDBOX_URL:-}" ]; then
       echo "  sandbox       LLM_SANDBOX_URL unset — code execution DISABLED (in-memory fallback)"
     elif curl -fsS --max-time 3 "${LLM_SANDBOX_URL}/healthz" >/dev/null 2>&1; then

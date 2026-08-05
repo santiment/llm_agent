@@ -118,6 +118,9 @@ async def make_graph(config: dict | None = None):
     # Every loaded data-tool name (search + MCP + custom) — the report scrub/lint layer
     # strips exactly THESE names (plus the get_* fallback) when they leak into a report,
     # so hygiene follows the deployment's real tool naming instead of a hardcoded prefix.
+    # Deliberately EXCLUDES the deepagents built-ins (task, execute, read_file, …):
+    # they are engine machinery, not data-layer names, and words like "task" or
+    # "execute" appear in legitimate report prose all the time.
     data_tool_names = tuple(sorted(t.name for t in tools))
 
     # A sub-agent owns ONE UNIT of research (e.g. a single entity / period / segment): it makes
