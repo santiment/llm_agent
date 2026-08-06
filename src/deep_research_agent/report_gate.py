@@ -21,6 +21,7 @@ from langchain_core.messages import ToolMessage
 
 from .events import emit
 from .report_hygiene import report_problems, scrub_report
+from .turn import tool_call_of
 
 log = logging.getLogger("deep_research_agent.report_gate")
 
@@ -35,27 +36,19 @@ _REVISE = (
 
 
 class ReportQualityGateMiddleware(AgentMiddleware):
-    def __init__(self, *, max_revisions: int = 1) -> None:
+    def __init__(self, *, max_revisions: int = 1, tool_names=()) -> None:
         super().__init__()
         self.max_revisions = max_revisions
+        self.tool_names = tuple(tool_names or ())
         self._revisions = 0
 
-    def _call_of(self, request):
-        # langchain renamed this field `call` -> `tool_call`; read both so a version
-        # bump can't silently turn this gate into a no-op (it did exactly that once).
-        call = getattr(request, "tool_call", None) or getattr(request, "call", None) or {}
-        if isinstance(call, dict):
-            return call.get("name", ""), (call.get("args") or {}), call.get("id", "")
-        return (getattr(call, "name", ""), getattr(call, "args", {}) or {},
-                getattr(call, "id", ""))
-
     async def awrap_tool_call(self, request, handler):
-        name, args, call_id = self._call_of(request)
+        name, args, call_id = tool_call_of(request)
         if name != "submit_report":
             return await handler(request)
         # Evaluate the SCRUBBED report so leaks the scrub already fixes don't force a revision.
         raw = args.get("report_markdown") if isinstance(args, dict) else ""
-        problems = report_problems(scrub_report(raw or ""))
+        problems = report_problems(scrub_report(raw or "", self.tool_names), self.tool_names)
         if not problems:
             return await handler(request)
         if self._revisions >= self.max_revisions:

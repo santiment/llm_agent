@@ -2,7 +2,7 @@
 
 Every model goes through an OpenAI-compatible endpoint (``base_url``). With the
 default OpenRouter base URL you can name ANY model — ``openai/gpt-4o``,
-``anthropic/claude-sonnet-4-6``, ``google/gemini-2.5-pro``, a local vLLM slug —
+``anthropic/claude-sonnet-5``, ``xiaomi/mimo-v2.5``, a local vLLM slug —
 without locking to one vendor's SDK. Point ``base_url`` at your own gateway and
 nothing else changes.
 """
@@ -32,6 +32,12 @@ def build_chat_model(model_id: str, cfg: ResearchConfig) -> ChatOpenAI:
         api_key=cfg.openai_api_key or "missing-key",
         base_url=cfg.base_url,
         temperature=cfg.temperature,
+        # Always set both explicitly. A proxied provider can stall a single request far
+        # past any sane bound; without a timeout that one call pins its research unit —
+        # and its concurrency slot — for the rest of the run. max_retries covers the
+        # transient 429/5xx the same stack produces. DRA_REQUEST_TIMEOUT / DRA_MAX_RETRIES.
+        timeout=cfg.request_timeout,
+        max_retries=cfg.max_retries,
         # Streaming on by default (drives the live "thinking" narration in the UI). Some
         # OpenRouter-proxied models emit off-spec streaming chunks that LangChain merges
         # into doubled metadata (e.g. deepseek-v4-flash's `finish_reason: "stopstop"`) and

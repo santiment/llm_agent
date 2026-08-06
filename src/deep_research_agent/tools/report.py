@@ -21,7 +21,7 @@ log = logging.getLogger("deep_research_agent.report")
 _MAX_REPORT_CHARS = 50_000
 
 
-def build_submit_report_tool() -> StructuredTool:
+def build_submit_report_tool(tool_names=()) -> StructuredTool:
     async def submit_report(report_markdown: str) -> str:
         """Deliver the FINAL report to the user. Call this EXACTLY ONCE, when research
         is complete, with the full report as Markdown (begin with a single '# ' title).
@@ -29,8 +29,8 @@ def build_submit_report_tool() -> StructuredTool:
         message. After it returns, stop; do not repeat or rewrite the report."""
         md = report_markdown if isinstance(report_markdown, str) else str(report_markdown)
         # Last-mile guard: strip any data-layer machinery (tool names / call syntax) that
-        # leaked past the prompt rules, so the user never sees `get_*` in the report.
-        md = scrub_report(md)
+        # leaked past the prompt rules, so the user never sees tool names in the report.
+        md = scrub_report(md, tool_names)
         # Backstop against a raw-row dump: hard-truncate past a generous ceiling so a
         # pathological dump can't reach the user; the prompt rules are the primary guard,
         # this guarantees termination.

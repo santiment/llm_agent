@@ -6,17 +6,34 @@ needed; it's just HTTP/SSE against the LangGraph server.
     python examples/client.py -                                  # read STDIN
     cat prompt.txt | python examples/client.py                   # piped STDIN
 
-Shows the live event protocol: phase / search / mcp / sources, assistant
-thinking tokens, and the final report. Mirrors what your frontend renders.
+Handles every event type in the protocol (``EVENT_SCHEMAS`` in
+``deep_research_agent/events.py``): the ``run_start`` handshake, searches, sources, tool
+calls, skills, clarifications, sub-agent findings, usage and the final report — plus the
+assistant thinking tokens that stream on the ``messages`` channel. Mirrors what your
+frontend renders.
 """
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
 from langgraph_sdk import get_client
 
 _DEFAULT_Q = "Give me a deep research report on BDCs."
+
+# run.sh advertises DRA_HOST/DRA_PORT; honour them here too, or a non-default server
+# silently gets no traffic while this client talks to a dead 127.0.0.1:2024. Bare PORT
+# is a compatibility fallback — it's a name every other tool also uses.
+BASE_URL = os.environ.get(
+    "DRA_URL",
+    f"http://{os.environ.get('DRA_HOST', '127.0.0.1')}"
+    f":{os.environ.get('DRA_PORT') or os.environ.get('PORT') or '2024'}")
+
+# The protocol version this client understands. The agent opens every run with a
+# `run_start` event carrying its own; a mismatch means the shape of later events may have
+# changed under us, so say so at the top rather than mis-render halfway through.
+EXPECTED_PROTOCOL = 1
 
 
 def read_question(argv: list[str]) -> str:
@@ -46,10 +63,10 @@ async def stream_turn(client, thread_id: str, content: str) -> list[str]:
         thread_id,
         "deep_research_agent",
         input={"messages": [{"role": "user", "content": content}]},
-        # per-run overrides; omit to use the server's .env defaults
+        # Per-run overrides; omit to use the server's .env defaults. Models are chosen by
+        # TIER NAME only — per-model keys are ignored with a warning (see README).
         config={"configurable": {
-            "research_model": "openai/gpt-4o",
-            "final_report_model": "anthropic/claude-sonnet-4-6",
+            "model_tier": "mid",   # extra-low | low | mid | high
             # "mcp_servers": [{"name": "data-provider", "url": "http://127.0.0.1:8765", "tools": []}],
         }},
         stream_mode=["messages", "updates", "custom"],
@@ -58,25 +75,48 @@ async def stream_turn(client, thread_id: str, content: str) -> list[str]:
         if chunk.event == "custom":
             d = chunk.data
             t = d.get("type")
-            if t == "clarification":
+            if t == "run_start":
+                got = d.get("protocol_version")
+                note = "" if got == EXPECTED_PROTOCOL else f"  ⚠ expected v{EXPECTED_PROTOCOL}"
+                print(f"[protocol v{got} · engine {d.get('engine_version')}]{note}")
+            elif t == "clarification":
                 pending = [q for q in d.get("questions", []) if q]
                 print("\n❓ Clarifying questions:")
                 for i, q in enumerate(pending, 1):
                     print(f"  {i}. {q}")
-            elif t == "phase":
-                print(f"\n### {d.get('title')} [{d.get('status')}]")
             elif t == "search_query":
                 print(f"  🔎 {d['query']}")
             elif t == "search_results":
                 for r in d.get("results", []):
                     print(f"     • {r['domain']:<22} {r['title'][:60]}")
-            elif t in ("mcp_call",):
+            elif t == "source":
+                print(f"     ↳ source: {d['title'][:60]} — {d['url']}")
+            # mcp_* and tool_* carry the same shape; the split is only which layer emitted.
+            elif t in ("mcp_call", "tool_call"):
                 print(f"  🛠  {d['tool']}({d.get('args')})")
+            elif t in ("mcp_result", "tool_result"):
+                mark = "✓" if d.get("ok") else f"✗ {d.get('error_class', 'error')}"
+                print(f"     {mark} {d['tool']}")
+            elif t == "skill":
+                print(f"  📄 skill {d['name']} [{d['state']}]")
+            elif t == "subagent_findings":
+                print(f"\n  ── {d['unit']}: {d['summary']}")
+                for f in d.get("findings", []):
+                    print(f"     • {f}")
+                for g in d.get("gaps", []):
+                    print(f"     ? gap: {g}")
             elif t == "report":
                 print("\n===== FINAL REPORT =====\n")
                 print(d["markdown"])
+            elif t == "usage":
+                print(f"\n[usage] {d['tool_calls']} tool calls · "
+                      f"{d['total_tokens']} tokens · limits {d['limits']}")
             elif t == "status":
                 print(f"  [status] {d}")
+            else:
+                # Additions are compatible by design (only removals/renames bump the
+                # version), so an unknown type is informational — never fatal.
+                print(f"  [unknown event: {t}]")
         elif chunk.event == "messages":
             # streamed assistant thinking tokens
             for m in chunk.data:
@@ -98,8 +138,14 @@ def collect_answers(questions: list[str]) -> str:
 
 
 async def main(question: str) -> None:
-    client = get_client(url="http://127.0.0.1:2024")
-    thread = await client.threads.create()
+    client = get_client(url=BASE_URL)
+    try:
+        thread = await client.threads.create()
+    except Exception as exc:  # httpx raises several distinct connect errors; all mean the same
+        print(f"cannot reach the agent at {BASE_URL}: {exc}\n"
+              "start it with ./run.sh (or ./run-stack.sh, which also starts the sandbox)",
+              file=sys.stderr)
+        raise SystemExit(1) from None
 
     content = question
     while True:

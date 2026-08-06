@@ -3,9 +3,12 @@ name = "deep-research-agent"
 version = "0.1.0"
 description = "Portable, model-agnostic deep research agent (deepagents + LangGraph) with a typed streaming-event protocol and interleaved citations."
 requires-python = ">=3.11"
+# deepagents and langchain carry UPPER bounds: the engine reaches into their internals
+# (middleware hooks, backends, the tool_call request field) and a mid-range bump has
+# already silently no-op'd a gate once. Raising a cap is a deliberate, tested act.
 dependencies = [
-    "deepagents>=0.6.7",
-    "langchain>=1.0.0",
+    "deepagents>=0.6.7,<0.7",
+    "langchain>=1.0.0,<2",
     "langchain-openai>=0.3.0",
     "langchain-tavily>=0.2.0",
     "langchain-mcp-adapters>=0.1.0",
@@ -21,3 +24,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.uv]
+# Supply-chain freshness window: uv NEVER resolves/installs a distribution published
+# after this timestamp, so a freshly-hijacked release can't reach us before the
+# ecosystem notices. Keep it ~2 weeks behind today; move it forward by running
+# ./update_safe_deps_date.sh (which sets it to today - 14 days), then `uv lock`.
+exclude-newer = "2026-07-22T00:00:00Z"

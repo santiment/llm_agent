@@ -36,7 +36,7 @@ def _normalize(raw: Any) -> list[dict[str, Any]]:
     return out
 
 
-def build_search_tool(cfg: ResearchConfig) -> StructuredTool | None:
+def build_search_tool(cfg: ResearchConfig, meter=None) -> StructuredTool | None:
     if not cfg.tavily_api_key:
         return None
 
@@ -52,6 +52,10 @@ def build_search_tool(cfg: ResearchConfig) -> StructuredTool | None:
         try:
             raw = await backend.ainvoke({"query": query})
         except Exception as exc:
+            # Metered like every other tool, so the run's `usage` event counts
+            # web searches too (they used to bypass the ledger and undercount).
+            if meter is not None:
+                meter.record_tool_result(ok=False)
             emit({"type": "search_results", "id": qid, "query": query,
                   "ok": False, "error": str(exc), "results": []})
             return f"Search failed: {exc}"
@@ -67,12 +71,14 @@ def build_search_tool(cfg: ResearchConfig) -> StructuredTool | None:
         })
         source_events(results)
 
-        if not results:
-            return "No results found."
-        return "\n\n".join(
+        text = "No results found." if not results else "\n\n".join(
             f"[{i + 1}] {r['title']} — {r['url']}\n{r['content'][:600]}"
             for i, r in enumerate(results)
         )
+        if meter is not None:
+            meter.record_tool_result(ok=True, result_bytes=len(text),
+                                     result_rows=len(results))
+        return text
 
     return StructuredTool.from_function(
         coroutine=web_search,

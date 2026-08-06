@@ -11,5 +11,20 @@ __pycache__/
 # uv
 .uv/
 
-# Deployment-specific drop-in tools (loaded at runtime, not committed)
+# Deployment-specific drop-in tools. This repo DOES commit what is in custom_tools/
+# (a template plus tools worth sharing). Uncomment the rule to keep a deployment's
+# private tools — or its whole dir — out of git; either way they load at runtime.
 # custom_tools/
+.DS_Store
+
+# langgraph dev local runtime state (checkpoints, ops, vector store — may hold
+# conversation data; never commit)
+.langgraph_api/
+
+# Deployment-specific content: analyst command templates, presentation decks, and the
+# coin-talk design note. All name internal systems (metrics-hub/sanbase module paths,
+# Elasticsearch fields, subscription tiers) or are proprietary methodology. They still
+# load and work locally — they are just not this repo's to publish.
+commands/
+docs/*slides*
+docs/plans/COIN_TALK_TOOL_PLAN.md

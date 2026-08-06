@@ -7,6 +7,8 @@ Portable, model-agnostic deep research agent. Built on [`deepagents`](https://gi
 - **Not model-locked.** Every model goes through an OpenAI-compatible `base_url` (OpenRouter by default). Models are organized as named price tiers defined in code (`MODEL_TIERS`: any OpenRouter slug, local vLLM, …); runtime selects a tier by name (`DRA_MODEL_TIER=extra-low|low|mid|high`, see Model tiers).
 - **Replaceable parts.** Search backend, MCP servers, skills, prompts, and the event emitter are all isolated modules.
 
+This README is the operator/deployment reference. For how the runtime actually behaves — the middleware chain, turn scoping, the gates, delegation, offloading — read [`docs/HOW_THE_AGENT_WORKS.md`](docs/HOW_THE_AGENT_WORKS.md).
+
 ## Run standalone
 
 This project is managed with [`uv`](https://docs.astral.sh/uv/) (`uv.lock` is committed). Use `uv` — do **not** `pip install` into your base interpreter.
@@ -22,11 +24,34 @@ cp .env.example .env          # set OPENAI_API_KEY, TAVILY_API_KEY (+ optional D
 |---|---|
 | `./run.sh` (or `./run.sh up`) | Sync deps if `./.venv` is missing, then start the dev server (API + docs at `http://127.0.0.1:2024/docs`). Warns if `OPENAI_API_KEY` / `TAVILY_API_KEY` are unset. |
 | `./run.sh --sync` | Force `uv sync --extra dev`, then start the server. |
-| `./run.sh ask "<question>"` | Stream one research run against an **already-running** server. |
+| `./run.sh ask "<question>"` | Stream one research run against an **already-running** server (fails fast with a message if none is up). |
 | `./run.sh smoke` | `ask` a canned question against a running server. |
+| `./run.sh doctor` | Check deps, `.env` keys, whether the server is up, and whether the sandbox is reachable — starts nothing. |
 | `./run.sh test` | Sync, then run the offline `pytest` suite (no API keys / network). |
 
-Host/port follow `DRA_HOST` (default `127.0.0.1`) and `PORT` (default `2024`). `ask`/`smoke` need the server up in another shell first. The equivalent manual commands:
+Host/port follow `DRA_HOST` (default `127.0.0.1`) and `DRA_PORT` (default `2024`; bare `PORT` still works). `ask`/`smoke` need the server up in another shell first — or use `run-stack.sh` below, which starts everything for you.
+
+### `run-stack.sh` — agent + sandbox together
+
+`run.sh` starts only this agent. When `LLM_SANDBOX_URL` is set, the agent's `execute` tool needs the [llm-sandbox](../llm_sandbox) service running too. `run-stack.sh` brings up both and wires them:
+
+| Command | Does |
+|---|---|
+| `./run-stack.sh` (or `up`) | Start the sandbox in the background, then the LangGraph server in the foreground. Ctrl-C stops both. |
+| `./run-stack.sh ask "<q>"` | Start both, stream one run, tear everything down after. |
+| `./run-stack.sh smoke` | Same with a canned question. |
+| `./run-stack.sh doctor` | Check both halves — keys, token match, and what isolation the host can actually provide — without starting anything. |
+
+It reuses an already-running sandbox instead of starting a second one, and on exit it kills the sandbox and reaps any session containers a crash left behind. Sandbox repo location: `LLM_SANDBOX_REPO` (default `../llm_sandbox`).
+
+Two things it checks up front, because both otherwise fail deep inside a paid run:
+
+- **Token match.** `LLM_SANDBOX_TOKEN` must be identical in this repo's `.env` and the sandbox's. A mismatch is a 401 on the agent's first tool call.
+- **Isolation.** The sandbox refuses to start under a runtime the Docker daemon doesn't have, and `run-stack.sh` relays its verdict. On macOS you will see **NO ISOLATION** — sessions run under `runc`, which is fine for developing and unfit for untrusted code. `./run-stack.sh doctor` prints how to get real gVisor.
+
+A run allocates **one sandbox container**, lazily on the first `execute`/file operation, reuses it for the whole run (so `/workspace` persists), and deletes it when the run ends — the same lifecycle as production, where a session is a gVisor pod instead.
+
+The equivalent manual commands:
 
 ```bash
 uv sync --extra dev           # create ./.venv with all deps + the langgraph CLI
@@ -46,9 +71,29 @@ uv sync --extra dev          # installs pytest + deepagents + the langgraph CLI 
 uv run pytest tests/ -q
 ```
 
+The same three steps run in CI (`.github/workflows/ci.yml`) on every pull request and on pushes to `main`: `uv lock --check`, then `uv sync --extra dev`, then the suite.
+
+## Dependency policy
+
+Two guards in `pyproject.toml`:
+
+- **Freshness window** — `[tool.uv] exclude-newer` makes uv refuse any distribution *published* in the last ~2 weeks, so a freshly-hijacked package release can't reach this project before the ecosystem notices. uv only takes a static timestamp, so the date is hardcoded; move it forward with `./update_safe_deps_date.sh` (sets it to today − 14 days; `--lock` also re-locks and syncs). CI's `uv lock --check` fails if the lock and the window drift apart.
+- **Framework caps** — `deepagents<0.7` and `langchain<2`, because the engine reaches into their internals (middleware hooks, backends, the `tool_call` request field) and a mid-range bump has silently no-op'd a gate before. Raising a cap is a deliberate act: bump, re-lock, run the suite.
+
+**How `pyproject.toml` and `uv.lock` relate** (and why CI checks them as a pair): `pyproject.toml` states what the project *wants* — loose version ranges, plus the freshness date; `uv.lock` records what was *actually picked* — exact versions and checksums for every package (dependencies of dependencies included), so every machine installs identical bits. The freshness date is an **input** to that picking, and the lock records which date it was resolved under. Moving the date without re-locking therefore desyncs the two files, and CI's `uv lock --check` ("would re-resolving change the lock?") fails — that failure is the guard working, not noise.
+
+The rule: never change the date (or any dependency bound) alone. Either run
+
+```bash
+./update_safe_deps_date.sh --lock    # moves the date + re-locks + syncs
+uv run pytest tests/ -q              # confirm the refreshed versions still pass
+```
+
+or follow a manual `pyproject.toml` edit with `uv lock && uv sync --extra dev` and the tests — then commit `pyproject.toml` and `uv.lock` **together**.
+
 ## Configuration
 
-Resolution order for every field: per-run `configurable` override → env var → default. `configurable` accepts both this package's native keys and compatibility aliases (`research_model`, `final_report_model`, `apiKeys`, `mcp_config`, `mcp_prompt`) so an existing caller can adopt the agent with zero backend changes.
+Resolution order for every field: per-run `configurable` override → env var → default. `configurable` accepts both this package's native keys and compatibility aliases (`apiKeys`, `mcp_config`, `max_react_tool_calls`) so an existing caller can adopt the agent with zero backend changes. Legacy *model* keys are the exception — they are ignored with a warning, see [Model tiers](#model-tiers-price-packages).
 
 | Env var | Default | Purpose |
 |---|---|---|
@@ -57,13 +102,18 @@ Resolution order for every field: per-run `configurable` override → env var �
 | `DRA_ALLOWED_BASE_URLS` | — | Comma-separated allowlist of extra base URLs a run may override to (key-exfiltration guard) |
 | `TAVILY_API_KEY` | — | Web search; if unset, the `web_search` tool is omitted |
 | `DRA_MODEL_TIER` | `extra-low` | Named model package: `extra-low` \| `low` \| `mid` \| `high` (see Model tiers below). **The only model knob** — individual models are chosen in code (`MODEL_TIERS`), never per env/run |
+| `DRA_REQUEST_TIMEOUT` | `180` | Per-request ceiling (seconds) on every model call — stops one stalled upstream request from pinning a research unit for the run |
+| `DRA_MAX_RETRIES` | `3` | Retries per model call on transient 429/5xx; `0` disables |
 | `DRA_MCP_URL` | — | Single MCP server (bare host → `/mcp` appended) |
 | `DRA_MCP_LABEL` | — | Friendly name for that server in the report's Sources |
 | `DRA_MCP_SERVERS` | — | JSON list of `{label, url}` for multiple servers |
 | `DRA_MCP_BEARER` | — | Bearer token attached to every MCP server lacking explicit auth |
 | `DRA_MCP_MAX_CONCURRENCY` | `10` | Hard ceiling on simultaneous MCP calls across the whole run |
 | `DRA_MCP_RATE_LIMIT_MAX_WAIT` | `120` | Per-call 429 backoff budget (seconds) before the call fails |
-| `DRA_SKILLS_DIR` | `./skills` | Directory of agent skills (see below) |
+| `DRA_SKILLS_DIR` | `./skills` | Directory of agent skills (see below); in an installed package the default is off — set explicitly |
+| `DRA_CUSTOM_TOOLS_DIR` | `./custom_tools` | Directory of drop-in deployment tools (see Custom tools); same installed-package rule |
+| `DRA_DOMAIN_PROMPT` | — | Deployment/domain guidance injected into both system prompts (see Domain prompt) |
+| `DRA_DOMAIN_PROMPT_FILE` | — | Path to a file with the same; inline `DRA_DOMAIN_PROMPT` wins |
 | `DRA_STREAMING` | `true` | Token-by-token streaming; set `false` for models with off-spec streaming chunks |
 | `DRA_STREAMING_DENYLIST` | `deepseek-v4-flash` | Comma-separated model-name substrings that force `streaming` off |
 | `DRA_RECURSION_LIMIT` | `4500` | LangGraph super-step ceiling for the orchestrator loop (caps loops, not tool calls) |
@@ -73,45 +123,53 @@ Resolution order for every field: per-run `configurable` override → env var �
 | `DRA_MAX_RESULT_ROWS` | `1000` | Per-call MCP result row count that triggers the same offload/truncate |
 | `DRA_OFFLOAD_RESULTS` | `true` | Offload large MCP results to the sandbox filesystem instead of truncating them |
 | `DRA_OFFLOAD_DIR` | `/workspace/data` | Directory (inside the sandbox) for offloaded result files |
-| `LLM_SANDBOX_URL` | — | Code-execution sandbox sidecar; when set, the `execute` tool runs real shell/Python/JS |
+| `LLM_SANDBOX_URL` | — | Code-execution sandbox sidecar; when set, the `execute` tool runs real shell/Python (the sandbox image is python-only — no node runtime) |
 | `LLM_SANDBOX_TOKEN` | — | Auth token; must match the sandbox service's `LLM_SANDBOX_TOKEN` |
 | `LLM_SANDBOX_NETWORK` | `false` | Allow outbound network from inside the sandbox |
 | `LLM_SANDBOX_SESSION_TIMEOUT` | `900` | Sandbox session timeout (seconds) |
 
-Per-run `configurable` keys mirror these: `model_tier`, `apiKeys.{OPENAI_API_KEY,TAVILY_API_KEY}`, `base_url` (allowlisted only), `temperature`, `search_max_results`, `max_concurrent_research_units`, `mcp_servers` / `mcp_config`, `mcp_prompt`, `mcp_max_concurrency`, `mcp_rate_limit_max_wait`, `skills_dir`, `streaming`, `streaming_denylist`, `recursion_limit`, `max_tool_calls`, `max_total_tokens`, `max_result_chars`, `max_result_rows`, `offload_results`, `offload_dir`, `sandbox_url`, `sandbox_token`, `sandbox_network`, `sandbox_session_timeout`.
+Per-run `configurable` keys mirror these: `model_tier`, `apiKeys.{OPENAI_API_KEY,TAVILY_API_KEY}`, `base_url` (allowlisted only), `temperature`, `request_timeout`, `max_retries`, `search_max_results`, `mcp_servers` / `mcp_config`, `mcp_prompt`, `mcp_max_concurrency`, `mcp_rate_limit_max_wait`, `domain_prompt`, `skills_dir`, `custom_tools_dir`, `streaming`, `streaming_denylist`, `recursion_limit`, `max_tool_calls`, `max_total_tokens`, `max_result_chars`, `max_result_rows`, `offload_results`, `offload_dir`, `sandbox_url`, `sandbox_token`, `sandbox_network`, `sandbox_session_timeout`.
 
 ### Model tiers (price packages)
 
-Models are chosen by NAME only: `DRA_MODEL_TIER=mid` (or per-run `configurable.model_tier`). Which models a name means is decided in code — `MODEL_TIERS` in `config.py`, one reviewed place — and is **not** settable per env var or per run; legacy per-model keys (`research_model`, `final_report_model`, `compression_model`, …) are ignored with a warning. **The default, when nothing is configured, is `extra-low`** — a bare checkout can't silently burn money; opt up explicitly for real work. An unknown tier name warns and falls back to the default. OpenRouter slugs, prices $/M input/output as of 2026-06:
+Models are chosen by NAME only: `DRA_MODEL_TIER=mid` (or per-run `configurable.model_tier`). Which models a name means is decided in code — `MODEL_TIERS` in `config.py`, one reviewed place — and is **not** settable per env var or per run; legacy per-model keys (`research_model`, `final_report_model`, `compression_model`, …) are ignored with a warning. **The default, when nothing is configured, is `extra-low`** — a bare checkout can't silently burn money; opt up explicitly for real work. An unknown tier name warns and falls back to the default. OpenRouter slugs, prices $/M input/output verified live 2026-07-30 (they drift — re-check before relying on them):
 
 | Tier | Research (orchestrator) | Sub-agent | Utility |
 |---|---|---|---|
-| `extra-low` | `deepseek/deepseek-v4-flash` (0.10/0.20) | `deepseek/deepseek-v4-flash` (0.10/0.20) | `qwen/qwen3-30b-a3b-instruct-2507` (0.05/0.19) |
-| `low` | `deepseek/deepseek-v4-pro` (0.44/0.87) | `deepseek/deepseek-v4-flash` (0.10/0.20) | `deepseek/deepseek-v4-flash` |
-| `mid` | `google/gemini-3.5-flash` (1.50/9) | `google/gemini-2.5-flash` (0.30/2.50) | `deepseek/deepseek-v4-flash` |
-| `high` | `anthropic/claude-opus-4.8` (5/25) | `anthropic/claude-sonnet-4.6` (3/15) | `anthropic/claude-haiku-4.5` (1/5) |
+| `extra-low` | `xiaomi/mimo-v2.5` (0.14/0.28) | `deepseek/deepseek-v4-flash` (0.14/0.28) | `qwen/qwen3-30b-a3b-instruct-2507` (0.05/0.19) |
+| `low` | `deepseek/deepseek-v4-pro` (0.43/0.87) | `deepseek/deepseek-v4-flash` (0.14/0.28) | `deepseek/deepseek-v4-flash` |
+| `mid` | `google/gemini-3.6-flash` (1.50/7.50) | `xiaomi/mimo-v2.5` (0.14/0.28) | `deepseek/deepseek-v4-flash` |
+| `high` | `anthropic/claude-sonnet-5` (2/10) | `moonshotai/kimi-k2.6` (0.65/2.72) | `google/gemini-3.5-flash-lite` (0.30/2.50) |
 
-`extra-low` is rock bottom — `deepseek-v4-flash` for both tool-loop roles (it's proven reliable here as this tier's orchestrator and the `low` tier's sub-agent, unlike the cheaper-but-flakier open-weight options that gave up mid-loop), so the sub-agent is never pricier than the orchestrator. Delegation still pays off via context isolation. ~$0.02 of orchestrator spend per medium run. Expect noticeably weaker planning and earlier give-ups than higher tiers; the force-completion / findings-gate / budget backstops keep runs honest, not great. For demos, smoke tests, and high-volume low-stakes scheduled ticks — not for decisions. `high` deliberately keeps sub-agent/utility at sonnet/haiku tier — Opus plans and synthesizes only; an Opus sub-agent fleet would defeat the tiering. To add your own packaging: add an entry to `MODEL_TIERS` (code), pick a name, and document it in this table — callers then select it with `DRA_MODEL_TIER=<name>`. An unknown tier name is ignored with a warning (plain defaults apply).
+**Two invariants every package keeps, both asserted in `tests/test_model_tiering.py`:** the sub-agent is never pricier than the orchestrator (the fleet makes most of the tool calls, so a fleet at planner prices makes the tier's cost the *fleet's* cost), and each tier costs more than the one below it on the research slot. The tests parse the `# $in / $out` comments beside each slug in `MODEL_TIERS`, so those comments are load-bearing — change a model without its price and the suite fails.
+
+`extra-low` is rock bottom: planner and fleet cost the same, so delegation pays off only via context isolation (~$0.02 of orchestrator spend per medium run). Expect weaker planning and earlier give-ups than higher tiers; the force-completion / findings-gate / budget backstops keep runs honest, not great. For demos, smoke tests, and high-volume low-stakes ticks — not for decisions. Note that `mimo-v2.5` is **not** on the streaming denylist while `deepseek-v4-flash` is, so this tier's orchestrator streams; if tool calls arrive doubled or dropped, add `mimo-v2.5` to `DRA_STREAMING_DENYLIST`. `mid` and `high` follow the same shape one step up — a stronger planner over a fleet costing a fraction of it — with `high`'s utility slot deliberately picked for context length rather than reasoning, since its job is input-heavy map/extract.
+
+To add your own packaging: add an entry to `MODEL_TIERS` (code), pick a name, and document it in this table — callers then select it with `DRA_MODEL_TIER=<name>`. An unknown tier name is ignored with a warning (plain defaults apply).
 
 ## Streaming event protocol
 
 Stream with `stream_mode=["messages","updates","custom"]` and `stream_subgraphs=True`. The `custom` channel carries protocol events (each a JSON object with `type`); the `messages` channel carries assistant **thinking** tokens for the collapsible pane.
 
+The contract is pinned in code: `events.EVENT_SCHEMAS` registers every type's required keys, `emit` warns on drift, and tests enforce both. Every run opens with a `run_start` handshake — check `protocol_version` there (bumped only on breaking shape changes; additive keys/types don't bump) instead of failing mid-render on an unfamiliar shape.
+
 | `type` | Key fields | Renders as |
 |---|---|---|
+| `run_start` | `protocol_version`, `engine_version` | Version handshake, first event of every run (no UI) |
 | `clarification` | `questions[]` | Question card; input re-enabled. On submit, reply on the **same thread** with each answer paired to its question (`1. Q: … A: …`) — not bare answers |
 | `search_query` | `id`, `query`, `source` | Globe row |
 | `search_results` | `id`, `query`, `ok`, `count`, `results[].{title,url,domain,snippet}` | Favicon + title grid |
 | `source` | `title`, `url`, `domain` | Live citation list entry |
 | `mcp_call` | `id`, `tool`, `args` | MCP call row |
 | `mcp_result` | `id`, `tool`, `ok`, `summary`; on failure `error_class` = `permanent` \| `transient` \| `unknown` (+ `repeated` when an identical failed call was answered locally) | MCP result row |
+| `tool_call` / `tool_result` | same fields as the `mcp_*` pair above | Identical rows for NON-MCP instrumented tools (web search, drop-in `custom_tools/`); only the emitting layer differs, so a renderer can treat the two pairs as one |
 | `skill` | `name`, `path`, `state` | "Skill applied: `<name>`" indicator |
 | `subagent_findings` | `unit`, `summary`, `findings[].{finding,evidence,source}`, `gaps[]` | Folded findings table (one per sub-agent); emitted when a sub-agent's findings validate |
 | `report` | `markdown` | Final answer (also in state `final_report`) |
 | `usage` | `tool_calls`, `total_tokens`, `model_calls`, `limits{}`, … | Per-run ledger at run end (no UI; logging / cost tracking) |
-| `status` | `state` = `mcp_ready` \| `mcp_error` \| `budget_soft` \| `budget_halt` \| `revising` \| `done` | Lifecycle / errors |
+| `status` | `state` = `mcp_ready` \| `mcp_error` \| `budget_soft` \| `budget_halt` \| `revising` \| `done` \| `error` | Lifecycle / errors |
 
-`status` detail: `mcp_ready` carries `tool_count` + `tools[]`; `mcp_error` carries `detail`, `server`, `label`; `budget_soft` is the 75% wrap-up nudge and `budget_halt` the hard ceiling stop (see budgets below); `revising` fires when a gate bounces a deliverable back for one revision — `reason: report_quality` (final report) or `reason: subagent_findings` (a sub-agent's findings handoff); `done` fires when the report is finalized.
+`status` detail: `mcp_ready` carries `tool_count` + `tools[]`; `mcp_error` carries `detail`, `server`, `label`; `budget_soft` is the 75% wrap-up nudge and `budget_halt` the hard ceiling stop (see budgets below); `revising` fires when a gate bounces a deliverable back for one revision — `reason: report_quality` (final report) or `reason: subagent_findings` (a sub-agent's findings handoff). `done` / `error` is the run's authoritative end-state, emitted exactly once with a `reason` code: `done` for `report_delivered`, `awaiting_clarification`, `direct_answer` or `report_salvaged`; `error` for `budget_exhausted`, `stalled_after_nudges` or `ended_without_report`. Absence of either means the run died on an exception before the end-of-run hook and the host surfaces a stream error.
 
 The `usage` event (from `metering.py`) reports orchestrator-level token counts plus global tool-call / result-size totals and the configured ceilings — emitted once at run end for logging and cost tracking.
 
@@ -132,6 +190,12 @@ Answers to your clarifying questions:
 ```
 
 Sending bare answers (`"the first"`) loses meaning — without the question the agent can't tell what "the first" refers to. As insurance the `request_clarification` tool also echoes the questions into its own result, so they stay in context even if history is trimmed. The user's reply lands on the same thread, so the agent then has the full Q&A in context and proceeds to research. A deterministic fallback (`ClarificationFallbackMiddleware`) emits the same event if a model narrates questions in prose without calling the tool, so the card always appears regardless of model. See `examples/client.py` for the round-trip.
+
+## Domain prompt
+
+The base system prompts are deliberately **domain-neutral** — they carry the research workflow and the engine contracts (findings format, `submit_report` protocol, clarification protocol) that the middleware enforces. Everything specific to *your* deployment's domain — the analytical dimensions that matter (e.g. on-chain activity and tokenomics for crypto; yield and non-accruals for credit), terminology, example asks, report register — goes in the **domain prompt**, injected into both the orchestrator's and the sub-agents' system prompts as a labeled `DOMAIN CONTEXT` block.
+
+Set it per run (`configurable.domain_prompt`), inline (`DRA_DOMAIN_PROMPT`), or from a file (`DRA_DOMAIN_PROMPT_FILE=/path/to/domain.md` — the usual place for anything longer than a sentence). Empty = the slot collapses and the base prompt runs as-is. The domain prompt **extends** the base prompt; the engine contracts are not replaceable — don't restate workflow, citation, or output rules in it, just the domain color.
 
 ## Skills
 

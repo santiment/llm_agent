@@ -19,9 +19,8 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, ToolMessage
 
-from .completion import _called
 from .events import emit
-from .turn import current_turn, did_research_work, text_of
+from .turn import called, current_turn, did_research_work, text_of, tool_call_of
 
 log = logging.getLogger("deep_research_agent.clarify")
 
@@ -57,7 +56,7 @@ class ClarificationFallbackMiddleware(AgentMiddleware):
             return None
         turn = current_turn(messages)
         # Tool path already emitted the event, or this is a report / mid-research stop.
-        if _called(turn, "request_clarification") or _called(turn, "submit_report"):
+        if called(turn, "request_clarification") or called(turn, "submit_report"):
             return None
         if did_research_work(turn):
             return None
@@ -78,16 +77,13 @@ class ClarificationGuardMiddleware(AgentMiddleware):
     """
 
     async def awrap_tool_call(self, request, handler):
-        # langchain renamed this field `call` -> `tool_call`; read both defensively.
-        call = getattr(request, "tool_call", None) or getattr(request, "call", None) or {}
-        name = call.get("name", "") if isinstance(call, dict) else getattr(call, "name", "")
+        name, _args, call_id = tool_call_of(request)
         if name != "request_clarification":
             return await handler(request)
         state = getattr(request, "state", None)
         messages = state.get("messages") if isinstance(state, dict) else None
         if not did_research_work(current_turn(messages or [])):
             return await handler(request)  # legitimate up-front clarification — allow it
-        call_id = call.get("id", "") if isinstance(call, dict) else getattr(call, "id", "")
         log.warning("CLARIFY GUARD: blocked request_clarification after research began")
         return ToolMessage(
             content=(

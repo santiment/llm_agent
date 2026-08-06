@@ -27,7 +27,7 @@ from .models import build_chat_model
 from .prompts import describe_mcp_sources, orchestrator_prompt, subagent_prompt
 from .report_gate import ReportQualityGateMiddleware
 from .skill_usage import SkillUsageMiddleware
-from .events import instrument_tool
+from .events import instrument_tool, result_handling
 from .tools.clarify import build_clarify_tool
 from .tools.custom import load_custom_tools
 from .tools.mcp import load_mcp_tools
@@ -62,7 +62,9 @@ async def make_graph(config: dict | None = None):
 
     # Model tiering — smart orchestrator, cheap sub-agents. The orchestrator plans,
     # delegates and synthesizes on research_model; sub-agents run their tool loops on
-    # subagent_model (defaults to research_model, so unset = single-model behavior).
+    # subagent_model. Both come from the run's tier package (MODEL_TIERS), which always
+    # names both slots, so there is nothing to fall back to here — a tier that omits the
+    # sub-agent slot is resolved back to research_model in config.py, not in this file.
     # Both must be tool-capable. report_model is reserved for a future dedicated
     # synthesis step — using it (often a cheap "nano") for the tool loop makes the
     # agent skip tools and terminate early.
@@ -74,7 +76,7 @@ async def make_graph(config: dict | None = None):
              "consumer lands)", cfg.research_model, cfg.subagent_model, cfg.utility_model)
 
     tools = []
-    search = build_search_tool(cfg)
+    search = build_search_tool(cfg, meter)
     if search is not None:
         tools.append(search)
 
@@ -105,15 +107,21 @@ async def make_graph(config: dict | None = None):
     tools.extend(await load_mcp_tools(cfg, meter, offload_sink=offload_sink))
     mcp_prompt = cfg.mcp_prompt or describe_mcp_sources(cfg.mcp_servers)
 
-    # Deployment-specific tools dropped into the gitignored custom_tools/ dir (no edits to
-    # this generic codebase). Same instrumentation as MCP tools, so a large result offloads
+    # Deployment-specific tools dropped into the custom_tools/ dir (no edits to this
+    # generic codebase). Same instrumentation as MCP tools, so a large result offloads
     # to the sandbox file the `execute` tool reads back. Available to BOTH orchestrator and
     # sub-agents (they share `tools`); the model discovers each via its own name/description.
     for custom in load_custom_tools(cfg):
         tools.append(instrument_tool(
-            custom, kind="tool",
-            max_result_chars=cfg.max_result_chars, max_result_rows=cfg.max_result_rows,
-            meter=meter, offload_sink=offload_sink, offload_dir=cfg.offload_dir))
+            custom, kind="tool", **result_handling(cfg, meter, offload_sink)))
+
+    # Every loaded data-tool name (search + MCP + custom) — the report scrub/lint layer
+    # strips exactly THESE names (plus the get_* fallback) when they leak into a report,
+    # so hygiene follows the deployment's real tool naming instead of a hardcoded prefix.
+    # Deliberately EXCLUDES the deepagents built-ins (task, execute, read_file, …):
+    # they are engine machinery, not data-layer names, and words like "task" or
+    # "execute" appear in legitimate report prose all the time.
+    data_tool_names = tuple(sorted(t.name for t in tools))
 
     # A sub-agent owns ONE UNIT of research (e.g. a single entity / period / segment): it makes
     # ALL the calls that unit needs in its OWN context and returns only consolidated dense
@@ -128,7 +136,7 @@ async def make_graph(config: dict | None = None):
             "or segment — making ALL the web/MCP calls that unit needs, and returns "
             "consolidated dense findings with sources. Spawn one per unit, in parallel."
         ),
-        "system_prompt": subagent_prompt(mcp_prompt),
+        "system_prompt": subagent_prompt(mcp_prompt, cfg.domain_prompt),
         "tools": tools,
         "model": subagent_model,
         "middleware": [SubagentFindingsMiddleware()],
@@ -150,10 +158,11 @@ async def make_graph(config: dict | None = None):
         ForceCompletionMiddleware(),
         # Bounce a finished report back to the model ONCE if it ships with uncited sources,
         # duplicate source lines, or raw field/tool names — things only the author can fix.
-        ReportQualityGateMiddleware(),
+        ReportQualityGateMiddleware(tool_names=data_tool_names),
         ResearchOutputMiddleware(
             max_tool_calls=cfg.max_tool_calls,
             max_total_tokens=cfg.max_total_tokens,
+            tool_names=data_tool_names,
         ),
         SkillUsageMiddleware(),
         # Block request_clarification once research has started (TRIAGE-only), then the
@@ -174,8 +183,8 @@ async def make_graph(config: dict | None = None):
 
     agent = create_deep_agent(
         model=research_model,
-        tools=[*tools, build_clarify_tool(), build_submit_report_tool()],
-        system_prompt=orchestrator_prompt(mcp_prompt),
+        tools=[*tools, build_clarify_tool(), build_submit_report_tool(data_tool_names)],
+        system_prompt=orchestrator_prompt(mcp_prompt, cfg.domain_prompt),
         subagents=subagents,
         middleware=middleware,
         skills=skills,

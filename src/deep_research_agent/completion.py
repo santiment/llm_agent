@@ -16,19 +16,20 @@ it resets automatically each new turn (no cross-turn state to carry).
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware, hook_config
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from .turn import (
     NUDGE_NAME,
     RESUBMIT_NUDGE_NAME,
+    called,
     count_nudges,
     current_turn,
     did_research_work,
     is_json_object_dump,
+    looks_delivered,
     text_of,
 )
 
@@ -67,38 +68,6 @@ _RESUBMIT_JSON = (
 )
 
 
-def _tc_name(tc) -> str:
-    return (tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")) or ""
-
-
-def _called(messages: list, name: str) -> bool:
-    """True if a tool with `name` was invoked anywhere in the given messages."""
-    for m in messages:
-        if isinstance(m, ToolMessage) and getattr(m, "name", "") == name:
-            return True
-        if isinstance(m, AIMessage):
-            for tc in getattr(m, "tool_calls", None) or []:
-                if _tc_name(tc) == name:
-                    return True
-    return False
-
-
-def _looks_delivered(content: str) -> bool:
-    """True when the final text is itself a delivered report/answer, not a bare intent
-    stub. The model is supposed to deliver via `submit_report`, but some models write the
-    report as a plain message instead — the citations fallback still surfaces it, so
-    nudging it to "deliver the report" just nags an already-answered model into apology
-    loops. Heuristic: substantial length, a markdown heading, or a Sources section."""
-    t = content.strip()
-    if len(t) >= 400:  # a real report is long; an intent stub ("I will now…") is short
-        return True
-    if re.search(r"(?m)^\s*#{1,3}\s", t):  # markdown heading → a report body
-        return True
-    if re.search(r"(?im)^\s*#*\s*sources\b", t):  # a Sources section
-        return True
-    return False
-
-
 class ForceCompletionMiddleware(AgentMiddleware):
     @hook_config(can_jump_to=["model"])
     def after_model(self, state: dict, runtime) -> dict[str, Any] | None:
@@ -112,7 +81,7 @@ class ForceCompletionMiddleware(AgentMiddleware):
         # Scope to the current turn: a prior turn's submit_report must NOT count here,
         # or a follow-up would terminate immediately and inherit the old report.
         turn = current_turn(messages)
-        if _called(turn, "submit_report") or _called(turn, "request_clarification"):
+        if called(turn, "submit_report") or called(turn, "request_clarification"):
             return None
         content = text_of(last.content)
         if not content.strip():
@@ -122,18 +91,16 @@ class ForceCompletionMiddleware(AgentMiddleware):
         # Only an ending that follows real research work is a premature mid-research stall.
         if not did_research_work(turn):
             return None
-        # The model produced a substantial report/answer as plain text. Don't accept it
-        # silently — the text would only reach the user via the citations salvage,
-        # OUTSIDE the report channel (skipping the quality gate). One mechanical
-        # resubmit-verbatim instruction; if the model still answers in prose, accept and
-        # let the salvage deliver it (repeat nagging is what drives apology loops).
-        # A raw JSON blob (often the echoed findings schema) or a delivered-looking prose
-        # report ended the turn instead of a submit_report call. Both get ONE resubmit
-        # nudge, then are accepted (prose is salvaged; a JSON blob is dropped, not shown).
-        # JSON is its own branch — length-independent (a dump is never valid) — and gets a
-        # REWRITE-to-markdown instruction, NOT "resubmit verbatim" (which would ship JSON).
+        # A delivered-looking prose report, or a raw JSON blob (often the echoed findings
+        # schema), ended the turn instead of a submit_report call. Don't accept either
+        # silently: the text would reach the user only via the citations salvage, OUTSIDE
+        # the report channel (skipping the quality gate). Both get ONE resubmit nudge,
+        # then are accepted — repeat nagging is what drives apology loops (prose is
+        # salvaged; a JSON blob is dropped, not shown). JSON is its own branch, length-
+        # independent (a dump is never valid), and gets a REWRITE-to-markdown instruction
+        # rather than "resubmit verbatim", which would ship the JSON as the report.
         jsonish = is_json_object_dump(content)
-        if jsonish or _looks_delivered(content):
+        if jsonish or looks_delivered(content):
             if count_nudges(turn, RESUBMIT_NUDGE_NAME) >= MAX_RESUBMIT_NUDGES:
                 log.warning(
                     "FORCE-COMPLETION: %s answer persisted after resubmit nudge; accepting "

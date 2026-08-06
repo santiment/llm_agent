@@ -15,7 +15,10 @@ and is also pytest-discoverable. No network, no API keys.
 from __future__ import annotations
 
 import os
+import re
+from pathlib import Path
 
+from deep_research_agent import config
 from deep_research_agent.config import DEFAULT_MODEL_TIER, MODEL_TIERS, ResearchConfig
 
 _ENV_KEYS = ("DRA_MODEL_TIER",)
@@ -42,9 +45,12 @@ def test_model_tier_package_selects_all_three() -> None:
         assert cfg.research_model == package["research_model"], name
         assert cfg.subagent_model == package["subagent_model"], name
         assert cfg.utility_model == package["utility_model"], name
-    # The user rule the "high" package encodes: Opus orchestrates only.
+    # The rule the "high" package encodes: its top model ORCHESTRATES ONLY — never
+    # handed to the sub-agent fleet or the utility slot, which would defeat the
+    # tiering. Stated against the slot, not a model name, so swapping the orchestrator
+    # (opus-4.8 -> kimi-k3 -> claude-sonnet-5, …) can't quietly turn this vacuous.
     high = MODEL_TIERS["high"]
-    assert "opus" not in high["subagent_model"] and "opus" not in high["utility_model"]
+    assert high["research_model"] not in (high["subagent_model"], high["utility_model"])
 
 
 def test_bare_config_defaults_to_cheapest_tier() -> None:
@@ -102,6 +108,57 @@ def test_budget_fallbacks_match_dataclass_defaults() -> None:
                 os.environ[k] = v
 
 
+def _tier_prices() -> dict[str, dict[str, tuple[float, float]]]:
+    """``{tier: {slot: ($in, $out)}}`` parsed from the ``# $x / $y`` comments beside each
+    slug in ``MODEL_TIERS``. Those comments are the only price data in the repo, so this
+    parse is what makes them load-bearing instead of decorative — an edit that changes a
+    model without its price, or breaks the cost ordering below, fails here."""
+    src = Path(config.__file__).read_text(encoding="utf-8")
+    body = src.split("MODEL_TIERS: dict[str, dict[str, str]] = {", 1)[1].split("\n}\n", 1)[0]
+    out: dict[str, dict[str, tuple[float, float]]] = {}
+    tier = ""
+    for line in body.splitlines():
+        opens = re.match(r'\s*"([\w-]+)":\s*\{', line)
+        if opens:
+            tier = opens.group(1)
+            out[tier] = {}
+            continue
+        slot = re.match(r'\s*"(\w+_model)":\s*"[^"]+",\s*#\s*\$([\d.]+)\s*/\s*\$([\d.]+)', line)
+        if slot and tier:
+            out[tier][slot.group(1)] = (float(slot.group(2)), float(slot.group(3)))
+    return out
+
+
+def test_every_tier_slot_documents_its_price() -> None:
+    prices = _tier_prices()
+    assert set(prices) == set(MODEL_TIERS), (set(prices), set(MODEL_TIERS))
+    for tier, package in MODEL_TIERS.items():
+        assert set(prices[tier]) == set(package), tier
+
+
+def test_subagent_is_never_pricier_than_the_orchestrator() -> None:
+    # The tiering invariant. The sub-agent fleet makes MOST of a run's tool calls, each
+    # worker burning raw tool output in its own context, so a fleet at planner prices
+    # makes the tier's cost the FLEET's cost and the tiering stops meaning anything.
+    # This has been violated in practice (a `high` tier once ran an opus planner over a
+    # sonnet fleet priced identically to it), which is why it is asserted, not just noted.
+    for tier, slots in _tier_prices().items():
+        research, subagent = slots["research_model"], slots["subagent_model"]
+        assert subagent[0] <= research[0], f"{tier}: sub-agent input ${subagent[0]} > ${research[0]}"
+        assert subagent[1] <= research[1], f"{tier}: sub-agent output ${subagent[1]} > ${research[1]}"
+
+
+def test_tiers_cost_more_as_they_go_up() -> None:
+    # `extra-low` < `low` < `mid` < `high` on the research slot, both axes. A "higher"
+    # tier that is cheaper than the one below it means the names lie to the caller.
+    prices = _tier_prices()
+    ladder = ["extra-low", "low", "mid", "high"]
+    assert set(ladder) == set(MODEL_TIERS), "ladder must cover every tier"
+    for lower, higher in zip(ladder, ladder[1:]):
+        lo, hi = prices[lower]["research_model"], prices[higher]["research_model"]
+        assert lo[0] <= hi[0] and lo[1] <= hi[1], f"{higher} is not pricier than {lower}"
+
+
 if __name__ == "__main__":
     test_model_tier_package_selects_all_three()
     test_bare_config_defaults_to_cheapest_tier()
@@ -109,4 +166,7 @@ if __name__ == "__main__":
     test_per_model_keys_are_ignored()
     test_report_model_follows_tier_research_slot()
     test_budget_fallbacks_match_dataclass_defaults()
+    test_every_tier_slot_documents_its_price()
+    test_subagent_is_never_pricier_than_the_orchestrator()
+    test_tiers_cost_more_as_they_go_up()
     print("OK — tier-only model selection verified.")

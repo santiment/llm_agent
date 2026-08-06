@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 330" width="980" height="330" font-family="Inter, 'Segoe UI', system-ui, sans-serif">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <text x="490" y="34" text-anchor="middle" fill="#64748b" font-size="15">think → act → observe, repeated until the answer is ready</text>
+
+  <!-- nodes -->
+  <g>
+    <rect x="20"  y="118" width="150" height="64" rx="12" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+    <text x="95"  y="155" text-anchor="middle" fill="#0f172a" font-size="17" font-weight="600">Your question</text>
+
+    <rect x="250" y="118" width="150" height="64" rx="12" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+    <text x="325" y="155" text-anchor="middle" fill="#1e3a8a" font-size="17" font-weight="600">Think / plan</text>
+
+    <rect x="440" y="118" width="150" height="64" rx="12" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+    <text x="515" y="155" text-anchor="middle" fill="#1e3a8a" font-size="17" font-weight="600">Use a tool</text>
+
+    <rect x="630" y="118" width="150" height="64" rx="12" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+    <text x="705" y="155" text-anchor="middle" fill="#1e3a8a" font-size="17" font-weight="600">Read result</text>
+
+    <rect x="820" y="118" width="150" height="64" rx="12" fill="#ede9fe" stroke="#8b5cf6" stroke-width="1.5"/>
+    <text x="895" y="155" text-anchor="middle" fill="#5b21b6" font-size="17" font-weight="600">Report</text>
+  </g>
+
+  <!-- forward arrows -->
+  <g stroke="#475569" stroke-width="2" fill="none">
+    <line x1="170" y1="150" x2="248" y2="150" marker-end="url(#ah)"/>
+    <line x1="400" y1="150" x2="438" y2="150" marker-end="url(#ah)"/>
+    <line x1="590" y1="150" x2="628" y2="150" marker-end="url(#ah)"/>
+    <line x1="780" y1="150" x2="818" y2="150" marker-end="url(#ah)"/>
+  </g>
+  <text x="799" y="138" text-anchor="middle" fill="#475569" font-size="13">done</text>
+
+  <!-- loop back: read result -> think/plan -->
+  <path d="M705,182 C705,260 325,260 325,184" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#ah)"/>
+  <text x="515" y="278" text-anchor="middle" fill="#475569" font-size="14" font-weight="600">repeat</text>
+</svg>

@@ -5,20 +5,37 @@ Events are emitted on LangGraph's ``custom`` stream channel via
 consume them) with a ``type`` discriminator. The agent core is the only
 producer; your app is just a consumer — this is what keeps the agent portable.
 
-Render mapping (Claude / Gemini deep-research UIs):
-  - ``phase``          -> collapsible section header ("Structuring the Investigation")
+Render mapping (Claude / Gemini deep-research UIs) — one line per registered type,
+in ``EVENT_SCHEMAS`` order:
+  - ``run_start``      -> protocol handshake; pin/verify before rendering anything else
   - ``search_query``   -> the globe row ("how to analyze key metrics")
   - ``search_results`` -> the favicon + title grid ("7 results")
-  - ``tool_call`` /
-    ``tool_result``    -> MCP call rows
   - ``source``         -> registered citation (for the live source list)
+  - ``mcp_call`` /
+    ``mcp_result``     -> MCP call rows (legacy aliases of the two below)
+  - ``tool_call`` /
+    ``tool_result``    -> tool call rows
   - ``skill``          -> a skill being applied ("Skill: data-provider")
   - ``report``         -> final markdown answer (also persisted in state)
-  - ``status``         -> lifecycle: researching | writing | done | error
+  - ``status``         -> lifecycle: mcp_ready | mcp_error | budget_soft | budget_halt |
+                          revising | done | error (the last two are the run's end-state,
+                          classified in citations.py; ``reason`` carries the specific code)
+  - ``clarification``  -> the questions the agent needs answered before it can proceed
+  - ``usage``          -> end-of-run tool-call / token counters against their limits
+  - ``subagent_findings`` -> one research unit's summary, findings and gaps
 
 Assistant *reasoning* prose (the italic narration between steps) is NOT a custom
 event — it streams on the ``messages`` channel as normal AI tokens, so the UI
 puts it in the "show thinking process" pane.
+
+THE CONTRACT IS CODE, not just this docstring: ``EVENT_SCHEMAS`` below registers every
+event type and its required keys, and ``emit`` warns (never raises) when an event
+misses its shape or uses an unregistered type — so drift shows up in this repo's logs
+and tests, not in a consumer's broken UI. Versioning for consumers: every run opens
+with a ``run_start`` event carrying ``protocol_version`` (bump it on any BREAKING shape
+change — a removed/renamed key or type; additions are compatible and don't bump) and
+``engine_version`` (the installed package version), so a frontend can pin what it
+understands and detect mismatch at run start instead of failing mid-render.
 """
 
 from __future__ import annotations
@@ -35,6 +52,57 @@ from urllib.parse import urlparse
 from langchain_core.tools import BaseTool, StructuredTool
 
 log = logging.getLogger("deep_research_agent.events")
+
+# Bump ONLY on a breaking change to a shipped event's shape (removed/renamed key or
+# type). Additive keys and new event types are backward-compatible — no bump.
+PROTOCOL_VERSION = 1
+
+
+def engine_version() -> str:
+    """Installed package version for the run_start handshake ('unknown' in odd
+    environments — the event must never fail over metadata lookup)."""
+    try:
+        from importlib.metadata import version
+
+        return version("deep-research-agent")
+    except Exception:
+        return "unknown"
+
+
+# type -> keys every event of that type MUST carry (beyond "type"). Optional keys are
+# deliberately not listed — consumers must tolerate extras. ``emit`` checks each event
+# against this registry and WARNS on violation; it never raises (observability must not
+# break a run). Adding an event type without registering it here is itself a warning.
+EVENT_SCHEMAS: dict[str, frozenset[str]] = {
+    "run_start": frozenset({"protocol_version", "engine_version"}),
+    "search_query": frozenset({"id", "query"}),
+    "search_results": frozenset({"id", "query", "ok", "results"}),
+    "source": frozenset({"title", "url", "domain"}),
+    "mcp_call": frozenset({"id", "tool", "args"}),
+    "mcp_result": frozenset({"id", "tool", "ok"}),
+    "tool_call": frozenset({"id", "tool", "args"}),
+    "tool_result": frozenset({"id", "tool", "ok"}),
+    "skill": frozenset({"name", "path", "state"}),
+    "report": frozenset({"markdown"}),
+    "status": frozenset({"state"}),
+    "clarification": frozenset({"questions"}),
+    "usage": frozenset({"tool_calls", "input_tokens", "output_tokens",
+                        "total_tokens", "limits"}),
+    "subagent_findings": frozenset({"unit", "summary", "findings", "gaps"}),
+}
+
+
+def _check_shape(event: dict[str, Any]) -> None:
+    etype = event.get("type")
+    required = EVENT_SCHEMAS.get(etype or "")
+    if required is None:
+        log.warning("EVENT PROTOCOL: unregistered event type %r — register it in "
+                    "EVENT_SCHEMAS", etype)
+        return
+    missing = required - event.keys()
+    if missing:
+        log.warning("EVENT PROTOCOL: %r event missing required keys %s",
+                    etype, sorted(missing))
 
 
 def new_id() -> str:
@@ -61,6 +129,7 @@ def _writer():
 
 def emit(event: dict[str, Any]) -> None:
     """Push one protocol event onto the ``custom`` stream channel (no-op offline)."""
+    _check_shape(event)
     w = _writer()
     if w is not None:
         try:
@@ -103,13 +172,24 @@ _TRANSIENT_MARKERS = (
 )
 
 
+# The explicit server-side tags, written once: classify_tool_error reads them and
+# _strip_class_tag removes them, so the two can't disagree on the spelling.
+_CLASS_TAGS = ("permanent", "transient")
+
+
+def _explicit_class(msg: str) -> str | None:
+    """The classification a server tagged the message with (``[permanent]`` /
+    ``[transient]`` prefix), or None when it did not tag it."""
+    low = msg.lstrip().lower()
+    return next((t for t in _CLASS_TAGS if low.startswith(f"[{t}]")), None)
+
+
 def classify_tool_error(msg: str) -> str:
     """``"permanent"`` | ``"transient"`` | ``"unknown"`` for a tool error message."""
+    explicit = _explicit_class(msg)
+    if explicit:
+        return explicit
     low = msg.strip().lower()
-    if low.startswith("[permanent]"):
-        return "permanent"
-    if low.startswith("[transient]"):
-        return "transient"
     if any(m in low for m in _PERMANENT_MARKERS):
         return "permanent"
     if any(m in low for m in _TRANSIENT_MARKERS):
@@ -118,11 +198,8 @@ def classify_tool_error(msg: str) -> str:
 
 
 def _strip_class_tag(msg: str) -> str:
-    low = msg.lstrip().lower()
-    for tag in ("[permanent]", "[transient]"):
-        if low.startswith(tag):
-            return msg.lstrip()[len(tag):].lstrip()
-    return msg
+    tag = _explicit_class(msg)
+    return msg.lstrip()[len(tag) + 2:].lstrip() if tag else msg
 
 
 _ERROR_GUIDANCE = {
@@ -200,21 +277,24 @@ def _offload_result(
     Returns ``(stub, note)`` on success, or ``(None, None)`` if anything went wrong —
     the caller then falls back to ``cap_result`` so a flaky sandbox never loses data
     silently or breaks the run.
+
+    BLOCKING on purpose: ``sink.upload_files`` is a sync HTTP call and ``json.dumps``
+    of a multi-MB result is CPU-bound. The caller runs this whole function through
+    ``asyncio.to_thread`` — call it from async code ONLY that way, or one big offload
+    stalls every concurrent tool call in the run.
     """
     try:
-        rows: list | None = None
-        if isinstance(result, list):
-            rows = result
-            payload = json.dumps(result, default=str)
-        elif isinstance(result, str):
-            payload = result
+        # A string result is written through verbatim; anything else is serialized. Rows
+        # (for the stub's count/columns/head) are the result itself when it is already a
+        # list, or the parse of a string that happens to hold a JSON array.
+        payload = result if isinstance(result, str) else json.dumps(result, default=str)
+        rows: list | None = result if isinstance(result, list) else None
+        if isinstance(result, str):
             try:
                 parsed = json.loads(result)
-                rows = parsed if isinstance(parsed, list) else None
             except (ValueError, TypeError):
-                rows = None
-        else:
-            payload = json.dumps(result, default=str)
+                parsed = None
+            rows = parsed if isinstance(parsed, list) else None
 
         path = f"{offload_dir.rstrip('/')}/{tool_name}-{call_id}.json"
         resp = sink.upload_files([(path, payload.encode("utf-8"))])
@@ -240,7 +320,7 @@ def _offload_result(
         + (f"columns: {columns}\n" if columns else "")
         + (f"preview (first {head_rows} rows):\n{head}\n" if head else "")
         + "\nThis file holds the COMPLETE result. To use it, call the `execute` tool to load "
-        "and analyze the file (Python/pandas or duckdb over the JSON) — compute aggregates, "
+        "and analyze the file (Python + pandas/numpy over the JSON) — compute aggregates, "
         "joins, or filters there. Do NOT re-call this tool to page the same rows."
     )
     return stub, note
@@ -292,11 +372,17 @@ def instrument_tool(
             "tool": tool.name,
             "args": {k: _summarize(v, 120) for k, v in kwargs.items()},
         })
+
+        def result_event(ok: bool, **extra: Any) -> None:
+            """The three result emits below differ only in their extras — the correlation
+            keys are written once here so a *_result can't drift from its *_call."""
+            emit({"type": f"{kind}_result", "id": call_id, "tool": tool.name,
+                  "ok": ok, **extra})
+
         args_key = json.dumps(kwargs, sort_keys=True, default=str)
         if args_key in failed_permanently:
-            emit({"type": f"{kind}_result", "id": call_id, "tool": tool.name,
-                  "ok": False, "error_class": "permanent", "repeated": True,
-                  "summary": _summarize(failed_permanently[args_key])})
+            result_event(False, error_class="permanent", repeated=True,
+                         summary=_summarize(failed_permanently[args_key]))
             return (f"TOOL ERROR ({tool.name}, permanent, REPEATED CALL): you already "
                     f"called this tool with these EXACT arguments and it failed: "
                     f"{_summarize(failed_permanently[args_key], 500)}\n"
@@ -332,9 +418,7 @@ def instrument_tool(
                     failed_permanently[args_key] = _strip_class_tag(msg)
                 if meter is not None:
                     meter.record_tool_result(ok=False)
-                emit({"type": f"{kind}_result", "id": call_id, "tool": tool.name,
-                      "ok": False, "error_class": classification,
-                      "summary": _summarize(msg)})
+                result_event(False, error_class=classification, summary=_summarize(msg))
                 log.warning("TOOL ERROR (%s, %s): %s", tool.name, classification,
                             _summarize(msg, 500))
                 return tool_error_text(tool.name, msg, classification)
@@ -351,7 +435,11 @@ def instrument_tool(
             # Prefer OFFLOAD to a sandbox file over truncation: keeps the full data
             # available (the model reads it back with `execute`) instead of dropping rows.
             if too_big and offload_sink is not None:
-                stub, note = _offload_result(
+                # to_thread: the offload serializes megabytes and uploads them over a
+                # SYNC HTTP client. Called inline it would freeze the event loop — and
+                # with it every other tool call in flight — for the whole upload.
+                stub, note = await asyncio.to_thread(
+                    _offload_result,
                     result, sink=offload_sink, offload_dir=offload_dir,
                     tool_name=tool.name, call_id=call_id)
                 if stub is not None:
@@ -368,9 +456,8 @@ def instrument_tool(
             if meter is not None:
                 meter.record_tool_result(ok=True, result_bytes=raw_bytes,
                                          result_rows=raw_rows, capped=bool(capped))
-            emit({"type": f"{kind}_result", "id": call_id, "tool": tool.name,
-                  "ok": True, "summary": _summarize(result),
-                  "bytes": raw_bytes, "rows": raw_rows, "capped": bool(capped)})
+            result_event(True, summary=_summarize(result), bytes=raw_bytes,
+                         rows=raw_rows, capped=bool(capped))
             return result
 
     return StructuredTool(
@@ -379,6 +466,23 @@ def instrument_tool(
         args_schema=tool.args_schema,
         coroutine=_run,
     )
+
+
+def result_handling(cfg: Any, meter: Any = None, offload_sink: Any = None) -> dict[str, Any]:
+    """The ``instrument_tool`` kwargs every instrumented tool shares — size bounds,
+    the run meter, and where oversized results are offloaded.
+
+    Both call sites (MCP tools in ``tools/mcp.py``, custom tools in ``agent.py``) wrap
+    with IDENTICAL result handling and differ only in the transport knobs (``kind``,
+    ``semaphore``, ``rate_limit_max_wait``). Building the shared half here means a new
+    size knob is wired ONCE instead of having to be remembered in both places."""
+    return {
+        "max_result_chars": cfg.max_result_chars,
+        "max_result_rows": cfg.max_result_rows,
+        "meter": meter,
+        "offload_sink": offload_sink,
+        "offload_dir": cfg.offload_dir,
+    }
 
 
 def source_events(results: Iterable[dict[str, Any]]) -> None:
