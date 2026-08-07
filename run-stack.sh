@@ -3,9 +3,12 @@
 # Bring up the FULL local stack: the llm-sandbox service + this agent, wired together.
 #
 #   ./run-stack.sh                start sandbox (background) + LangGraph server (foreground)
+#   ./run-stack.sh split          same stack, but a live 2-column log view in tmux:
+#                                 agent (left) | sandbox (right) — see ./run-stack-split.sh
 #   ./run-stack.sh ask "<q>"      start the whole stack, stream one research run, tear down
 #   ./run-stack.sh smoke          same with a canned question
 #   ./run-stack.sh doctor         check both halves without starting anything
+#   ./run-stack.sh help           print this text
 #
 # How a run becomes a container:
 #   agent run -> HttpSandboxBackend creates a sandbox SESSION on first execute/file op
@@ -31,12 +34,16 @@ LOGDIR="$(mktemp -d "${TMPDIR:-/tmp}/llm-stack.XXXXXX")"
 
 SANDBOX_PID=""
 AGENT_PID=""
+TMUX_SOCKET=""
 
 die() { echo "error: $*" >&2; exit 1; }
 say() { echo "▶ $*"; }
 
 cleanup() {
   local code=$?
+  # The split view runs on its own tmux server (private socket) so it can't collide with —
+  # or take down — the user's real tmux. Kill that server, never the default one.
+  [ -n "$TMUX_SOCKET" ] && tmux -L "$TMUX_SOCKET" kill-server 2>/dev/null || true
   [ -n "$AGENT_PID" ] && kill "$AGENT_PID" 2>/dev/null || true
   if [ -n "$SANDBOX_PID" ]; then
     say "stopping sandbox service…"
@@ -105,7 +112,9 @@ start_sandbox() {
 }
 
 start_agent_bg() {
-  say "starting LangGraph server on $AGENT_URL…"
+  # ${…} braces matter: some bash builds parse a multibyte char glued to a bare $VAR into
+  # the variable name itself, and set -u then aborts on the "unbound" mangled name.
+  say "starting LangGraph server on ${AGENT_URL}…"
   ./run.sh up >"$LOGDIR/agent.log" 2>&1 &
   AGENT_PID=$!
   for _ in $(seq 1 120); do
@@ -116,6 +125,36 @@ start_agent_bg() {
     sleep 1
   done
   say "agent healthy at $AGENT_URL (log: $LOGDIR/agent.log)"
+}
+
+# Live 2-column log view: agent (left) | sandbox (right), each pane scrolling on its own.
+# Side-by-side independently-scrolling regions are exactly what a terminal can't do with
+# plain ANSI (scroll regions are full-width rows), so this needs a multiplexer.
+view_split() {
+  command -v tmux >/dev/null || die "split view needs tmux (brew install tmux)"
+  # start_sandbox early-returns when it finds a sandbox to reuse — then nobody writes
+  # sandbox.log and tail -F would sit on a missing file forever. Say so in the pane instead.
+  [ -f "$LOGDIR/sandbox.log" ] || \
+    echo "(sandbox was already running — its logs are in the shell that started it)" >"$LOGDIR/sandbox.log"
+
+  TMUX_SOCKET="llm-stack-$$"
+  # TMUX= so this also works from inside an existing tmux session (nested-attach guard keys
+  # off that variable); -f /dev/null so the user's tmux.conf can't restyle or rebind the view.
+  TMUX='' tmux -L "$TMUX_SOCKET" -f /dev/null new-session -d -s stack \
+    "exec tail -n +1 -F '$LOGDIR/agent.log'"
+  tmux -L "$TMUX_SOCKET" split-window -h -t stack:0 "exec tail -n +1 -F '$LOGDIR/sandbox.log'"
+  tmux -L "$TMUX_SOCKET" set-option -g mouse on
+  tmux -L "$TMUX_SOCKET" set-option -g pane-border-status top
+  tmux -L "$TMUX_SOCKET" select-pane -t stack:0.0 -T "agent — $AGENT_URL"
+  tmux -L "$TMUX_SOCKET" select-pane -t stack:0.1 -T "sandbox — $SANDBOX_URL"
+  tmux -L "$TMUX_SOCKET" set-option -g status-left-length 80
+  tmux -L "$TMUX_SOCKET" set-option -g status-left " Ctrl-b d quits view AND stops the stack "
+  tmux -L "$TMUX_SOCKET" set-option -g status-right " logs: $LOGDIR "
+  tmux -L "$TMUX_SOCKET" set-option -g status-right-length 120
+  say "split view: agent (left) | sandbox (right) — Ctrl-b d (or Ctrl-C in both panes) stops the stack"
+  TMUX='' tmux -L "$TMUX_SOCKET" attach -t stack
+  # attach returned = user detached or closed both panes; falling off main exits the
+  # script, and the EXIT trap tears the whole stack down.
 }
 
 case "${1:-up}" in
@@ -139,13 +178,23 @@ case "${1:-up}" in
     ./run.sh up
     ;;
 
+  split)
+    resolve_sandbox; check_token; start_sandbox; start_agent_bg
+    view_split
+    ;;
+
   ask|smoke)
     resolve_sandbox; check_token; start_sandbox; start_agent_bg
     echo
     ./run.sh "$@"
     ;;
 
+  help|-h|--help)
+    # The header comment IS the manual — print it rather than maintain a second copy.
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+    ;;
+
   *)
-    die 'usage: ./run-stack.sh [up|ask "<question>"|smoke|doctor]'
+    die 'usage: ./run-stack.sh [up|split|ask "<question>"|smoke|doctor|help]'
     ;;
 esac
