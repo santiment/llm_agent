@@ -27,4 +27,5 @@ __pycache__/
 # load and work locally — they are just not this repo's to publish.
 commands/
 docs/*slides*
-docs/plans/COIN_TALK_TOOL_PLAN.md
+
+.worktrees

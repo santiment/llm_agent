@@ -1,0 +1,1045 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How the Deep Research Agent works — animated run</title>
+<style>
+  /* One deliberate theme: a dark control room. Every surface paints its own
+     background so the page holds on any host ground. */
+  :root {
+    --bg: #0e131d;
+    --panel: #151c2a;
+    --panel-2: #1b2434;
+    --panel-3: #10182490;
+    --line: #2a3547;
+    --line-soft: #222c3d;
+    --ink: #e7ecf5;
+    --muted: #93a0b4;
+    --faint: #5c6a80;
+    --orch: #e6a53c;      /* orchestrator — the smart, expensive model  */
+    --worker: #6c96e8;    /* sub-agent fleet — the cheap model          */
+    --exec: #43b787;      /* sandbox — code that really ran             */
+    --guard: #d96f5e;     /* guardrails / bounces                       */
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  .app {
+    display: grid;
+    grid-template-rows: auto auto minmax(0,1fr) auto; /* header, caption, viz, ticker */
+    height: 100vh;
+    gap: 10px;
+    padding: 12px 14px;
+  }
+
+  /* ---------- header ---------- */
+  header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 19px; font-weight: 750; margin: 0; letter-spacing: -.01em; }
+  header .sub { color: var(--muted); font-size: 12.5px; }
+  header .sub code { font-family: var(--mono); font-size: 11.5px; color: var(--faint); }
+  .transport { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+  .transport button, .transport select {
+    background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; font: 600 12px var(--mono); padding: 5px 10px; cursor: pointer;
+  }
+  .transport button:hover { border-color: var(--muted); }
+  .transport button:focus-visible, .phase:focus-visible, .transport select:focus-visible {
+    outline: 2px solid var(--orch); outline-offset: 1px;
+  }
+  .transport button[data-on="true"] { border-color: var(--orch); color: var(--orch); }
+  #stepCount { font: 600 11px var(--mono); color: var(--faint); min-width: 52px; text-align: right; }
+
+  /* ---------- main split ---------- */
+  .viz { position: relative; display: grid; grid-template-columns: 330px minmax(0,1fr); gap: 12px; min-height: 0;
+         overflow: hidden; /* pulse dots must never escape over header/caption */ }
+  /* edges + dots sit UNDER the boxes (z 1 vs node z 2): a line or pulse
+     crossing a panel disappears behind it instead of drawing over text */
+  svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; }
+  /* the moving dot rides ABOVE the boxes (z 3 vs node z 2): the flow must stay
+     visible for its whole trip — only the static dashed lines hide under panels */
+  .pulse-dot { position: absolute; width: 7px; height: 7px; border-radius: 50%; z-index: 3;
+               box-shadow: 0 0 9px 2px currentColor; pointer-events: none; }
+
+  .panel-title {
+    font: 700 10.5px var(--mono); text-transform: uppercase; letter-spacing: .12em;
+    color: var(--faint); padding: 8px 12px; border-bottom: 1px solid var(--line-soft);
+    display: flex; gap: 8px; align-items: center;
+  }
+  .panel-title .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+  .panel-title .dot[data-live="1"] { background: var(--exec); box-shadow: 0 0 6px var(--exec); }
+
+  /* ---------- chat client ---------- */
+  .chat { position: relative; z-index: 2; /* above the edge/pulse layer */
+          background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          display: flex; flex-direction: column; min-height: 0; }
+  .chat-body { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  .bubble-user {
+    align-self: flex-end; background: #26314a;
+    border: 1px solid #33415f; border-radius: 12px 12px 3px 12px;
+    padding: 8px 11px; max-width: 92%; font-size: 13px;
+  }
+  .thinking {
+    border-left: 2px solid var(--line); padding: 2px 0 2px 10px;
+    color: var(--muted); font-style: italic; font-size: 12.5px;
+    display: flex; flex-direction: column; gap: 5px;
+  }
+  .thinking .t-label { font: 700 9.5px var(--mono); font-style: normal; text-transform: uppercase;
+                       letter-spacing: .1em; color: var(--faint); }
+  .card {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px;
+    padding: 9px 11px; font-size: 12.5px;
+  }
+  .card .card-eyebrow { font: 700 9.5px var(--mono); text-transform: uppercase; letter-spacing: .1em;
+                        color: var(--faint); margin-bottom: 6px; display: flex; gap: 6px; align-items: center; }
+  .todo-row { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; }
+  .todo-row .tick { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+  .todo-row[data-done="1"] .tick { color: var(--exec); }
+  .todo-row[data-done="1"] .todo-text { color: var(--muted); text-decoration: line-through; text-decoration-color: var(--faint); }
+  .findings-card { border-left: 3px solid var(--worker); }
+  .findings-card .f-row { color: var(--muted); font-size: 12px; padding: 3px 0; border-top: 1px dashed var(--line-soft); }
+  .findings-card .f-row b { color: var(--ink); font-weight: 600; }
+  .src-chip { font: 600 10px var(--mono); color: var(--worker); }
+  .report-card { border-left: 3px solid var(--orch); }
+  .report-card h3 { margin: 2px 0 6px; font-size: 14px; }
+  .report-card p { margin: 5px 0; color: var(--muted); }
+  .report-card p b { color: var(--ink); font-weight: 600; }
+  .cite { font: 600 10px var(--mono); color: var(--orch); }
+  .report-card .sources { border-top: 1px solid var(--line-soft); margin-top: 8px; padding-top: 6px;
+                          font: 11px var(--mono); color: var(--muted); }
+  .usage-line { font: 11px var(--mono); color: var(--faint); text-align: center; }
+  .chat-input { border-top: 1px solid var(--line-soft); padding: 9px 12px; display: flex; gap: 8px; }
+  .chat-input .fake-input {
+    flex: 1; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 7px 10px; font-size: 13px; color: var(--ink); min-height: 33px;
+  }
+  .chat-input .fake-input:empty::before { content: "Ask a research question…"; color: var(--faint); }
+  .chat-input .send { background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+                      border-radius: 8px; width: 36px; font-size: 15px; display: grid; place-items: center; }
+  .chat-input .send[data-hot="1"] { color: var(--orch); border-color: var(--orch); }
+
+  /* ---------- stage ---------- */
+  .stage {
+    position: relative; border: 1px dashed #35435c; border-radius: 12px; background: var(--panel-3);
+    display: flex; flex-direction: column; gap: 18px; /* wide row gutters double as lanes for the flow dots */
+    padding: 30px 12px 12px; overflow-y: auto; min-height: 0;
+  }
+  .stage-label {
+    position: absolute; top: 8px; left: 14px; font: 700 10.5px var(--mono);
+    letter-spacing: .12em; text-transform: uppercase; color: var(--faint); z-index: 2;
+  }
+  .stage-label b { color: var(--muted); }
+
+  .node {
+    position: relative; z-index: 2; /* above the edge/pulse layer */
+    background: var(--panel); border: 1px solid var(--line); border-radius: 9px;
+    padding: 8px 11px; opacity: .5; transition: opacity .35s, border-color .35s, box-shadow .35s;
+  }
+  .node[data-state="active"] { opacity: 1; border-color: var(--node-accent, var(--muted));
+    box-shadow: 0 0 0 1px var(--node-accent, transparent), 0 0 18px -6px var(--node-accent, transparent); }
+  .node[data-state="done"] { opacity: .82; }
+  .node[data-state="done"] .node-name::after { content: " ✓"; color: var(--exec); }
+  .node-kicker { font: 700 9.5px var(--mono); text-transform: uppercase; letter-spacing: .11em;
+                 color: var(--faint); display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+  .node-name { font: 600 13px var(--sans); margin-top: 2px; }
+  .node-desc { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+  .model-tag { font: 600 10px var(--mono); color: var(--faint); }
+
+  .row { display: flex; gap: 14px; align-items: stretch; }
+  .row > * { flex: 1; min-width: 0; }
+
+  #makegraph .chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+  .chip {
+    font: 600 10.5px var(--mono); padding: 3px 8px; border-radius: 20px;
+    border: 1px solid var(--line); color: var(--faint); background: var(--panel-2);
+    transition: color .3s, border-color .3s;
+  }
+  .chip[data-on="1"] { color: var(--ink); border-color: var(--muted); }
+
+  #orch { --node-accent: var(--orch); flex: 1.6; align-self: flex-start; /* natural height — don't stretch to match the middleware stack */ }
+  .react-loop { display: flex; gap: 6px; margin-top: 8px; align-items: center; font: 600 10.5px var(--mono); color: var(--faint); }
+  .react-loop .ph { padding: 3px 9px; border-radius: 6px; border: 1px solid var(--line); transition: all .3s; }
+  .react-loop .ph[data-on="1"] { color: var(--orch); border-color: var(--orch); background: #e6a53c14; }
+  .react-loop .arrow { color: var(--faint); }
+
+  /* guardrails stay ghosted until the run first touches a middleware — opacity
+     (not display) so the layout and edge routing never shift on reveal */
+  #mwstack { flex: 1.1; opacity: .12; transition: opacity .6s ease; }
+  #mwstack.on { opacity: 1; }
+  .mw-list { display: flex; flex-direction: column; gap: 3px; margin-top: 7px; }
+  .mw {
+    display: flex; justify-content: space-between; gap: 8px; align-items: baseline;
+    font: 600 10.5px var(--mono); padding: 2.5px 7px; border-radius: 5px;
+    border: 1px solid transparent; color: var(--faint); transition: all .25s;
+  }
+  .mw .hook { font-weight: 500; font-size: 9px; color: var(--faint); opacity: .8; }
+  .mw[data-used="1"] { color: var(--muted); border-color: var(--line-soft); }
+  .mw.flash { color: var(--guard); border-color: var(--guard); background: #d96f5e14; }
+  .mw.flash-ok { color: var(--exec); border-color: var(--exec); background: #43b78714; }
+
+  .meters { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .meter label { display: flex; justify-content: space-between; font: 600 9.5px var(--mono);
+                 color: var(--faint); margin-bottom: 3px; font-variant-numeric: tabular-nums; }
+  .meter .bar { height: 4px; border-radius: 3px; background: var(--panel-2); overflow: hidden; }
+  .meter .fill { height: 100%; width: 0%; background: var(--orch); border-radius: 3px; transition: width .5s; }
+
+  .sub { --node-accent: var(--worker); }
+  .sub .gate-tag { font: 600 9px var(--mono); color: var(--faint); border: 1px dashed var(--line);
+                   border-radius: 4px; padding: 1px 5px; }
+  .sub .gate-tag[data-mode="bounce"] { color: var(--guard); border-color: var(--guard); }
+  .sub .gate-tag[data-mode="pass"] { color: var(--exec); border-color: var(--exec); }
+
+  .tool { --node-accent: var(--worker); }
+  .tool .node-name { font-family: var(--mono); font-size: 12px; }
+
+  #sandbox { --node-accent: var(--exec); display: flex; gap: 12px; padding: 10px 12px; }
+  #sandbox .sb-meta { width: 218px; flex: none; display: flex; flex-direction: column; gap: 6px; }
+  #sandbox .files { font: 10.5px var(--mono); color: var(--faint); display: flex; flex-direction: column; gap: 3px; }
+  #sandbox .files .file { color: var(--exec); }
+  #sandbox .term {
+    flex: 1; background: #0a0f17; border: 1px solid var(--line-soft); border-radius: 7px;
+    font: 11px/1.55 var(--mono); color: #9fb6a9; padding: 8px 10px; overflow: auto;
+    min-height: 86px; max-height: 130px; white-space: pre; margin: 0;
+  }
+  #sandbox .term .in { color: #cfe3d8; }
+  #sandbox .term .out { color: #7fd0a8; }
+
+  /* ---------- caption + phases ---------- */
+  .caption-bar {
+    display: grid; grid-template-columns: auto minmax(0,1fr); gap: 8px 18px; align-items: start;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px;
+    border-left: 3px solid var(--orch); /* the narration is the story — anchor the eye */
+  }
+  .caption-bar.flash { animation: capflash .8s ease-out; }
+  @keyframes capflash {
+    0%   { border-color: var(--orch); box-shadow: 0 0 0 1px var(--orch) inset, 0 0 22px -8px var(--orch); }
+    100% { border-color: var(--line); border-left-color: var(--orch); box-shadow: none; }
+  }
+  .cap-text-wrap.swap { animation: capswap .35s ease-out; }
+  @keyframes capswap { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  .phases { display: flex; gap: 5px; flex-wrap: wrap; align-self: center; }
+  .phase {
+    font: 700 10px var(--mono); text-transform: uppercase; letter-spacing: .09em;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--faint);
+    border-radius: 6px; padding: 4px 9px; cursor: pointer;
+  }
+  .phase[data-on="1"] { color: var(--orch); border-color: var(--orch); }
+  .phase[data-past="1"] { color: var(--muted); }
+  .cap-text-wrap { min-width: 0; }
+  #capTitle { font-weight: 700; font-size: 13.5px; }
+  #capText { color: var(--muted); font-size: 12.5px; margin-top: 1px; max-width: 88ch; }
+  #capText code { font-family: var(--mono); font-size: 11px; color: var(--ink); background: var(--panel-2);
+                  padding: 1px 5px; border-radius: 4px; }
+
+  /* ---------- event ticker ---------- */
+  .ticker { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+            display: flex; flex-direction: column; min-height: 0; height: 148px; }
+  .ticker-body { flex: 1; overflow-y: auto; padding: 6px 12px; font: 11px/1.7 var(--mono); }
+  .ev { display: flex; gap: 10px; white-space: nowrap; }
+  .ev .ev-type { flex: none; width: 130px; font-weight: 700; }
+  .ev .ev-payload { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+  .ev[data-kind="life"]   .ev-type { color: var(--faint); }
+  .ev[data-kind="tool"]   .ev-type { color: var(--orch); }
+  .ev[data-kind="data"]   .ev-type { color: var(--worker); }
+  .ev[data-kind="exec"]   .ev-type { color: var(--exec); }
+  .ev[data-kind="guard"]  .ev-type { color: var(--guard); }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+  @media (max-width: 980px) {
+    .app { height: auto; }
+    .viz { grid-template-columns: 1fr; }
+    .chat { height: 420px; }
+    .stage { min-height: 640px; }
+    .row { flex-wrap: wrap; }
+    #sandbox { flex-direction: column; }
+    #sandbox .sb-meta { width: auto; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <header>
+    <h1>How the Deep Research Agent works</h1>
+    <div class="sub">a simulated replay of one run — client → LangGraph → orchestrator → sub-agents → sandbox → report
+      &nbsp;·&nbsp; <code>docs/HOW_THE_AGENT_WORKS.md</code> in motion</div>
+    <div class="transport">
+      <span id="stepCount">0 / 0</span>
+      <button id="btnRestart" title="Restart (R)">⟲</button>
+      <button id="btnPrev" title="Previous step (←)">←</button>
+      <button id="btnPlay" title="Play / pause (Space)" data-on="true">Pause</button>
+      <button id="btnNext" title="Next step (→)">→</button>
+      <select id="speed" title="Playback speed">
+        <option value="0.6">0.6×</option>
+        <option value="1" selected>1×</option>
+        <option value="1.6">1.6×</option>
+        <option value="2.4">2.4×</option>
+      </select>
+    </div>
+  </header>
+
+  <div class="caption-bar">
+    <div class="phases" id="phases"></div>
+    <div class="cap-text-wrap" id="capWrap">
+      <div id="capTitle">Press play</div>
+      <div id="capText">One full research run, step by step.</div>
+    </div>
+  </div>
+
+  <div class="viz" id="viz">
+    <svg class="overlay" id="overlay"></svg>
+
+    <!-- client -->
+    <section class="chat" id="chat">
+      <div class="panel-title"><span class="dot" id="sseDot"></span> Client app — chat UI <span style="margin-left:auto;font-weight:500;letter-spacing:0;text-transform:none">SSE stream</span></div>
+      <div class="chat-body" id="chatBody"></div>
+      <div class="chat-input">
+        <div class="fake-input" id="fakeInput"></div>
+        <div class="send" id="sendBtn">➤</div>
+      </div>
+    </section>
+
+    <!-- stage -->
+    <section class="stage" id="stage">
+      <div class="stage-label">LangGraph server — <b>one research run</b> (thread + SSE)</div>
+
+      <div class="node" id="makegraph">
+        <div class="node-kicker"><span>entry · config factory</span><span class="model-tag">per run, not per deployment</span></div>
+        <div class="node-name">make_graph(config)</div>
+        <div class="chips">
+          <span class="chip" data-k="cfg">ResearchConfig</span>
+          <span class="chip" data-k="meter">RunMeter</span>
+          <span class="chip" data-k="models">tier: high</span>
+          <span class="chip" data-k="tools">tools: 12</span>
+          <span class="chip" data-k="skills">skills: /skills ro</span>
+          <span class="chip" data-k="sbx">sandbox: wired</span>
+          <span class="chip" data-k="mw">middleware ×9</span>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="node" id="orch">
+          <div class="node-kicker"><span>orchestrator</span><span class="model-tag">claude-sonnet-5 · smart, expensive</span></div>
+          <div class="node-name">ReAct loop — plans, delegates, synthesizes</div>
+          <div class="react-loop">
+            <span class="ph" data-ph="triage">triage</span><span class="arrow">→</span>
+            <span class="ph" data-ph="plan">plan</span><span class="arrow">→</span>
+            <span class="ph" data-ph="gather">gather</span><span class="arrow">→</span>
+            <span class="ph" data-ph="synth">synthesize</span>
+          </div>
+        </div>
+        <div class="node" id="mwstack">
+          <div class="node-kicker"><span>guardrails · middleware</span></div>
+          <div class="mw-list">
+            <span class="mw" data-mw="budget"><span>Budget</span><span class="hook">before_model</span></span>
+            <span class="mw" data-mw="force"><span>ForceCompletion</span><span class="hook">after_model</span></span>
+            <span class="mw" data-mw="gate"><span>ReportQualityGate</span><span class="hook">awrap_tool_call</span></span>
+            <span class="mw" data-mw="clarify"><span>ClarifyGuard + Fallback</span><span class="hook">tool / after_model</span></span>
+            <span class="mw" data-mw="skilluse"><span>SkillUsage</span><span class="hook">after_model</span></span>
+            <span class="mw" data-mw="output"><span>ResearchOutput</span><span class="hook">after_agent</span></span>
+            <span class="mw" data-mw="usage"><span>UsageMeter</span><span class="hook">after_agent</span></span>
+            <span class="mw" data-mw="cleanup"><span>SandboxCleanup</span><span class="hook">after_agent</span></span>
+          </div>
+          <div class="meters">
+            <div class="meter">
+              <label><span>tool calls</span><span id="mCallsVal">0 / 200</span></label>
+              <div class="bar"><div class="fill" id="mCalls"></div></div>
+            </div>
+            <div class="meter">
+              <label><span>tokens</span><span id="mTokVal">0 / 4.0M</span></label>
+              <div class="bar"><div class="fill" id="mTok"></div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="node sub" id="sub-a">
+          <div class="node-kicker"><span>research-subagent</span><span class="gate-tag" data-mw="fgate-a">findings gate</span></div>
+          <div class="node-name">unit: market action</div>
+          <div class="node-desc"><span class="model-tag">kimi-k2.6 · cheap fleet · isolated context</span></div>
+        </div>
+        <div class="node sub" id="sub-b">
+          <div class="node-kicker"><span>research-subagent</span><span class="gate-tag" data-mw="fgate-b">findings gate</span></div>
+          <div class="node-name">unit: on-chain activity</div>
+          <div class="node-desc"><span class="model-tag">kimi-k2.6 · cheap fleet · isolated context</span></div>
+        </div>
+        <div class="node sub" id="sub-c">
+          <div class="node-kicker"><span>research-subagent</span><span class="gate-tag" data-mw="fgate-c">findings gate</span></div>
+          <div class="node-name">unit: social &amp; sentiment</div>
+          <div class="node-desc"><span class="model-tag">kimi-k2.6 · cheap fleet · isolated context</span></div>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="node tool" id="tool-search">
+          <div class="node-kicker"><span>tool · Tavily</span></div>
+          <div class="node-name">web_search</div>
+          <div class="node-desc">numbered [n] sources</div>
+        </div>
+        <div class="node tool" id="tool-mcp">
+          <div class="node-kicker"><span>MCP · Santiment</span></div>
+          <div class="node-name">fetch_metric_data …</div>
+          <div class="node-desc">semaphore: 10 concurrent</div>
+        </div>
+        <div class="node tool" id="tool-custom">
+          <div class="node-kicker"><span>custom tool</span></div>
+          <div class="node-name">social_messages</div>
+          <div class="node-desc">drop-in from custom_tools/</div>
+        </div>
+        <div class="node tool" id="tool-skills">
+          <div class="node-kicker"><span>skills mount · read-only</span></div>
+          <div class="node-name">/skills/crowd-positioning</div>
+          <div class="node-desc">progressive disclosure</div>
+        </div>
+      </div>
+
+      <div class="node" id="sandbox">
+        <div class="sb-meta">
+          <div>
+            <div class="node-kicker"><span>llm-sandbox sidecar</span></div>
+            <div class="node-name">execute — real Python</div>
+            <div class="node-desc" id="sbSession">session: —</div>
+          </div>
+          <div class="files" id="sbFiles">/workspace/data/ <span style="color:var(--faint)">(empty)</span></div>
+        </div>
+        <pre class="term" id="term"></pre>
+      </div>
+    </section>
+  </div>
+
+  <div class="ticker">
+    <div class="panel-title">custom event channel — what any frontend renders (<span style="text-transform:none">events.py · EVENT_SCHEMAS</span>)</div>
+    <div class="ticker-body" id="tickerBody"></div>
+  </div>
+
+</div>
+
+<script>
+"use strict";
+/* ============================================================ helpers */
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => Array.from(document.querySelectorAll(s));
+const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+const viz = $("#viz"), overlay = $("#overlay"), stage = $("#stage");
+const chatBody = $("#chatBody"), tickerBody = $("#tickerBody"), term = $("#term");
+
+let speed = 1;
+let animating = true;          // false during instant replay
+let calls = 0, tokens = 0;     // meters, recomputed on every replay
+
+function el(tag, cls, html) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (html !== undefined) e.innerHTML = html;
+  return e;
+}
+/* -------- edges: drawn lazily the first time a pulse travels them.
+   Manhattan (elbow) routing between the facing borders of the two boxes:
+   the middle segment lands in the gap between rows / the gutter between
+   panels, so lines run around content instead of through it. */
+const edges = new Map(); // "a:b" -> {a, b, path}
+function vizRect(id) {
+  const r = $("#" + id).getBoundingClientRect(), v = viz.getBoundingClientRect();
+  return { x: r.left - v.left, y: r.top - v.top, w: r.width, h: r.height };
+}
+function nodeRects(a, b) {
+  // every box except the two endpoints, inflated 3px, in viz coordinates
+  const ea = $("#" + a), eb = $("#" + b), v = viz.getBoundingClientRect(), out = [];
+  $$(".node, .chat").forEach(n => {
+    if (n === ea || n === eb) return;
+    const r = n.getBoundingClientRect();
+    out.push({ x: r.left - v.left - 3, y: r.top - v.top - 3, w: r.width + 6, h: r.height + 6 });
+  });
+  return out;
+}
+function segClear(x1, y1, x2, y2, obs) { // axis-aligned segments only
+  for (const r of obs) {
+    if (x1 === x2) {
+      if (x1 > r.x && x1 < r.x + r.w && Math.max(y1, y2) > r.y && Math.min(y1, y2) < r.y + r.h) return false;
+    } else {
+      if (y1 > r.y && y1 < r.y + r.h && Math.max(x1, x2) > r.x && Math.min(x1, x2) < r.x + r.w) return false;
+    }
+  }
+  return true;
+}
+/* An elbow route along one axis: the cross segment starts at the midpoint of
+   the gap and slides to the first lane where all three segments clear every
+   other box. Candidates and ordering depend only on the box pair, never on
+   direction, so a→b and b→a always produce the same corridor (the flow back
+   retraces the path). */
+function routeV(ra, rb, obs) {
+  const cax = ra.x + ra.w / 2, cbx = rb.x + rb.w / 2;
+  const down = rb.y + rb.h / 2 >= ra.y + ra.h / 2;
+  const ay = down ? ra.y + ra.h : ra.y;
+  const by = down ? rb.y : rb.y + rb.h;
+  const lo = Math.min(ay, by), hi = Math.max(ay, by), mid = (ay + by) / 2;
+  const cand = [mid];
+  obs.forEach(r => cand.push(r.y - 6, r.y + r.h + 6));
+  let my = mid, clear = false;
+  for (const y of cand.filter(y => y > lo + 4 && y < hi - 4)
+                      .sort((p, q) => Math.abs(p - mid) - Math.abs(q - mid))) {
+    if (segClear(cax, ay, cax, y, obs) && segClear(cax, y, cbx, y, obs) && segClear(cbx, y, cbx, by, obs)) { my = y; clear = true; break; }
+  }
+  return { d: `M ${cax} ${ay} L ${cax} ${my} L ${cbx} ${my} L ${cbx} ${by}`, clear };
+}
+function routeH(ra, rb, obs) {
+  const cay = ra.y + ra.h / 2, cby = rb.y + rb.h / 2;
+  const right = rb.x + rb.w / 2 >= ra.x + ra.w / 2;
+  const ax = right ? ra.x + ra.w : ra.x;
+  const bx = right ? rb.x : rb.x + rb.w;
+  const lo = Math.min(ax, bx), hi = Math.max(ax, bx), mid = (ax + bx) / 2;
+  const cand = [mid];
+  obs.forEach(r => cand.push(r.x - 6, r.x + r.w + 6));
+  let mx = mid, clear = false;
+  for (const x of cand.filter(x => x > lo + 4 && x < hi - 4)
+                      .sort((p, q) => Math.abs(p - mid) - Math.abs(q - mid))) {
+    if (segClear(ax, cay, x, cay, obs) && segClear(x, cay, x, cby, obs) && segClear(x, cby, bx, cby, obs)) { mx = x; clear = true; break; }
+  }
+  return { d: `M ${ax} ${cay} L ${mx} ${cay} L ${mx} ${cby} L ${bx} ${cby}`, clear };
+}
+function edgeD(a, b) {
+  const ra = vizRect(a), rb = vizRect(b);
+  // preferred axis has the bigger clear gap between the boxes' BORDERS (center
+  // distance lies when a wide box faces a narrow one) — but for diagonal pairs
+  // the preferred axis can be walled off by a box in between, so if its route
+  // still crosses something and the other axis is clean, take the other axis
+  const gapY = Math.max(rb.y - (ra.y + ra.h), ra.y - (rb.y + rb.h));
+  const gapX = Math.max(rb.x - (ra.x + ra.w), ra.x - (rb.x + rb.w));
+  const obs = nodeRects(a, b);
+  const first = gapY >= gapX ? routeV(ra, rb, obs) : routeH(ra, rb, obs);
+  if (first.clear) return first.d;
+  const second = gapY >= gapX ? routeH(ra, rb, obs) : routeV(ra, rb, obs);
+  return second.clear ? second.d : first.d;
+}
+function ensureEdge(a, b) {
+  const key = a < b ? a + ":" + b : b + ":" + a;
+  let e = edges.get(key);
+  if (!e) {
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", "#394a63");
+    path.setAttribute("stroke-width", "1");
+    path.setAttribute("stroke-dasharray", "3 4");
+    path.setAttribute("opacity", "0.55");
+    overlay.appendChild(path);
+    e = { a, b, path };
+    edges.set(key, e);
+  }
+  e.path.setAttribute("d", edgeD(a, b));
+  return e;
+}
+function redrawEdges() { edges.forEach(e => e.path.setAttribute("d", edgeD(e.a, e.b))); }
+addEventListener("resize", redrawEdges);
+stage.addEventListener("scroll", redrawEdges);
+
+function pulse(a, b, color) {
+  ensureEdge(a, b);
+  if (!animating || reduced) return;
+  // a short stream of dots, not a single shot: the flow reads like a hose —
+  // ~2.5s of traffic on the edge, one dot every ~300ms
+  const myGen = gen;
+  const streamMs = 2500 / speed, gapMs = 300 / speed;
+  const t0 = performance.now();
+  (function emit() {
+    if (gen !== myGen) return; // a replay/reset ends the stream
+    launchDot(a, b, color);
+    if (performance.now() - t0 + gapMs < streamMs) setTimeout(emit, gapMs);
+  })();
+}
+
+function launchDot(a, b, color) {
+  const probe = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  probe.setAttribute("fill", "none");
+  probe.setAttribute("stroke", "none");
+  probe.setAttribute("d", edgeD(a, b));
+  overlay.appendChild(probe); // getTotalLength needs the path in the document
+  const dot = el("div", "pulse-dot");
+  dot.style.color = color; dot.style.background = color;
+  viz.appendChild(dot);
+  const dur = Math.max(320, Math.min(950, probe.getTotalLength() * 2.2)) / speed;
+  const t0 = performance.now();
+  const cleanup = () => { dot.remove(); probe.remove(); };
+  (function frame(now) {
+    // A replay (resetAll) detaches the dot; the stage may also be smooth-scrolling
+    // right now, so the path is recomputed every frame to track live node positions.
+    if (!dot.isConnected || !probe.isConnected) { cleanup(); return; }
+    const t = Math.min(1, (now - t0) / dur);
+    probe.setAttribute("d", edgeD(a, b));
+    const len = probe.getTotalLength();
+    const pt = probe.getPointAtLength(len * t);
+    dot.style.left = (pt.x - 4.5) + "px";
+    dot.style.top = (pt.y - 4.5) + "px";
+    if (t < 1) requestAnimationFrame(frame); else cleanup();
+  })(t0);
+  setTimeout(cleanup, dur + 3000); // backstop if rAF stalls (hidden tab, etc.)
+}
+
+/* -------- node / middleware state */
+function setNode(id, state) {
+  const n = $("#" + id);
+  n.dataset.state = state;
+  if (state === "active" && animating && !reduced) {
+    const nr = n.getBoundingClientRect(), sr = stage.getBoundingClientRect();
+    if (nr.top < sr.top || nr.bottom > sr.bottom) {
+      // instant, not smooth: a smooth scroll drags every in-flight pulse dot
+      // across the screen while nodes move under it
+      n.scrollIntoView({ block: "nearest", behavior: "auto" });
+      redrawEdges();
+    }
+  }
+}
+function reactPhase(ph) {
+  $$(".react-loop .ph").forEach(x => x.dataset.on = (x.dataset.ph === ph) ? "1" : "0");
+}
+function mwFlash(key, ok) {
+  const m = document.querySelector(`[data-mw="${key}"]`);
+  if (!m) return;
+  m.dataset.used = "1";
+  // first middleware event reveals the ghosted guardrails panel (gate-tags
+  // live in the subagent cards, so they don't trigger it)
+  if (m.closest("#mwstack")) $("#mwstack").classList.add("on");
+  if (animating && !reduced) {
+    const cls = ok ? "flash-ok" : "flash";
+    m.classList.add(cls);
+    setTimeout(() => m.classList.remove(cls), 1400 / speed);
+  }
+}
+function chip(k) { const c = document.querySelector(`.chip[data-k="${k}"]`); if (c) c.dataset.on = "1"; }
+
+/* -------- meters */
+function fmtTok(n) { return n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : Math.round(n / 1e3) + "k"; }
+function addUsage(dc, dt) {
+  calls += dc; tokens += dt;
+  $("#mCalls").style.width = Math.min(100, calls / 200 * 100) + "%";
+  $("#mTok").style.width = Math.min(100, tokens / 4e6 * 100) + "%";
+  $("#mCallsVal").textContent = `${calls} / 200`;
+  $("#mTokVal").textContent = `${fmtTok(tokens)} / 4.0M`;
+}
+
+/* -------- chat + ticker + terminal */
+function chatAdd(node) { chatBody.appendChild(node); chatBody.scrollTop = chatBody.scrollHeight; return node; }
+function think(text) {
+  let t = chatBody.querySelector(".thinking:last-child");
+  if (!t || t !== chatBody.lastElementChild) {
+    t = chatAdd(el("div", "thinking", '<span class="t-label">thinking · messages channel</span>'));
+  }
+  t.appendChild(el("div", "", text));
+  chatBody.scrollTop = chatBody.scrollHeight;
+}
+const KIND = {
+  run_start: "life", status: "life", usage: "life",
+  tool_call: "tool", tool_result: "tool",
+  mcp_call: "data", mcp_result: "data", search_query: "data", search_results: "data", source: "data",
+  skill: "exec", subagent_findings: "data", clarification: "guard", report: "tool"
+};
+function ev(type, payload) {
+  const row = el("div", "ev");
+  row.dataset.kind = KIND[type] || "life";
+  row.appendChild(el("span", "ev-type", type));
+  row.appendChild(el("span", "ev-payload", payload));
+  tickerBody.appendChild(row);
+  tickerBody.scrollTop = tickerBody.scrollHeight;
+}
+function termLine(text, cls) {
+  term.appendChild(el("span", cls, text + "\n"));
+  term.scrollTop = term.scrollHeight;
+}
+
+/* -------- cards */
+const TODOS = ["Market action — price & volatility", "On-chain activity", "Social & sentiment", "Synthesis"];
+function todoCard() {
+  const c = el("div", "card");
+  c.id = "todoCard";
+  c.appendChild(el("div", "card-eyebrow", "write_todos — the plan"));
+  TODOS.forEach((t, i) => {
+    const r = el("div", "todo-row");
+    r.dataset.i = i;
+    r.appendChild(el("span", "tick", "◻"));
+    r.appendChild(el("span", "todo-text", t));
+    c.appendChild(r);
+  });
+  chatAdd(c);
+}
+function todoDone(i) {
+  const r = document.querySelector(`#todoCard .todo-row[data-i="${i}"]`);
+  if (r) { r.dataset.done = "1"; r.querySelector(".tick").textContent = "✓"; }
+}
+function findingsCard(unit, n, sample, src) {
+  const c = el("div", "card findings-card");
+  c.appendChild(el("div", "card-eyebrow", `subagent_findings · ${unit} · ${n} findings, all sourced`));
+  c.appendChild(el("div", "f-row", `<b>${sample}</b> <span class="src-chip">→ ${src}</span>`));
+  c.appendChild(el("div", "f-row", `+ ${n - 1} more · gaps: []`));
+  chatAdd(c);
+}
+function reportCard() {
+  const c = el("div", "card report-card");
+  c.appendChild(el("div", "card-eyebrow", "report — via submit_report"));
+  c.innerHTML += `
+    <h3>Bitcoin, last 30 days: price, on-chain, social</h3>
+    <p><b>Price</b> fell 8.4% over the window ($109.2k → $100.0k), with the sharpest single-day
+       drop on Aug&nbsp;2 <span class="cite">[1]</span>.</p>
+    <p><b>On-chain</b>: daily active addresses averaged 91.2k, and the final week ran 11.8% below
+       the first — activity cooled alongside price <span class="cite">[2][3]</span>.</p>
+    <p><b>Social</b>: crowd positioning flipped net-short after the drop; funding and social
+       volume diverged from chain activity <span class="cite">[3][4][5]</span>.</p>
+    <div class="sources">## Sources<br>
+      - [1][2][3] Santiment<br>
+      - [4] coindesk.com/markets/2026/08/02/bitcoin-slides…<br>
+      - [5] theblock.co/post/…-funding-rates</div>`;
+  chatAdd(c);
+}
+
+/* ============================================================ the script */
+/* Each step: { phase, title, text, run() }. run() must be safe to execute
+   with animating=false — that is how instant replay / stepping back works. */
+const PHASES = [
+  ["send", "Send"], ["build", "Build"], ["triage", "Triage"], ["plan", "Plan"],
+  ["gather", "Gather"], ["synth", "Synthesize"], ["deliver", "Deliver"]
+];
+
+const STEPS = [
+
+{ phase: "send", title: "The user asks a question",
+  text: `The client app posts the message to the LangGraph server (<code>POST /threads/…/runs/stream</code>) and keeps the response open as an SSE stream. Everything the UI will render from here on arrives as typed events on the <code>custom</code> channel, plus plain thinking tokens on <code>messages</code>.`,
+  run() {
+    $("#fakeInput").textContent = "Analyze Bitcoin's last 30 days — price, on-chain, and social.";
+    $("#sendBtn").dataset.hot = "1";
+    chatAdd(el("div", "bubble-user", "Analyze Bitcoin's last 30 days — price, on-chain, and social."));
+    $("#fakeInput").textContent = "";
+    $("#sseDot").dataset.live = "1";
+    pulse("chat", "makegraph", "#93a0b4");
+  } },
+
+{ phase: "build", title: "make_graph builds this run from its config",
+  text: `An async config factory runs per request — models, API keys, MCP servers, sandbox and skills come from the run config, not import-time globals. It resolves <code>ResearchConfig</code>, creates the <code>RunMeter</code>, builds both models from the tier (<code>high</code>: claude-sonnet-5 plans, kimi-k2.6 grinds), loads tools, mounts <code>/skills</code> read-only, wires the sandbox, and stacks the middleware.`,
+  run() {
+    setNode("makegraph", "active");
+    ["cfg", "meter", "models", "tools", "skills", "sbx", "mw"].forEach(chip);
+    ev("run_start", '{protocol_version: 3, engine_version: "1.9.0"}');
+    ev("status", '{stage: "mcp_ready", server: "santiment", tools: 8}');
+    pulse("makegraph", "orch", "#e6a53c");
+  } },
+
+{ phase: "triage", title: "Every turn starts with triage",
+  text: `First model call. Three outcomes: <b>SIMPLE</b> → answer in plain text, no tools, stop. <b>AMBIGUOUS</b> → <code>request_clarification</code> (allowed only here, before research, max twice). <b>NEEDS RESEARCH</b> → continue. Before every model call, BudgetMiddleware checks the two run ceilings — 75% injects a "wrap up now" nudge, 100% halts.`,
+  run() {
+    setNode("makegraph", "done");
+    setNode("orch", "active");
+    reactPhase("triage");
+    mwFlash("budget", true);
+    addUsage(0, 6200);
+    think("Live price, chain and social data across a 30-day window — this needs research, not a quick answer.");
+  } },
+
+{ phase: "plan", title: "write_todos lays out the investigation",
+  text: `The orchestrator names its angles with the built-in <code>write_todos</code> tool and narrates brief reasoning between steps. That narration streams as ordinary tokens on the <code>messages</code> channel — it is the live "thinking" view, not a custom event.`,
+  run() {
+    reactPhase("plan");
+    ev("tool_call", '{name: "write_todos", todos: 4}');
+    todoCard();
+    addUsage(1, 4800);
+    think("Splitting into three independent units so each can run in parallel.");
+  } },
+
+{ phase: "gather", title: "Delegate — don't grind raw data upstairs",
+  text: `The orchestrator partitions the question into independent units and spawns one <code>research-subagent</code> per unit via the <code>task</code> tool, in parallel. This is context isolation: a sub-agent's raw tool output stays trapped in its own (cheaper) context; the smart model's context is reserved for planning and synthesis.`,
+  run() {
+    reactPhase("gather");
+    ["sub-a", "sub-b", "sub-c"].forEach(id => setNode(id, "active"));
+    ev("tool_call", '{name: "task", unit: "market action"}');
+    ev("tool_call", '{name: "task", unit: "on-chain activity"}');
+    ev("tool_call", '{name: "task", unit: "social & sentiment"}');
+    addUsage(3, 9400);
+    pulse("orch", "sub-a", "#e6a53c");
+    pulse("orch", "sub-b", "#e6a53c");
+    pulse("orch", "sub-c", "#e6a53c");
+    think("Delegating each dimension to a research sub-agent.");
+  } },
+
+{ phase: "gather", title: "Sub-agent A pulls market data over MCP",
+  text: `MCP tools are loaded per server so every tool carries a friendly source label ("Santiment") for citations. A shared semaphore caps simultaneous MCP calls at 10 across the orchestrator and all sub-agents; 429s back off instead of failing. A failed call never kills the run — the error text goes back to the model as the tool result.`,
+  run() {
+    setNode("tool-mcp", "active");
+    pulse("sub-a", "tool-mcp", "#6c96e8");
+    ev("mcp_call", '{name: "fetch_metric_data", asset: "bitcoin", metric: "price_usd", days: 30}');
+    ev("mcp_result", '{rows: 30, chars: 4.1k}');
+    ev("source", '{n: 1, label: "Santiment"}');
+    addUsage(2, 14000);
+    pulse("tool-mcp", "sub-a", "#6c96e8");
+  } },
+
+{ phase: "gather", title: "A result too big for context gets offloaded",
+  text: `Any result over 60k chars or 1,000 rows is too big for context. With a sandbox wired, it is written to a file under <code>/workspace/data</code> and only a compact stub enters the model's context — path, row count, columns, preview. Without a sandbox the same threshold becomes hard truncation. Raw rows never pile into anyone's context.`,
+  run() {
+    pulse("sub-b", "tool-mcp", "#6c96e8");
+    ev("mcp_call", '{name: "fetch_metric_data", asset: "bitcoin", metric: "active_addresses_24h"}');
+    ev("mcp_result", '{chars: 82k → offloaded, stub: "/workspace/data/aa_7f3a.json"}');
+    setNode("sandbox", "active");
+    $("#sbSession").textContent = "session: sbx_41c9 · pandas/numpy image";
+    $("#sbFiles").innerHTML = '/workspace/data/<br><span class="file">aa_7f3a.json · 30 rows · [ts, value]</span>';
+    addUsage(1, 2600);
+    pulse("tool-mcp", "sandbox", "#43b787");
+  } },
+
+{ phase: "gather", title: "execute — real code in the llm-sandbox",
+  text: `<code>execute</code> runs actual Python in the llm-sandbox sidecar (an HTTP service; the session is created lazily and reused for the whole run). The sub-agent loads the offloaded file with pandas and computes aggregates <em>there</em>. The prompt is strict: run code for real or not at all — "output" is only ever the verbatim result of a real call.`,
+  run() {
+    pulse("sub-b", "sandbox", "#43b787");
+    ev("tool_call", '{name: "execute", lang: "python"}');
+    termLine("$ python", "in");
+    termLine('>>> df = pd.read_json("/workspace/data/aa_7f3a.json")', "in");
+    termLine('>>> df.value.agg(["mean","min","max"]).round(0)', "in");
+    termLine("mean     91213    min  78411    max  112480", "out");
+    termLine(">>> (df.value[-7:].mean() / df.value[:7].mean() - 1).round(3)", "in");
+    termLine("-0.118", "out");
+    ev("tool_result", '{stdout: "mean 91213 …  -0.118"}');
+    addUsage(1, 5200);
+    pulse("sandbox", "sub-b", "#43b787");
+  } },
+
+{ phase: "gather", title: "Skills: progressive disclosure",
+  text: `Sub-agent C's task matches the <code>crowd-positioning</code> skill's description, so it reads the full <code>SKILL.md</code> from the read-only <code>/skills</code> mount — instructions are cheap to advertise in the system prompt and loaded only on demand. SkillUsageMiddleware emits a <code>skill</code> event so the UI can show it.`,
+  run() {
+    setNode("tool-skills", "active");
+    pulse("sub-c", "tool-skills", "#6c96e8");
+    mwFlash("skilluse", true);
+    ev("skill", '{name: "crowd-positioning"}');
+    setNode("tool-custom", "active");
+    pulse("sub-c", "tool-custom", "#6c96e8");
+    ev("tool_call", '{name: "social_messages", asset: "bitcoin", days: 30}');
+    ev("source", '{n: 3, label: "Santiment social data"}');
+    addUsage(2, 11800);
+  } },
+
+{ phase: "gather", title: "Web search rounds out the picture",
+  text: `<code>web_search</code> (Tavily) returns numbered sources for inline <code>[n]</code> citation and emits <code>search_query</code> / <code>search_results</code> events — the globe row and the favicon grid a research UI shows while working.`,
+  run() {
+    setNode("tool-search", "active");
+    pulse("sub-c", "tool-search", "#6c96e8");
+    ev("search_query", '{q: "bitcoin drop august 2 2026 cause"}');
+    ev("search_results", '{count: 7}');
+    ev("source", '{n: 4, url: "coindesk.com/markets/…"}');
+    ev("source", '{n: 5, url: "theblock.co/post/…"}');
+    addUsage(1, 7400);
+    pulse("tool-search", "sub-c", "#6c96e8");
+  } },
+
+{ phase: "gather", title: "The findings contract — a checkable handoff",
+  text: `A sub-agent's final message is the <em>only</em> thing the orchestrator ever sees of its work, so it must be exactly one JSON object: a dense summary, findings each carrying <code>{finding, evidence, source}</code>, and honest gaps. Sub-agent A's passes the deterministic gate — no model in the loop — and streams as a <code>subagent_findings</code> event.`,
+  run() {
+    document.querySelector('[data-mw="fgate-a"]').dataset.mode = "pass";
+    setNode("sub-a", "done");
+    todoDone(0);
+    ev("subagent_findings", '{unit: "market action", findings: 4, gaps: 0}');
+    findingsCard("market action", 4, "BTC −8.4% over 30d; sharpest drop Aug 2 (−5.1%)", "[1] Santiment");
+    addUsage(0, 3800);
+    pulse("sub-a", "orch", "#6c96e8");
+  } },
+
+{ phase: "gather", title: "A bad handoff bounces — once",
+  text: `Sub-agent B returns a finding with no source, so the gate bounces it back with the specific problems. The same gate also checks provenance: non-empty findings with zero tool calls means the model answered from memory — bounced. Empty findings are allowed (an honest "nothing found" beats a fabricated one). One bounce max; then whatever comes back is accepted, because the gate must never fail a run over formatting.`,
+  run() {
+    const g = document.querySelector('[data-mw="fgate-b"]');
+    g.dataset.mode = "bounce";
+    ev("status", '{stage: "revising", target: "findings", unit: "on-chain"}');
+    if (animating && !reduced) {
+      const myGen = gen;
+      setTimeout(() => { if (gen === myGen) { g.dataset.mode = "pass"; } }, 1600 / speed);
+    } else { g.dataset.mode = "pass"; }
+    setNode("sub-b", "done");
+    todoDone(1);
+    ev("subagent_findings", '{unit: "on-chain activity", findings: 3, gaps: 0}');
+    findingsCard("on-chain activity", 3, "Active addresses avg 91.2k/d; last week −11.8% vs first", "[2] Santiment");
+    addUsage(0, 4600);
+    pulse("sub-b", "orch", "#6c96e8");
+  } },
+
+{ phase: "gather", title: "All units are home",
+  text: `Sub-agent C passes cleanly. Had any unit reported non-empty <code>gaps</code>, the orchestrator would spawn follow-up sub-agents for exactly those gaps. Note the meters: most tool calls were made by the cheap fleet — that is model tiering doing its job.`,
+  run() {
+    document.querySelector('[data-mw="fgate-c"]').dataset.mode = "pass";
+    setNode("sub-c", "done");
+    todoDone(2);
+    ["tool-search", "tool-mcp", "tool-custom", "tool-skills"].forEach(id => setNode(id, "done"));
+    ev("subagent_findings", '{unit: "social & sentiment", findings: 5, gaps: 0}');
+    findingsCard("social & sentiment", 5, "Crowd flipped net-short post-drop; social vol +64%", "[3] Santiment social data");
+    addUsage(0, 5200);
+    pulse("sub-c", "orch", "#6c96e8");
+  } },
+
+{ phase: "synth", title: "Synthesize: one report from three findings objects",
+  text: `The orchestrator reads the findings JSONs — summaries, claims, and each claim's source — and weaves one markdown report, reusing those sources for its inline <code>[n]</code> citations. This is where the expensive model earns its keep: tokens spent on synthesis, never on re-reading raw rows.`,
+  run() {
+    reactPhase("synth");
+    mwFlash("budget", true);
+    addUsage(0, 38000);
+    think("All three units returned sourced findings. Writing the synthesis with inline citations.");
+  } },
+
+{ phase: "synth", title: "submit_report is the deliverable",
+  text: `The report is delivered by calling <code>submit_report</code> — not by whatever the last chat message happened to be. If a model writes the whole report as plain prose instead, ForceCompletionMiddleware nudges one mechanical resubmit; if it stops mid-research with a bare "Now I will…" and no tool call, it gets nudged to act (capped).`,
+  run() {
+    ev("tool_call", '{name: "submit_report", chars: 18.2k}');
+    mwFlash("force", true);
+    addUsage(1, 2400);
+  } },
+
+{ phase: "deliver", title: "The quality gate intercepts before delivery",
+  text: `ReportQualityGateMiddleware wraps the <code>submit_report</code> call itself. Uncited sources, split internal source lines, raw field names → one bounce back with specific fixes, then deliver as-is. <code>scrub_report</code> deterministically strips leaked plumbing (this run's own tool names, "server-side") and <code>lint_citations</code> reports orphans and danglers.`,
+  run() {
+    mwFlash("gate", true);
+    ev("status", '{stage: "revising", target: "report"}');
+    ev("tool_call", '{name: "submit_report", chars: 18.4k, attempt: 2}');
+    addUsage(1, 6800);
+  } },
+
+{ phase: "deliver", title: "The report lands in the UI",
+  text: `The <code>report</code> event carries the final markdown — claims cited inline with <code>[n]</code>, a <code>## Sources</code> list where web sources get one line per URL and internal data sources get one grouped line. The report is also persisted into thread state by ResearchOutputMiddleware.`,
+  run() {
+    todoDone(3);
+    mwFlash("output", true);
+    ev("report", '{markdown: "# Bitcoin, last 30 days…", sources: 5}');
+    reportCard();
+    pulse("orch", "chat", "#e6a53c");
+    addUsage(0, 1200);
+  } },
+
+{ phase: "deliver", title: "The run accounts for itself, then cleans up",
+  text: `after_agent hooks close the run: UsageMeterMiddleware emits the <code>usage</code> event (the observability surface), SandboxCleanupMiddleware destroys the sandbox session, and ResearchOutputMiddleware classifies why the run ended — here the happy path, <code>done / report_delivered</code>. Other endings it can name: direct_answer, awaiting_clarification, report_salvaged, budget_exhausted, stalled_after_nudges.`,
+  run() {
+    reactPhase("");
+    setNode("orch", "done");
+    setNode("sandbox", "done");
+    $("#sbSession").textContent = "session: sbx_41c9 · destroyed";
+    mwFlash("usage", true);
+    mwFlash("cleanup", true);
+    ev("usage", '{tool_calls: 13, tokens: 123k, model_calls: 9, rows: 4.2k}');
+    ev("status", '{stage: "done", reason: "report_delivered"}');
+    chatAdd(el("div", "usage-line", "run done · report_delivered · 13 tool calls · 123k tokens"));
+    $("#sseDot").dataset.live = "0";
+    $("#sendBtn").dataset.hot = "0";
+  } },
+];
+
+/* ============================================================ engine */
+const capTitle = $("#capTitle"), capText = $("#capText"), stepCount = $("#stepCount");
+const phasesEl = $("#phases");
+PHASES.forEach(([key, label]) => {
+  const b = el("button", "phase", label);
+  b.dataset.key = key;
+  b.addEventListener("click", () => {
+    const i = STEPS.findIndex(s => s.phase === key);
+    if (i >= 0) goTo(i, true);
+  });
+  phasesEl.appendChild(b);
+});
+
+let stepIndex = -1, playing = true, timer = null, gen = 0;
+
+function resetAll() {
+  gen++; // invalidates any pending per-step timeouts from a previous replay
+  chatBody.innerHTML = ""; tickerBody.innerHTML = ""; term.innerHTML = "";
+  overlay.innerHTML = ""; edges.clear();
+  $$(".pulse-dot").forEach(d => d.remove());
+  calls = 0; tokens = 0; addUsage(0, 0);
+  $$(".node").forEach(n => n.dataset.state = "");
+  $$(".chip").forEach(c => c.dataset.on = "0");
+  $$(".mw").forEach(m => { m.dataset.used = "0"; m.classList.remove("flash", "flash-ok"); });
+  $("#mwstack").classList.remove("on"); // re-ghost the guardrails for the next run
+  $$(".gate-tag").forEach(g => g.dataset.mode = "");
+  reactPhase("");
+  $("#sbSession").textContent = "session: —";
+  $("#sbFiles").innerHTML = '/workspace/data/ <span style="color:var(--faint)">(empty)</span>';
+  $("#sseDot").dataset.live = "0";
+  $("#sendBtn").dataset.hot = "0";
+  $("#fakeInput").textContent = "";
+}
+
+function renderCaption() {
+  const s = STEPS[stepIndex];
+  const changed = s && capTitle.textContent !== s.title;
+  capTitle.textContent = s ? s.title : "Press play";
+  capText.innerHTML = s ? s.text : "";
+  if (changed) {
+    const bar = capTitle.closest(".caption-bar"), wrap = $("#capWrap");
+    bar.classList.remove("flash"); wrap.classList.remove("swap");
+    void bar.offsetWidth; // restart both animations
+    bar.classList.add("flash"); wrap.classList.add("swap");
+  }
+  stepCount.textContent = `${stepIndex + 1} / ${STEPS.length}`;
+  const seen = new Set(STEPS.slice(0, stepIndex + 1).map(x => x.phase));
+  $$(".phase").forEach(p => {
+    p.dataset.on = (s && s.phase === p.dataset.key) ? "1" : "0";
+    p.dataset.past = (seen.has(p.dataset.key) && (!s || s.phase !== p.dataset.key)) ? "1" : "0";
+  });
+}
+
+function goTo(i, pause) {
+  clearTimeout(timer);
+  i = Math.max(0, Math.min(STEPS.length - 1, i));
+  resetAll();
+  animating = false;
+  for (let k = 0; k < i; k++) STEPS[k].run();
+  animating = true;
+  stepIndex = i;
+  STEPS[i].run();
+  redrawEdges();
+  renderCaption();
+  if (pause) setPlaying(false); else schedule();
+}
+
+function advance() {
+  if (stepIndex >= STEPS.length - 1) { setPlaying(false); return; }
+  stepIndex++;
+  STEPS[stepIndex].run();
+  redrawEdges();
+  renderCaption();
+  schedule();
+}
+
+function schedule() {
+  clearTimeout(timer);
+  if (!playing) return;
+  if (stepIndex >= STEPS.length - 1) { setPlaying(false); return; }
+  timer = setTimeout(advance, 5600 / speed);
+}
+
+function setPlaying(on) {
+  playing = on;
+  $("#btnPlay").textContent = on ? "Pause" : "Play";
+  $("#btnPlay").dataset.on = on ? "true" : "false";
+  if (on) {
+    if (stepIndex >= STEPS.length - 1) goTo(0); else schedule();
+  } else clearTimeout(timer);
+}
+
+$("#btnPlay").addEventListener("click", () => setPlaying(!playing));
+$("#btnNext").addEventListener("click", () => { setPlaying(false); goTo(stepIndex + 1, true); });
+$("#btnPrev").addEventListener("click", () => { setPlaying(false); goTo(Math.max(0, stepIndex - 1), true); });
+$("#btnRestart").addEventListener("click", () => { goTo(0); setPlaying(true); });
+$("#speed").addEventListener("change", (e) => { speed = parseFloat(e.target.value); schedule(); });
+addEventListener("keydown", (e) => {
+  if (e.target.tagName === "SELECT") return;
+  if (e.code === "Space") { e.preventDefault(); setPlaying(!playing); }
+  else if (e.key === "ArrowRight") { setPlaying(false); goTo(stepIndex + 1, true); }
+  else if (e.key === "ArrowLeft") { setPlaying(false); goTo(Math.max(0, stepIndex - 1), true); }
+  else if (e.key.toLowerCase() === "r") { goTo(0); setPlaying(true); }
+});
+
+/* go */
+goTo(0);
+</script>
+</body>
+</html>
