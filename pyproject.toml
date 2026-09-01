@@ -26,8 +26,8 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.uv]
-# Supply-chain freshness window: uv NEVER resolves/installs a distribution published
-# after this timestamp, so a freshly-hijacked release can't reach us before the
-# ecosystem notices. Keep it ~2 weeks behind today; move it forward by running
-# ./update_safe_deps_date.sh (which sets it to today - 14 days), then `uv lock`.
-exclude-newer = "2026-07-22T00:00:00Z"
+# Supply-chain freshness window: uv never resolves/installs a distribution
+# published in the last 10 days, so a freshly-hijacked release can't reach us
+# before the ecosystem notices. Relative durations need uv >= 0.12 (pinned in
+# the Dockerfile; update your local uv to match).
+exclude-newer = "10 days"

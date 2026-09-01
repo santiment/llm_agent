@@ -13,7 +13,10 @@ FROM python:3.11-slim AS build
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never
-RUN pip install --no-cache-dir uv
+# Pinned: needs >=0.12 for the relative exclude-newer window in pyproject.toml,
+# and an exact version keeps builds reproducible (and honours the same ~10-day
+# freshness policy the window itself enforces).
+RUN pip install --no-cache-dir uv==0.12.5
 
 WORKDIR /app
 # Dependencies from the lockfile (uv), project last — keeps the dep layer
