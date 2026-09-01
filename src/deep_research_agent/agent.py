@@ -150,7 +150,12 @@ async def make_graph(config: dict | None = None):
     # model. Registered only when offloading is live. `tools: []` — no data tools to
     # re-fetch with; deepagents still mounts the filesystem + `execute` built-ins.
     if offload_sink is not None:
-        subagents.append({
+        from deepagents.middleware.filesystem import FilesystemMiddleware
+        from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+        from deepagents.middleware.subagents import SubAgentMiddleware
+
+        utility_model = build_chat_model(cfg.utility_model, cfg)
+        extract_spec = {
             "name": "extract-subagent",
             "description": (
                 "Reads a RESULT FILE saved under /workspace (an offloaded tool result) "
@@ -162,11 +167,28 @@ async def make_graph(config: dict | None = None):
             ),
             "system_prompt": extract_prompt(cfg.domain_prompt),
             "tools": [],
-            "model": build_chat_model(cfg.utility_model, cfg),
+            "model": utility_model,
             "middleware": [SubagentFindingsMiddleware()],
-        })
-        log.info("extract-subagent enabled on %s (reads offloaded files)",
-                 cfg.utility_model)
+        }
+        subagents.append(extract_spec)
+
+        # Offloaded files appear in the research-subagents' context (they make the data
+        # calls), so nest a `task` tool there, restricted to extract-subagent. This
+        # direct path skips deepagents' default stack — carry our own filesystem stack.
+        nested_extract_spec = {
+            **extract_spec,
+            "middleware": [
+                FilesystemMiddleware(backend=backend),
+                PatchToolCallsMiddleware(),
+                SubagentFindingsMiddleware(),
+            ],
+        }
+        subagent_spec["middleware"] = [
+            SubAgentMiddleware(backend=backend, subagents=[nested_extract_spec]),
+            *subagent_spec["middleware"],
+        ]
+        log.info("extract-subagent enabled on %s (reads offloaded files; "
+                 "research-subagents delegate to it via task)", cfg.utility_model)
 
     # The orchestrator holds NO data tools — it plans, delegates (task), verifies
     # findings, and synthesizes. Gathering lives in sub-agents, so raw data can't

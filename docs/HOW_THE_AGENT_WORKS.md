@@ -118,9 +118,12 @@ an intention: `tests/test_model_tiering.py` parses the `# $in / $out` comment be
 `MODEL_TIERS` and fails if a fleet is priced above its planner, if a tier is cheaper than the one
 below it, or if a slug carries no price at all.
 (The `utility` slot powers the `extract-subagent`: when a large tool result is offloaded to a
-/workspace file, the orchestrator hands the file + a question to this cheapest model for
-reading/summarizing instead of loading the text into its own expensive context. It is registered
-only when a sandbox is attached — without one there are no offloaded files to read.)
+/workspace file, the file + a question goes to this cheapest model for reading/summarizing
+instead of being loaded into a more expensive context. Research-subagents — where the offloaded
+files actually appear, since they make the data calls — carry a nested `task` tool restricted to
+extract-subagent for exactly this delegation; the orchestrator can also call it for files
+surfaced in findings. It is registered only when a sandbox is attached — without one there are
+no offloaded files to read.)
 
 ---
 
