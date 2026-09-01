@@ -25,7 +25,12 @@ cd "$(dirname "$0")"
 
 [ -f .env ] && { set -a; . ./.env || true; set +a; }
 
-SANDBOX_REPO="${LLM_SANDBOX_REPO:-../llm_sandbox}"
+# The sandbox repo lives NEXT TO the main checkout. Resolve the default from git's
+# common dir so it also works from a linked worktree (…/.worktrees/<name>), where
+# this script's own ../ would point inside .worktrees. Outside a git repo the
+# fallback keeps the old script-relative behavior.
+MAIN_CHECKOUT="$(dirname "$(git rev-parse --git-common-dir 2>/dev/null || echo .git)")"
+SANDBOX_REPO="${LLM_SANDBOX_REPO:-$MAIN_CHECKOUT/../llm_sandbox}"
 SANDBOX_URL="${LLM_SANDBOX_URL:-http://127.0.0.1:8900}"
 AGENT_HOST="${DRA_HOST:-127.0.0.1}"
 AGENT_PORT="${DRA_PORT:-${PORT:-2024}}"
