@@ -89,6 +89,9 @@ MODEL_TIERS: dict[str, dict[str, str]] = {
 
 DEFAULT_MODEL_TIER = "extra-low"
 
+# Valid values for reasoning_effort ("" = provider default; "none" = disable thinking).
+_REASONING_EFFORTS = frozenset({"", "none", "minimal", "low", "medium", "high"})
+
 
 def _env(*names: str, default: str = "") -> str:
     for n in names:
@@ -212,12 +215,18 @@ class ResearchConfig:
     # subagent_model (typically a tier down); utility_model is the floor (flash-class)
     # for pure map/extract/verify work that needs no tool-loop judgment. All three are
     # filled from the selected MODEL_TIERS package (DEFAULT_MODEL_TIER when none
-    # chosen) — never settable individually by env or caller. utility_model has no
-    # consumer yet — plumbed now so the verifier / compaction / map-worker features
-    # configure against a stable key.
+    # chosen) — never settable individually by env or caller. utility_model's first
+    # consumer is the extract-subagent (agent.py): the map/extract worker that reads
+    # offloaded result files. Future verifier / compaction features share this key.
     subagent_model: str
     utility_model: str
     temperature: float = 0.0
+    # OpenRouter unified `reasoning` effort sent with every model call: none/minimal/
+    # low/medium/high, or "" for the provider default. Thinking bills as OUTPUT tokens
+    # and provider defaults run medium/dynamic, so capped to "low" by default; "none"
+    # disables thinking where supported. Unsupported models ignore the parameter.
+    # DRA_REASONING_EFFORT.
+    reasoning_effort: str = "low"
     # Per-HTTP-request ceiling (seconds) and retry count on every model call. Without an
     # explicit timeout the OpenAI client's default applies to a request that a proxied
     # provider can stall far longer on — one hung call would otherwise pin a research unit
@@ -407,6 +416,15 @@ class ResearchConfig:
         if isinstance(denylist, str):
             denylist = denylist.split(",")
 
+        reasoning_effort = str(_pick(
+            c, "reasoning_effort", env="DRA_REASONING_EFFORT",
+            default=cls.reasoning_effort)).strip().lower()
+        if reasoning_effort not in _REASONING_EFFORTS:
+            log.warning("unknown reasoning_effort %r — using %r (allowed: %s)",
+                        reasoning_effort, cls.reasoning_effort,
+                        ", ".join(sorted(v or "\"\"" for v in _REASONING_EFFORTS)))
+            reasoning_effort = cls.reasoning_effort
+
         return cls(
             openai_api_key=openai_key,
             base_url=base_url,
@@ -416,6 +434,7 @@ class ResearchConfig:
             subagent_model=subagent_model,
             utility_model=utility_model,
             temperature=float(_pick(c, "temperature", default=cls.temperature)),
+            reasoning_effort=reasoning_effort,
             request_timeout=float(_pick(
                 c, "request_timeout", env="DRA_REQUEST_TIMEOUT",
                 default=cls.request_timeout)),

@@ -24,7 +24,8 @@ from .config import ResearchConfig
 from .findings_gate import SubagentFindingsMiddleware
 from .metering import RunMeter, UsageMeterMiddleware
 from .models import build_chat_model
-from .prompts import describe_mcp_sources, orchestrator_prompt, subagent_prompt
+from .prompts import (describe_mcp_sources, extract_prompt, orchestrator_prompt,
+                      subagent_prompt)
 from .report_gate import ReportQualityGateMiddleware
 from .skill_usage import SkillUsageMiddleware
 from .events import instrument_tool, result_handling
@@ -72,8 +73,8 @@ async def make_graph(config: dict | None = None):
     # Always a fresh build — never alias the orchestrator's instance on string-equal
     # ids, so future per-tier kwargs (temperature, callbacks) can't be silently shared.
     subagent_model = build_chat_model(cfg.subagent_model, cfg)
-    log.info("models: research=%s subagent=%s utility=%s (utility unused until a "
-             "consumer lands)", cfg.research_model, cfg.subagent_model, cfg.utility_model)
+    log.info("models: research=%s subagent=%s utility=%s",
+             cfg.research_model, cfg.subagent_model, cfg.utility_model)
 
     tools = []
     search = build_search_tool(cfg, meter)
@@ -109,8 +110,8 @@ async def make_graph(config: dict | None = None):
 
     # Deployment-specific tools dropped into the custom_tools/ dir (no edits to this
     # generic codebase). Same instrumentation as MCP tools, so a large result offloads
-    # to the sandbox file the `execute` tool reads back. Available to BOTH orchestrator and
-    # sub-agents (they share `tools`); the model discovers each via its own name/description.
+    # to the sandbox file the `execute` tool reads back. `tools` goes to the
+    # research-subagents only — the orchestrator holds no data tools (see below).
     for custom in load_custom_tools(cfg):
         tools.append(instrument_tool(
             custom, kind="tool", **result_handling(cfg, meter, offload_sink)))
@@ -145,9 +146,31 @@ async def make_graph(config: dict | None = None):
         subagent_spec["skills"] = skills
     subagents = [subagent_spec]
 
-    # Orchestrator KEEPS the data tools for small/targeted gathering; the prompt steers it to
-    # DELEGATE breadth/scale to sub-agents (partitioned by unit), so large scans isolate their
-    # raw output in sub-agent contexts rather than overflowing the orchestrator's.
+    # Utility-model consumer: reads offloaded /workspace result files on the cheapest
+    # model. Registered only when offloading is live. `tools: []` — no data tools to
+    # re-fetch with; deepagents still mounts the filesystem + `execute` built-ins.
+    if offload_sink is not None:
+        subagents.append({
+            "name": "extract-subagent",
+            "description": (
+                "Reads a RESULT FILE saved under /workspace (an offloaded tool result) "
+                "and returns consolidated findings: summarize the topics in text, "
+                "classify or extract claims, compute aggregates. Runs on the cheapest "
+                "model — use it for ALL reading of offloaded files instead of loading "
+                "them yourself. Pass the file path(s), the specific question, and the "
+                "source label."
+            ),
+            "system_prompt": extract_prompt(cfg.domain_prompt),
+            "tools": [],
+            "model": build_chat_model(cfg.utility_model, cfg),
+            "middleware": [SubagentFindingsMiddleware()],
+        })
+        log.info("extract-subagent enabled on %s (reads offloaded files)",
+                 cfg.utility_model)
+
+    # The orchestrator holds NO data tools — it plans, delegates (task), verifies
+    # findings, and synthesizes. Gathering lives in sub-agents, so raw data can't
+    # enter the expensive orchestrator context at all.
     middleware = [
         # Hard backstop against runaway runs: cumulative tool-call + token ceilings,
         # soft wrap-up nudge then hard stop.
@@ -183,7 +206,7 @@ async def make_graph(config: dict | None = None):
 
     agent = create_deep_agent(
         model=research_model,
-        tools=[*tools, build_clarify_tool(), build_submit_report_tool(data_tool_names)],
+        tools=[build_clarify_tool(), build_submit_report_tool(data_tool_names)],
         system_prompt=orchestrator_prompt(mcp_prompt, cfg.domain_prompt),
         subagents=subagents,
         middleware=middleware,

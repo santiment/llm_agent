@@ -27,6 +27,13 @@ def build_chat_model(model_id: str, cfg: ResearchConfig) -> ChatOpenAI:
         log.warning("Streaming force-disabled for %r — off-spec streaming corrupts tool_calls "
                     "(merged/doubled chunks); override via DRA_STREAMING_DENYLIST", model_id)
         streaming = False
+    # OpenRouter's unified `reasoning` param — an OpenRouter extension, hence
+    # extra_body. Ignored by models without reasoning support.
+    extra_body: dict = {}
+    if cfg.reasoning_effort == "none":
+        extra_body["reasoning"] = {"enabled": False}
+    elif cfg.reasoning_effort:
+        extra_body["reasoning"] = {"effort": cfg.reasoning_effort}
     return ChatOpenAI(
         model=model_id,
         api_key=cfg.openai_api_key or "missing-key",
@@ -38,6 +45,7 @@ def build_chat_model(model_id: str, cfg: ResearchConfig) -> ChatOpenAI:
         # transient 429/5xx the same stack produces. DRA_REQUEST_TIMEOUT / DRA_MAX_RETRIES.
         timeout=cfg.request_timeout,
         max_retries=cfg.max_retries,
+        extra_body=extra_body or None,
         # Streaming on by default (drives the live "thinking" narration in the UI). Some
         # OpenRouter-proxied models emit off-spec streaming chunks that LangChain merges
         # into doubled metadata (e.g. deepseek-v4-flash's `finish_reason: "stopstop"`) and
