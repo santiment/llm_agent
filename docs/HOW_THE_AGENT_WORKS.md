@@ -103,7 +103,7 @@ Models are **not** individually settable per run or per env var. You pick a **na
 `model_tier` / `DRA_MODEL_TIER`; the models behind each name live in code (`MODEL_TIERS`), in one
 reviewed place. Every tier defines three roles:
 
-| Tier        | research (orchestrator) | subagent (workers)    | utility (reserved) | Use for |
+| Tier        | research (orchestrator) | subagent (workers)    | utility (extract)  | Use for |
 |-------------|-------------------------|-----------------------|--------------------|---------|
 | `extra-low` | mimo-v2.5               | deepseek-v4-flash     | qwen3-30b          | demos, smoke tests, high-volume low-stakes |
 | `low`       | deepseek-v4-pro         | deepseek-v4-flash     | deepseek-v4-flash  | cheapest sane agent |
@@ -117,7 +117,10 @@ makes most of the tool calls — would defeat the point, so that is an asserted 
 an intention: `tests/test_model_tiering.py` parses the `# $in / $out` comment beside every slug in
 `MODEL_TIERS` and fails if a fleet is priced above its planner, if a tier is cheaper than the one
 below it, or if a slug carries no price at all.
-(The `utility` slot is plumbed but has no consumer yet — reserved for future map/extract work.)
+(The `utility` slot powers the `extract-subagent`: when a large tool result is offloaded to a
+/workspace file, the orchestrator hands the file + a question to this cheapest model for
+reading/summarizing instead of loading the text into its own expensive context. It is registered
+only when a sandbox is attached — without one there are no offloaded files to read.)
 
 ---
 
@@ -126,9 +129,10 @@ below it, or if a slug carries no price at all.
 `create_deep_agent` gives us a **ReAct loop** (the model thinks, calls a tool, reads the result,
 repeats) with one orchestrator and a fleet of sub-agents.
 
-- **The orchestrator** runs on the smart model. It triages, plans, delegates, and writes the final
-  report. It *keeps* the data tools for small/targeted lookups, but the prompt steers it to delegate
-  breadth.
+- **The orchestrator** runs on the smart model. It triages, plans (`write_todos`), delegates,
+  verifies the returned findings against its plan, and writes the final report. It holds **no data
+  tools** — every gather, even a one-call lookup, goes through `task`, so raw data cannot enter the
+  expensive context at all.
 - **A `research-subagent`** owns **one unit** of research — a single entity, dimension, period, or
   segment. It makes *all* the calls that unit needs **in its own context** and returns only
   consolidated, dense findings. This is context isolation: a large scan's raw output stays trapped in

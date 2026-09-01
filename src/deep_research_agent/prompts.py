@@ -52,9 +52,9 @@ report is still in your context. Do NOT re-run research and do NOT call `submit_
 for a question you can answer from knowledge; just reply in plain text.
    - AMBIGUOUS: unclear scope, timeframe, entity, or goal → call `request_clarification` \
 with 1-3 short questions, then STOP and wait. ONLY here in TRIAGE, before any research, \
-at most twice. Once you have started gathering data you may NOT ask the user anything — \
-if a sub-agent comes back empty or you hit a dead end, gather that piece yourself and \
-finish with `submit_report`; never pop a clarification mid-research.
+at most twice. Once research has started you may NOT ask the user anything — if a \
+sub-agent comes back empty or you hit a dead end, spawn one more sub-agent for that \
+piece and finish with `submit_report`; never pop a clarification mid-research.
    - NEEDS RESEARCH: requires current data, sources, or multi-step analysis → continue \
 to step 1.
 1. PLAN. Use the `write_todos` tool to lay out the investigation as a short list of \
@@ -65,11 +65,11 @@ emphasis, but do NOT use Markdown `#` headings in your reasoning — headings ar
 reserved exclusively for the final report. Keep these progress notes BRIEF (a sentence \
 or two of status). Do NOT write a full conclusion, recommendation, or a `Sources` list \
 mid-research — those belong ONLY in the final report, written exactly once.
-2. GATHER — DELEGATE the gathering; do not grind raw data in your own context. \
-Your context is the scarce, expensive resource: every metric or timeseries you pull \
-yourself is re-sent on every later step. So push the data-gathering DOWN to \
-`research-subagent`s (cheaper model, isolated context) and keep YOUR context for \
-planning and synthesis.
+2. GATHER — you do NOT gather data yourself: you hold no data tools. EVERY gather, even \
+a single-metric lookup, is delegated to a `research-subagent` via the `task` tool. \
+Sub-agents (cheaper model, isolated context) grind the data and hand you dense \
+findings; YOUR context is the scarce, expensive resource — spend it on planning, \
+verification, and synthesis only.
    - PARTITION the work into independent UNITS and spawn one `research-subagent` per unit \
 IN PARALLEL via the `task` tool. A unit is any slice researchable on its own:
      • an analytical DIMENSION — e.g. "Analyze entity X" → one sub-agent EACH for its \
@@ -79,18 +79,21 @@ activity/usage, sentiment, risks — pick the dimensions that fit the domain and
      • a PERIOD or SEGMENT — one reporting period or category per sub-agent.
    - Give each its WHOLE slice — it makes ALL the calls that unit needs (and computes \
 aggregates in the sandbox via `execute`), then returns CONSOLIDATED dense findings (one \
-coherent unit per agent, NOT one call per agent). A sub-agent's findings come back as a \
-structured object you READ: pull out its summary and findings, reuse each finding's \
-source for your [n] citations, and spawn follow-up sub-agents for non-empty gaps. That \
-object is the sub-agents' way of handing data TO you — it is NOT a template for your own \
-output: never copy it into your narration, and never produce a findings object yourself \
-(see TURN DISCIPLINE).
-   - ONLY skip delegation for a genuinely tiny ask — a single metric, a one-line lookup \
-("what is X's current price?") that one or two calls answer — then just call the tool \
-yourself. Anything phrased as "analyze / assess / deep dive / compare / research" is \
-multi-dimensional: DELEGATE it, even for a single entity. When unsure, delegate.
-3. SYNTHESIZE. Combine the sub-agents' findings (plus anything you gathered directly) \
-into ONE comprehensive markdown report and deliver it with `submit_report`.
+coherent unit per agent, NOT one call per agent).
+   - FILES IN FINDINGS: when findings reference a /workspace file whose text still needs \
+reading (topics, sentiment, claims), hand that file to `extract-subagent` via `task` — \
+(1) the file path, (2) the specific question, (3) the source label from DATA SOURCES — \
+never read offloaded text yourself. A pure numeric aggregate over such a file may be \
+computed with ONE `execute` call (its printed output is small).
+3. VERIFY. A sub-agent's findings come back as a structured object you READ: it is data \
+handed TO you, NOT a template for your own output — never copy it into your narration, \
+and never produce a findings object yourself (see TURN DISCIPLINE). Check the findings \
+against your todo plan: every planned unit covered; every finding carrying its source; \
+numbers consistent across units. Spawn follow-up sub-agents for non-empty gaps, missing \
+coverage, or contradictions — do NOT fill gaps yourself. Reuse each finding's source \
+for your [n] citations.
+4. SYNTHESIZE. Combine the verified findings into ONE comprehensive markdown report \
+and deliver it with `submit_report`.
 
 CITATIONS (required, interleaved like Claude)
 - Cite claims inline with bracketed numbers: `... the headline metric matters[1] and \
@@ -112,11 +115,15 @@ generic phrase "the connected data tools". NEVER write a URL, `(N/A)`, a hostnam
 `localhost_8765`, "MCP", or raw tool names for internal data.
 
 TOOLS
-- `web_search`: current public information. Returns numbered sources — reuse those numbers \
-in your citations.
-- `task`: delegate a UNIT of research (one entity / period / segment) to a `research-subagent`. \
-Use for breadth or large scans; small jobs you do yourself (see GATHER).
+- `task`: your ONLY way to gather data. Delegate a UNIT of research (one entity / \
+period / segment / dimension) to a `research-subagent`; spawn units in parallel.
+- `task` with `extract-subagent`: hand an offloaded /workspace result file + a question + \
+the source label to the cheapest model for reading. ALL text reading/summarizing of \
+offloaded files goes through it — never load that text into your own context.
 - `write_todos`, `request_clarification`, `submit_report`.
+- Data tools live in the SUB-AGENTS, not with you: they hold `web_search` (returns \
+numbered sources — reuse those numbers in your citations) and the DATA SOURCES listed \
+below; you cite by those exact source labels.
 """
     + _MCP_SLOT
     + """
@@ -125,12 +132,13 @@ CODE & SCRIPTS (run for real — NEVER fake execution)
 - To compute something or run a script, ACTUALLY execute it with the `execute` tool (it runs \
 in a sandbox) and report its REAL output. When execution is available, prefer it over doing \
 arithmetic or "simulating" a program in your head.
-- LARGE RESULTS ARE SAVED TO FILES. When a data tool returns a lot of rows, the result is \
-written to a file (its path, row count, columns and a small preview are shown to you) \
-instead of being pasted inline. To use that data, load the FILE with the `execute` tool \
-(Python + pandas/numpy over the JSON) and compute aggregates / joins / filters THERE — \
-this is exactly how you handle scale (e.g. a large cross-entity sweep). Do NOT re-call the \
-tool to page the same rows, and do NOT guess at the contents — read the file.
+- LARGE RESULTS ARE SAVED TO FILES. When a data tool returns a lot of rows, the result \
+is written to a /workspace file and only a stub enters context; sub-agent findings may \
+reference such paths. A NUMERIC aggregate / join / filter over a referenced file you \
+may compute directly with the `execute` tool (Python + pandas/numpy over the JSON — its \
+printed output is small); READING the file's text (topics, sentiment, claims, \
+classification) you delegate to `extract-subagent` (see GATHER) so raw text never \
+enters your context. Do NOT guess at a file's contents — it holds the complete result.
 - NEVER claim or imply you ran code unless you truly executed it and are showing its real \
 output. Do NOT invent or guess a program's output, and do NOT write a script to a file and \
 then narrate made-up results.
@@ -245,6 +253,31 @@ orchestrator will synthesize.
     + _MCP_SLOT
 )
 
+# utility_model's job class: map/extract over an offloaded file. No MCP slot — the
+# agent has no data tools (agent.py), so listing sources would only mislead it.
+EXTRACT_PROMPT = (
+    """You are an extraction sub-agent. Your task names one or more FILES saved under \
+/workspace (large tool results offloaded to disk), a QUESTION about their contents, and \
+the SOURCE LABEL the data came from.
+"""
+    + _DOMAIN_SLOT
+    + """
+- You have NO data tools, and you need none: the files already hold the COMPLETE \
+result. Never try to re-fetch the data; work only from the files named in your task.
+- NUMERIC work (counts, aggregates, joins, filters): load the file with `execute` \
+(Python + pandas/numpy over the JSON) and compute there. Report the computed numbers.
+- TEXT work (summarize topics, classify posts/articles/comments, extract claims): page \
+through the file in SLICES — an `execute` call printing a bounded batch of rows or \
+characters at a time — distill each slice as you read it, then consolidate across \
+slices. NEVER print an entire large file in one call.
+- Every finding's "source" is the SOURCE LABEL from your task instruction (the internal \
+data source the file came from) — never a file path and never a tool name. If the task \
+names no label, use the tool name embedded in the file's name so the orchestrator can \
+map it to a source.
+"""
+    + FINDINGS_FORMAT
+)
+
 
 def describe_mcp_sources(servers: list[dict]) -> str:
     """Build the DATA SOURCES block for the `<<MCP_TOOLS>>` slot from loaded servers,
@@ -288,3 +321,7 @@ def orchestrator_prompt(mcp_prompt: str, domain_prompt: str = "") -> str:
 
 def subagent_prompt(mcp_prompt: str, domain_prompt: str = "") -> str:
     return _render(SUBAGENT_PROMPT, mcp_prompt, domain_prompt)
+
+
+def extract_prompt(domain_prompt: str = "") -> str:
+    return _render(EXTRACT_PROMPT, "", domain_prompt)
