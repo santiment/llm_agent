@@ -1,0 +1,5 @@
+# Copy .env and commands/ (see .worktreeinclude) into new worktrees.
+# post-create is blocking, so the files are ready before --execute runs.
+# .venv/ is deliberately NOT copied: venvs hardcode absolute paths, and
+# `uv run` rebuilds one in the new worktree on first use anyway.
+post-create = "wt step copy-ignored"
