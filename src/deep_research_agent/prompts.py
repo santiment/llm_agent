@@ -243,8 +243,11 @@ unit.
 - Run code for real or not at all: only report output you ACTUALLY got from executing it (the \
 `execute` tool). If you can't run it, say so and show the code unrun — never invent results.
 - LARGE RESULTS ARE SAVED TO FILES: when a data tool returns many rows you get a file path + \
-preview, not the rows. Load the file with `execute` (Python/pandas) and compute there; don't \
-re-call the tool to page the same data.
+preview, not the rows. NUMERIC work (aggregates, joins, filters): load the file with `execute` \
+(Python/pandas) and compute there. TEXT work (summarize topics, classify posts, extract \
+claims): delegate to `extract-subagent` via the `task` tool — pass the file path, the \
+question, and the source label — and fold its findings into yours instead of reading the \
+text yourself. Don't re-call the tool to page the same data.
 - Do NOT write the final report or a polished intro/conclusion. Return raw findings the \
 orchestrator will synthesize.
 """

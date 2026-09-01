@@ -321,10 +321,11 @@ def _offload_result(
         + (f"preview (first {head_rows} rows):\n{head}\n" if head else "")
         + "\nThis file holds the COMPLETE result. Numeric aggregates / joins / filters: "
         "compute with the `execute` tool (Python + pandas/numpy over the JSON). READING "
-        "the text inside (topics, sentiment, claims): if you have the `task` tool, "
-        "delegate that to `extract-subagent` (file path + question + source label) "
-        "instead of loading the text yourself. Do NOT re-call this tool to page the "
-        "same rows."
+        "the text inside (topics, sentiment, claims): you MUST delegate that to "
+        "`extract-subagent` via the `task` tool (file path + question + source label) — "
+        "do NOT print the text into your own context; `execute` on this file is for "
+        "numeric computation and structure checks only. Do NOT re-call this tool to "
+        "page the same rows."
     )
     return stub, note
 

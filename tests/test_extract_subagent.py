@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import asyncio
 
+from deepagents.middleware.filesystem import FilesystemMiddleware
+from deepagents.middleware.subagents import SubAgentMiddleware
+
 import deep_research_agent.agent as agent_mod
 from deep_research_agent.findings_gate import SubagentFindingsMiddleware
 from deep_research_agent.prompts import extract_prompt
@@ -74,6 +77,39 @@ def test_extract_subagent_disabled_when_offload_off(monkeypatch) -> None:
     captured = _make_graph(monkeypatch, config)
     names = [s["name"] for s in captured["subagents"]]
     assert names == ["research-subagent"]
+
+
+def test_research_subagent_delegates_to_extract(monkeypatch) -> None:
+    """Research-subagent gets a nested task tool restricted to extract-subagent."""
+    monkeypatch.delenv("LLM_SANDBOX_URL", raising=False)
+    config = _base_config()
+    config["configurable"]["sandbox_url"] = "http://sandbox.invalid:8080"
+    captured = _make_graph(monkeypatch, config)
+
+    research = next(s for s in captured["subagents"] if s["name"] == "research-subagent")
+    task_mws = [m for m in research["middleware"] if isinstance(m, SubAgentMiddleware)]
+    assert len(task_mws) == 1
+    assert task_mws[0].subagent_names == frozenset({"extract-subagent"})
+    # Nested spec must carry its own filesystem stack (no default stack on this path).
+    nested = task_mws[0]._subagents[0]
+    assert any(isinstance(m, FilesystemMiddleware) for m in nested["middleware"])
+    assert any(isinstance(m, SubagentFindingsMiddleware) for m in nested["middleware"])
+
+
+def test_real_graph_compiles_with_nested_extract(monkeypatch) -> None:
+    """Real graph build — the nested spec compiles eagerly, so wiring errors surface here."""
+    monkeypatch.delenv("LLM_SANDBOX_URL", raising=False)
+    config = _base_config()
+    config["configurable"]["sandbox_url"] = "http://sandbox.invalid:8080"
+    graph = asyncio.run(agent_mod.make_graph(config))
+    assert graph is not None
+
+
+def test_no_nested_task_without_offloading(monkeypatch) -> None:
+    monkeypatch.delenv("LLM_SANDBOX_URL", raising=False)
+    captured = _make_graph(monkeypatch, _base_config())
+    research = next(s for s in captured["subagents"] if s["name"] == "research-subagent")
+    assert not any(isinstance(m, SubAgentMiddleware) for m in research["middleware"])
 
 
 def test_orchestrator_holds_no_data_tools(monkeypatch) -> None:

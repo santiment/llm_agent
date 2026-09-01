@@ -36,7 +36,9 @@ _DESCRIPTION = (
     "by engagement), `random` (unbiased base), `poles` (oversampled bull/bear extremes). "
     "Judge prevalence and mood ONLY from the `random` stratum and the stats block; use "
     "head/poles for what spread and where the disagreement is. Large results are saved to "
-    "a file — load it with `execute` (pandas over messages, cite numbers from stats)."
+    "a file: compute NUMBERS with `execute` (pandas over messages; cite from stats), but "
+    "READ the message text (topics, narratives, claims) by handing the file to "
+    "`extract-subagent` via the `task` tool — never by printing it into your own context."
 )
 
 
