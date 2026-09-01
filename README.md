@@ -119,6 +119,9 @@ Resolution order for every field: per-run `configurable` override → env var �
 | `DRA_RECURSION_LIMIT` | `4500` | LangGraph super-step ceiling for the orchestrator loop (caps loops, not tool calls) |
 | `DRA_MAX_TOOL_CALLS` | `200` | Cumulative tool-call ceiling per run (BudgetMiddleware) before a hard stop |
 | `DRA_MAX_TOTAL_TOKENS` | `4000000` | Cumulative token ceiling per run; soft wrap-up nudge at 75%, hard stop at 100% |
+| `DRA_COMPACTION_TOKENS` | `100000` | Context size (est. tokens) at which older messages are summarized in-flight on the utility model and replaced (compacted work still counts against the budget); `0` disables |
+| `DRA_PROMPT_CACHING` | `true` | Inject `cache_control` prompt-cache breakpoints into every model request (OpenRouter base URL only; ignored by non-caching providers) |
+| `DRA_WEB_FETCH` | `true` | `web_fetch` tool: sub-agents read a page's FULL text instead of citing search snippets; oversized pages offload like any big tool result |
 | `DRA_MAX_RESULT_CHARS` | `60000` | Per-call MCP result size over which the result offloads to a file (or truncates, no sandbox) |
 | `DRA_MAX_RESULT_ROWS` | `1000` | Per-call MCP result row count that triggers the same offload/truncate |
 | `DRA_OFFLOAD_RESULTS` | `true` | Offload large MCP results to the sandbox filesystem instead of truncating them |
@@ -128,7 +131,7 @@ Resolution order for every field: per-run `configurable` override → env var �
 | `LLM_SANDBOX_NETWORK` | `false` | Allow outbound network from inside the sandbox |
 | `LLM_SANDBOX_SESSION_TIMEOUT` | `900` | Sandbox session timeout (seconds) |
 
-Per-run `configurable` keys mirror these: `model_tier`, `apiKeys.{OPENAI_API_KEY,TAVILY_API_KEY}`, `base_url` (allowlisted only), `temperature`, `request_timeout`, `max_retries`, `search_max_results`, `mcp_servers` / `mcp_config`, `mcp_prompt`, `mcp_max_concurrency`, `mcp_rate_limit_max_wait`, `domain_prompt`, `skills_dir`, `custom_tools_dir`, `streaming`, `streaming_denylist`, `recursion_limit`, `max_tool_calls`, `max_total_tokens`, `max_result_chars`, `max_result_rows`, `offload_results`, `offload_dir`, `sandbox_url`, `sandbox_token`, `sandbox_network`, `sandbox_session_timeout`.
+Per-run `configurable` keys mirror these: `model_tier`, `apiKeys.{OPENAI_API_KEY,TAVILY_API_KEY}`, `base_url` (allowlisted only), `temperature`, `request_timeout`, `max_retries`, `search_max_results`, `mcp_servers` / `mcp_config`, `mcp_prompt`, `mcp_max_concurrency`, `mcp_rate_limit_max_wait`, `domain_prompt`, `skills_dir`, `custom_tools_dir`, `streaming`, `streaming_denylist`, `recursion_limit`, `max_tool_calls`, `max_total_tokens`, `compaction_tokens`, `prompt_caching`, `web_fetch`, `max_result_chars`, `max_result_rows`, `offload_results`, `offload_dir`, `sandbox_url`, `sandbox_token`, `sandbox_network`, `sandbox_session_timeout`.
 
 ### Model tiers (price packages)
 
@@ -167,9 +170,9 @@ The contract is pinned in code: `events.EVENT_SCHEMAS` registers every type's re
 | `subagent_findings` | `unit`, `summary`, `findings[].{finding,evidence,source}`, `gaps[]` | Folded findings table (one per sub-agent); emitted when a sub-agent's findings validate |
 | `report` | `markdown` | Final answer (also in state `final_report`) |
 | `usage` | `tool_calls`, `total_tokens`, `model_calls`, `limits{}`, … | Per-run ledger at run end (no UI; logging / cost tracking) |
-| `status` | `state` = `mcp_ready` \| `mcp_error` \| `budget_soft` \| `budget_halt` \| `revising` \| `done` \| `error` | Lifecycle / errors |
+| `status` | `state` = `mcp_ready` \| `mcp_error` \| `budget_soft` \| `budget_halt` \| `revising` \| `compacting` \| `compacted` \| `loop_detected` \| `loop_halt` \| `done` \| `error` | Lifecycle / errors |
 
-`status` detail: `mcp_ready` carries `tool_count` + `tools[]`; `mcp_error` carries `detail`, `server`, `label`; `budget_soft` is the 75% wrap-up nudge and `budget_halt` the hard ceiling stop (see budgets below); `revising` fires when a gate bounces a deliverable back for one revision — `reason: report_quality` (final report) or `reason: subagent_findings` (a sub-agent's findings handoff). `done` / `error` is the run's authoritative end-state, emitted exactly once with a `reason` code: `done` for `report_delivered`, `awaiting_clarification`, `direct_answer` or `report_salvaged`; `error` for `budget_exhausted`, `stalled_after_nudges` or `ended_without_report`. Absence of either means the run died on an exception before the end-of-run hook and the host surfaces a stream error.
+`status` detail: `mcp_ready` carries `tool_count` + `tools[]`; `mcp_error` carries `detail`, `server`, `label`; `budget_soft` is the 75% wrap-up nudge and `budget_halt` the hard ceiling stop (see budgets below); `revising` fires when a gate bounces a deliverable back for one revision — `reason: report_quality` (final report) or `reason: subagent_findings` (a sub-agent's findings handoff); `compacting` / `compacted` bracket a context compaction (with `tokens_estimate` before and the summarized-away counters after); `loop_detected` is the repeated-identical-call nudge and `loop_halt` its hard stop (both carry `repeats`). `done` / `error` is the run's authoritative end-state, emitted exactly once with a `reason` code: `done` for `report_delivered`, `awaiting_clarification`, `direct_answer` or `report_salvaged`; `error` for `budget_exhausted`, `stalled_after_nudges` or `ended_without_report`. Absence of either means the run died on an exception before the end-of-run hook and the host surfaces a stream error.
 
 The `usage` event (from `metering.py`) reports orchestrator-level token counts plus global tool-call / result-size totals and the configured ceilings — emitted once at run end for logging and cost tracking.
 
@@ -260,6 +263,10 @@ To keep bare local runs from attempting an auth-less connect at all, leave `DRA_
 - **Code execution.** Set `LLM_SANDBOX_URL` (+ `LLM_SANDBOX_TOKEN`) to attach an llm-sandbox sidecar; deepagents' `execute` tool then runs real shell / Python / JS in the container, so the model computes aggregates and joins instead of doing arithmetic in its head. With no sandbox configured the agent falls back to an in-memory backend and execution is disabled — it degrades gracefully and says so rather than faking output.
 - **Large-result offload.** When a single MCP result exceeds `DRA_MAX_RESULT_CHARS` / `DRA_MAX_RESULT_ROWS`, the full payload is written to a file under `DRA_OFFLOAD_DIR` and only a compact stub (path, row count, columns, head) enters context; the model reads the file back with `execute`. Without a sandbox these bounds become hard truncation caps instead. This is how a large cross-entity scan stays within the context window.
 - **Budgets.** `BudgetMiddleware` enforces cumulative per-run ceilings — `DRA_MAX_TOOL_CALLS` and `DRA_MAX_TOTAL_TOKENS` — emitting a `budget_soft` wrap-up nudge at 75% and a `budget_halt` hard stop at 100%. `DRA_RECURSION_LIMIT` separately caps orchestrator super-steps. The `usage` event reports the run's spend against these ceilings at the end.
+- **Context compaction.** When an agent's estimated context crosses `DRA_COMPACTION_TOKENS` (default 100k; 0 = off), everything before the current turn's newest messages is summarized on the utility model — findings with figures and sources, offloaded file paths, gaps, next steps — and the transcript is replaced with `[summary, user request, recent tail]`. The summarized-away tool calls and tokens keep counting against the budget (compaction never grants fresh budget); a failed summarizer call compacts nothing and the run continues untouched.
+- **Loop guard.** Identical tool calls (same tool + args + result) repeated within the last 10 calls get a break-the-loop nudge at 3 repeats and a hard stop at 6 — the successful-but-useless twin of the permanent-failure memo. Applies to the orchestrator and every sub-agent.
+- **Usage & cost.** The end-of-run `usage` event now includes per-role sub-agent model usage (`subagents`), a whole-run token grand total (`total_tokens_all_agents`), compaction counters, and a best-effort `cost_usd` — OpenRouter's actual charged cost, captured on non-streamed calls only (a lower bound, not an invoice).
+- **Prompt caching.** With an OpenRouter base URL, every model request carries Anthropic-style `cache_control` breakpoints (system prompt + the two newest cacheable messages), cutting input cost on caching providers and ignored elsewhere. `DRA_PROMPT_CACHING=false` turns it off.
 
 ## Layout
 
@@ -274,6 +281,9 @@ src/deep_research_agent/
   completion.py       force-completion middleware (no premature ReAct termination)
   findings_gate.py    sub-agent findings gate — JSON contract, validator, bounce (report_gate's twin)
   budget.py           BudgetMiddleware — hard tool-call + token ceilings (soft nudge → hard stop)
+  compaction.py       in-flight context compaction — summarize-and-shrink near the window
+  loop_guard.py       identical-tool-call loop detector (nudge → hard stop)
+  caching.py          prompt-cache breakpoints (cache_control) per model request
   clarify_fallback.py emits clarification event when a model narrates questions in prose
   skill_usage.py      emits a skill event the first time each skill is read in a turn
   turn.py             scopes thread messages to the current turn (multi-turn safety)
@@ -282,6 +292,7 @@ src/deep_research_agent/
   metering.py         per-run usage ledger → usage event + RESEARCH USAGE log
   sandbox.py          wires the execute / filesystem tools to the llm-sandbox sidecar
   tools/search.py     Tavily web_search, emits search events
+  tools/fetch.py      web_fetch full-page reader (stdlib HTML→text, SSRF-guarded)
   tools/mcp.py        MCP loader + per-call instrumentation, concurrency + 429 backoff
   tools/clarify.py    request_clarification tool → clarification event
   tools/report.py     submit_report tool — the single explicit deliverable → report event

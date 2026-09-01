@@ -29,21 +29,36 @@ NUDGE_NAME = "dra_completion_nudge"
 BUDGET_NUDGE_NAME = "dra_budget_nudge"
 FINDINGS_NUDGE_NAME = "dra_findings_format_nudge"
 RESUBMIT_NUDGE_NAME = "dra_resubmit_nudge"
-_SYNTHETIC_NUDGE_NAMES = {
+LOOP_NUDGE_NAME = "dra_loop_nudge"
+# The HumanMessage carrying the compaction summary (compaction.py) — placed BEFORE the
+# turn's anchor precisely so current_turn() skips it.
+COMPACTION_SUMMARY_NAME = "dra_compaction_summary"
+# Every synthetic HumanMessage name — none of these may be read as a turn boundary.
+_SYNTHETIC_HUMAN_NAMES = {
     NUDGE_NAME, BUDGET_NUDGE_NAME, FINDINGS_NUDGE_NAME, RESUBMIT_NUDGE_NAME,
+    LOOP_NUDGE_NAME, COMPACTION_SUMMARY_NAME,
 }
 
 # Terminal/control tools — invoking these is how a turn *ends*, not "research work".
 _TERMINAL_TOOLS = {"submit_report", "request_clarification"}
 
 
-def current_turn(messages: list) -> list:
-    """Messages belonging to the in-progress turn (from the last real user message)."""
+def turn_anchor_index(messages: list) -> int:
+    """Index of the current turn's anchor — the last REAL (non-synthetic) HumanMessage —
+    or -1 when there is none. The one definition of "where does the current turn start";
+    ``current_turn`` and the compaction partitioner both build on it so they can never
+    disagree about the boundary."""
     for i in range(len(messages) - 1, -1, -1):
         m = messages[i]
-        if isinstance(m, HumanMessage) and getattr(m, "name", None) not in _SYNTHETIC_NUDGE_NAMES:
-            return messages[i:]
-    return list(messages)
+        if isinstance(m, HumanMessage) and getattr(m, "name", None) not in _SYNTHETIC_HUMAN_NAMES:
+            return i
+    return -1
+
+
+def current_turn(messages: list) -> list:
+    """Messages belonging to the in-progress turn (from the last real user message)."""
+    i = turn_anchor_index(messages)
+    return messages[i:] if i >= 0 else list(messages)
 
 
 def tc_name(tc) -> str:
@@ -55,6 +70,11 @@ def tc_args(tc) -> dict:
     """Args of a tool call (same dict-or-object duality), always a dict."""
     args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
     return args if isinstance(args, dict) else {}
+
+
+def tc_id(tc) -> str:
+    """Id of a tool call (same dict-or-object duality), always a str."""
+    return (tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "")) or ""
 
 
 def tool_call_of(request) -> tuple[str, dict, str]:
@@ -124,28 +144,38 @@ def did_research_work(messages: list) -> bool:
     return any(n not in _TERMINAL_TOOLS for n in tool_names_in(messages))
 
 
-_CHARS_PER_TOKEN = 4  # fallback estimate when usage_metadata is absent
+# Fallback estimate ratio when usage_metadata is absent. Shared by the budget ceiling
+# (tokens_in), the usage report (metering.sum_usage) and the compaction trigger
+# (compaction._context_estimate) — one ratio, so those numbers can't desynchronize.
+CHARS_PER_TOKEN = 4
+
+
+def raw_text(content) -> str:
+    """Full-fidelity stringification of a message's content. Deliberately NOT
+    ``text_of`` (which drops non-text blocks): size estimates and loop fingerprints
+    must see everything the transcript carries, or they undercount / miss repeats."""
+    return content if isinstance(content, str) else str(content)
+
+
+def message_tokens(m) -> int:
+    """One message's model-token count, with fallbacks: ``usage_metadata`` →
+    ``response_metadata.token_usage`` → chars/4 estimate. THE per-message ladder —
+    BudgetMiddleware's enforcement total and metering's reported totals are both sums
+    of this, so they can never disagree about the same messages."""
+    um = getattr(m, "usage_metadata", None)
+    t = um.get("total_tokens") if isinstance(um, dict) else None
+    if not t:
+        rm = getattr(m, "response_metadata", None)
+        t = (rm.get("token_usage") or {}).get("total_tokens") if isinstance(rm, dict) else None
+    if not t:
+        t = len(raw_text(m.content)) // CHARS_PER_TOKEN
+    return int(t or 0)
 
 
 def tokens_in(messages: list) -> int:
-    """Cumulative model tokens across the turn's AIMessages, with fallbacks (response
-    metadata, then a chars/4 estimate) so the count still reflects reality on models that
-    omit usage metadata. Shared by BudgetMiddleware (enforcement) and the end-of-run summary
-    so both read the same number."""
-    total = 0
-    for m in messages:
-        if not isinstance(m, AIMessage):
-            continue
-        um = getattr(m, "usage_metadata", None)
-        t = um.get("total_tokens") if isinstance(um, dict) else None
-        if not t:
-            rm = getattr(m, "response_metadata", None)
-            t = (rm.get("token_usage") or {}).get("total_tokens") if isinstance(rm, dict) else None
-        if not t:
-            content = m.content if isinstance(m.content, str) else str(m.content)
-            t = len(content) // _CHARS_PER_TOKEN
-        total += int(t or 0)
-    return total
+    """Cumulative model tokens across the turn's AIMessages (``message_tokens`` each),
+    so the count still reflects reality on models that omit usage metadata."""
+    return sum(message_tokens(m) for m in messages if isinstance(m, AIMessage))
 
 
 def tool_calls_in(messages: list) -> int:

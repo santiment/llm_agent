@@ -18,8 +18,9 @@ in ``EVENT_SCHEMAS`` order:
   - ``skill``          -> a skill being applied ("Skill: data-provider")
   - ``report``         -> final markdown answer (also persisted in state)
   - ``status``         -> lifecycle: mcp_ready | mcp_error | budget_soft | budget_halt |
-                          revising | done | error (the last two are the run's end-state,
-                          classified in citations.py; ``reason`` carries the specific code)
+                          revising | compacting | compacted | loop_detected | loop_halt |
+                          done | error (the last two are the run's end-state, classified
+                          in citations.py; ``reason`` carries the specific code)
   - ``clarification``  -> the questions the agent needs answered before it can proceed
   - ``usage``          -> end-of-run tool-call / token counters against their limits
   - ``subagent_findings`` -> one research unit's summary, findings and gaps
@@ -91,6 +92,14 @@ EVENT_SCHEMAS: dict[str, frozenset[str]] = {
     "subagent_findings": frozenset({"unit", "summary", "findings", "gaps"}),
 }
 
+# Every ``state`` a status event may carry — the docstring enumeration, as code.
+# A consumer switch()es on these; an unlisted state renders as nothing, so adding
+# one without registering it here is the same drift EVENT_SCHEMAS guards against.
+STATUS_STATES = frozenset({
+    "mcp_ready", "mcp_error", "budget_soft", "budget_halt", "revising",
+    "compacting", "compacted", "loop_detected", "loop_halt", "done", "error",
+})
+
 
 def _check_shape(event: dict[str, Any]) -> None:
     etype = event.get("type")
@@ -103,6 +112,9 @@ def _check_shape(event: dict[str, Any]) -> None:
     if missing:
         log.warning("EVENT PROTOCOL: %r event missing required keys %s",
                     etype, sorted(missing))
+    if etype == "status" and event.get("state") not in STATUS_STATES:
+        log.warning("EVENT PROTOCOL: unregistered status state %r — register it in "
+                    "STATUS_STATES", event.get("state"))
 
 
 def new_id() -> str:

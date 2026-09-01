@@ -24,12 +24,13 @@ from langchain.agents.middleware import AgentMiddleware, AgentState
 from langchain_core.messages import AIMessage, ToolMessage
 from typing_extensions import NotRequired
 
+from .compaction import turn_spend
 from .completion import MAX_NUDGES
 from .events import domain_of, emit
 from .report_hygiene import lint_citations, scrub_report
 from .turn import (NUDGE_NAME, called, count_nudges, current_turn, did_research_work,
-                   is_json_object_dump, looks_delivered, text_of, tokens_in,
-                   tool_calls_in, tool_calls_of)
+                   is_json_object_dump, looks_delivered, raw_text, text_of,
+                   tool_calls_of)
 
 log = logging.getLogger("deep_research_agent.citations")
 
@@ -78,7 +79,7 @@ class ResearchOutputMiddleware(AgentMiddleware):
         for m in messages:
             if not isinstance(m, ToolMessage):
                 continue
-            text = m.content if isinstance(m.content, str) else str(m.content)
+            text = raw_text(m.content)
             for raw in _URL_RE.findall(text):
                 url = _clean_url(raw)
                 if url and url not in seen:
@@ -122,8 +123,9 @@ class ResearchOutputMiddleware(AgentMiddleware):
         # an error and is logged + emitted as one. NOTE: this only runs on a clean end — its
         # ABSENCE in the logs means the run died via an exception (e.g. GraphRecursionError)
         # before after_agent, which the host streams as a stream error.
-        calls = tool_calls_in(messages)
-        tokens = tokens_in(messages)
+        # turn_spend includes what compaction summarized out of the transcript — the
+        # classifier must still recognize a budget-exhausted end after compaction.
+        calls, tokens = turn_spend(state)
         nudges = count_nudges(messages, NUDGE_NAME)
         last_ai = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
         end_state, reason, detail = self._classify(

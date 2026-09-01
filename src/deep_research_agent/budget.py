@@ -31,14 +31,9 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware, hook_config
 from langchain_core.messages import HumanMessage
 
+from .compaction import turn_spend
 from .events import emit
-from .turn import (
-    BUDGET_NUDGE_NAME,
-    count_nudges,
-    current_turn,
-    tokens_in,
-    tool_calls_in,
-)
+from .turn import BUDGET_NUDGE_NAME, count_nudges, current_turn
 
 log = logging.getLogger("deep_research_agent.budget")
 
@@ -62,8 +57,7 @@ class BudgetMiddleware(AgentMiddleware):
     @hook_config(can_jump_to=["end"])
     def before_model(self, state: dict, runtime) -> dict[str, Any] | None:
         turn = current_turn(state.get("messages") or [])
-        calls = tool_calls_in(turn)
-        tokens = tokens_in(turn)
+        calls, tokens = turn_spend(state)  # transcript + compacted-away spend
 
         over_hard = calls >= self.max_tool_calls or tokens >= self.max_total_tokens
         over_soft = (

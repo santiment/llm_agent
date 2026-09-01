@@ -8,6 +8,7 @@ many model choices.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -17,12 +18,15 @@ from deepagents.backends.filesystem import FilesystemBackend
 from deepagents.backends.state import StateBackend
 
 from .budget import BudgetMiddleware
+from .caching import PromptCacheMiddleware
 from .citations import ResearchOutputMiddleware
 from .clarify_fallback import ClarificationFallbackMiddleware, ClarificationGuardMiddleware
+from .compaction import ContextCompactionMiddleware
 from .completion import ForceCompletionMiddleware
 from .config import ResearchConfig
 from .findings_gate import SubagentFindingsMiddleware
-from .metering import RunMeter, UsageMeterMiddleware
+from .loop_guard import LoopGuardMiddleware
+from .metering import RunMeter, SubagentUsageMiddleware, UsageMeterMiddleware
 from .models import build_chat_model
 from .prompts import (describe_mcp_sources, extract_prompt, orchestrator_prompt,
                       subagent_prompt)
@@ -31,6 +35,7 @@ from .skill_usage import SkillUsageMiddleware
 from .events import instrument_tool, result_handling
 from .tools.clarify import build_clarify_tool
 from .tools.custom import load_custom_tools
+from .tools.fetch import build_fetch_tool
 from .tools.mcp import load_mcp_tools
 from .tools.report import build_submit_report_tool
 from .tools.search import build_search_tool
@@ -73,6 +78,9 @@ async def make_graph(config: dict | None = None):
     # Always a fresh build — never alias the orchestrator's instance on string-equal
     # ids, so future per-tier kwargs (temperature, callbacks) can't be silently shared.
     subagent_model = build_chat_model(cfg.subagent_model, cfg)
+    # The flash-class floor. This ONE instance is deliberately shared by its two
+    # consumers below (extract-subagent's loop + the compaction summarizer).
+    utility_model = build_chat_model(cfg.utility_model, cfg)
     log.info("models: research=%s subagent=%s utility=%s",
              cfg.research_model, cfg.subagent_model, cfg.utility_model)
 
@@ -116,6 +124,15 @@ async def make_graph(config: dict | None = None):
         tools.append(instrument_tool(
             custom, kind="tool", **result_handling(cfg, meter, offload_sink)))
 
+    # Full-page reader: search snippets are ~600 chars, and citing a page on its snippet
+    # alone is the failure this closes. Same wrapper as MCP/custom tools, so a huge page
+    # offloads to the sandbox instead of flooding a sub-agent's context. Its own
+    # semaphore bounds concurrent full-page downloads across the whole sub-agent fleet.
+    if cfg.web_fetch:
+        tools.append(instrument_tool(
+            build_fetch_tool(cfg), kind="tool", semaphore=asyncio.Semaphore(4),
+            **result_handling(cfg, meter, offload_sink)))
+
     # Every loaded data-tool name (search + MCP + custom) — the report scrub/lint layer
     # strips exactly THESE names (plus the get_* fallback) when they leak into a report,
     # so hygiene follows the deployment's real tool naming instead of a hardcoded prefix.
@@ -123,6 +140,22 @@ async def make_graph(config: dict | None = None):
     # they are engine machinery, not data-layer names, and words like "task" or
     # "execute" appear in legitimate report prose all the time.
     data_tool_names = tuple(sorted(t.name for t in tools))
+
+    # Middleware shared by the orchestrator AND every sub-agent — all stateless or
+    # message-derived, so single instances are safe across the sub-graphs:
+    #   - loop guard: break identical-tool-call loops (nudge, then end);
+    #   - compaction: summarize-and-shrink when a context nears the window
+    #     (0 = disabled; runs the summary on the cheap utility model);
+    #   - prompt cache: cache_control breakpoints, OpenRouter-only (it forwards the
+    #     markers to caching providers and strips them elsewhere; a plain OpenAI-compat
+    #     gateway might reject the unknown block key instead).
+    shared_middleware: list = [
+        LoopGuardMiddleware(),
+        # Self-disables when trigger_tokens <= 0 — no wiring guard needed here.
+        ContextCompactionMiddleware(utility_model, trigger_tokens=cfg.compaction_tokens),
+    ]
+    if cfg.prompt_caching and cfg.is_openrouter:
+        shared_middleware.append(PromptCacheMiddleware())
 
     # A sub-agent owns ONE UNIT of research (e.g. a single entity / period / segment): it makes
     # ALL the calls that unit needs in its OWN context and returns only consolidated dense
@@ -140,7 +173,11 @@ async def make_graph(config: dict | None = None):
         "system_prompt": subagent_prompt(mcp_prompt, cfg.domain_prompt),
         "tools": tools,
         "model": subagent_model,
-        "middleware": [SubagentFindingsMiddleware()],
+        # SubagentUsageMiddleware is what makes the fleet's model usage visible in the
+        # run's `usage` event — the orchestrator's state never sees these tokens.
+        "middleware": [SubagentFindingsMiddleware(),
+                       SubagentUsageMiddleware(meter, "research-subagent"),
+                       *shared_middleware],
     }
     if skills:  # give the sub-agent the same routing skill it needs to execute
         subagent_spec["skills"] = skills
@@ -154,7 +191,6 @@ async def make_graph(config: dict | None = None):
         from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
         from deepagents.middleware.subagents import SubAgentMiddleware
 
-        utility_model = build_chat_model(cfg.utility_model, cfg)
         extract_spec = {
             "name": "extract-subagent",
             "description": (
@@ -168,19 +204,24 @@ async def make_graph(config: dict | None = None):
             "system_prompt": extract_prompt(cfg.domain_prompt),
             "tools": [],
             "model": utility_model,
-            "middleware": [SubagentFindingsMiddleware()],
+            "middleware": [SubagentFindingsMiddleware(),
+                           SubagentUsageMiddleware(meter, "extract-subagent"),
+                           *shared_middleware],
         }
         subagents.append(extract_spec)
 
         # Offloaded files appear in the research-subagents' context (they make the data
         # calls), so nest a `task` tool there, restricted to extract-subagent. This
-        # direct path skips deepagents' default stack — carry our own filesystem stack.
+        # direct path skips deepagents' default stack — carry our own filesystem stack,
+        # then the same findings-gate/metering/shared trio as the top-level spec (the
+        # nested run has its OWN isolated state, so without its own usage middleware
+        # those tokens would never reach the meter).
         nested_extract_spec = {
             **extract_spec,
             "middleware": [
                 FilesystemMiddleware(backend=backend),
                 PatchToolCallsMiddleware(),
-                SubagentFindingsMiddleware(),
+                *extract_spec["middleware"],
             ],
         }
         subagent_spec["middleware"] = [
@@ -194,6 +235,10 @@ async def make_graph(config: dict | None = None):
     # findings, and synthesizes. Gathering lives in sub-agents, so raw data can't
     # enter the expensive orchestrator context at all.
     middleware = [
+        # Shared trio first (loop guard / compaction / prompt cache) — compaction must
+        # run BEFORE BudgetMiddleware so the budget check each step sees the shrunk
+        # transcript plus the compacted_* counters it folds back in (never a half-state).
+        *shared_middleware,
         # Hard backstop against runaway runs: cumulative tool-call + token ceilings,
         # soft wrap-up nudge then hard stop.
         BudgetMiddleware(

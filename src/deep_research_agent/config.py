@@ -49,8 +49,9 @@ def _read_prompt_file(path: str) -> str:
         log.warning("cannot read prompt file %s: %s", path, exc)
         return ""
 
-# Hostnames that resolve to cloud-metadata endpoints — never a legitimate MCP target.
-_BLOCKED_MCP_HOSTNAMES = {"metadata", "metadata.google.internal"}
+# Hostnames that resolve to cloud-metadata endpoints — never a legitimate target for
+# ANY outbound URL (MCP config or model-supplied web_fetch).
+_BLOCKED_HOSTNAMES = {"metadata", "metadata.google.internal"}
 
 # Default for the ``streaming_denylist`` field — a module constant so the field default
 # and the resolver share ONE list instead of repeating the model substring.
@@ -154,26 +155,46 @@ def _allowed_base_urls() -> set[str]:
     return allowed
 
 
-def _mcp_url_blocked(url: str) -> str | None:
-    """SSRF defense-in-depth for a per-run MCP URL. Returns a reason string if the URL
-    must be refused, else ``None``. Loopback/private hosts are ALLOWED (the internal
-    gateway legitimately uses them); only non-http(s) schemes and link-local / cloud-
-    metadata targets (169.254.0.0/16, fe80::/10, ``metadata.*``) are blocked."""
+def url_blocked(url: str, *, allow_private: bool) -> str | None:
+    """SSRF vetting shared by every outbound-URL consumer. Returns a reason string if
+    the URL must be refused, else ``None``. One skeleton (scheme allowlist, host
+    presence, cloud-metadata denylist, IP-literal properties) so hardening it — e.g.
+    adding a metadata alias — protects every caller at once; only the PRIVATE-address
+    policy diverges per caller:
+
+      - ``allow_private=True`` (operator-supplied MCP URLs): loopback/private hosts are
+        legitimate (the internal gateway uses them); only link-local / metadata targets
+        (169.254.0.0/16, fe80::/10, ``metadata.*``) are blocked.
+      - ``allow_private=False`` (MODEL-supplied web_fetch URLs): localhost and any
+        non-public IP literal are refused too.
+
+    A DNS name that RESOLVES to a private address is a known residual gap for both
+    (no resolve-and-pin here); the network posture is the second fence."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return f"scheme {parsed.scheme!r} not allowed"
     host = (parsed.hostname or "").lower()
     if not host:
         return "missing host"
-    if host in _BLOCKED_MCP_HOSTNAMES:
+    if host in _BLOCKED_HOSTNAMES:
         return f"blocked metadata host {host!r}"
+    if not allow_private and host == "localhost":
+        return "localhost blocked"
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return None  # a DNS name (e.g. host.docker.internal) — not an IP literal to vet
     if ip.is_link_local:
         return f"link-local address {host} blocked"
+    if not allow_private and (ip.is_private or ip.is_loopback or ip.is_reserved
+                              or ip.is_multicast or ip.is_unspecified):
+        return f"non-public address {host} blocked"
     return None
+
+
+def _mcp_url_blocked(url: str) -> str | None:
+    """The MCP-config policy: private/loopback allowed (see ``url_blocked``)."""
+    return url_blocked(url, allow_private=True)
 
 
 def _slug_from_url(url: str) -> str:
@@ -292,6 +313,23 @@ class ResearchConfig:
     # call ceiling can be generous. Without a sandbox these still backstop runaway runs.
     max_tool_calls: int = 200
     max_total_tokens: int = 4_000_000
+    # In-flight context compaction (compaction.py): when an agent's estimated context
+    # crosses this many tokens, older messages are summarized on utility_model and
+    # replaced with the summary. The knob is ABSOLUTE (not a window fraction) because an
+    # OpenRouter slug does not expose its context size; sized for the ~256k-window models
+    # the default tiers use, with headroom for the response. 0 disables compaction
+    # entirely (a run that outgrows the window then dies on the provider error, as
+    # before). DRA_COMPACTION_TOKENS.
+    compaction_tokens: int = 100_000
+    # Inject Anthropic-style prompt-cache breakpoints (cache_control) into every model
+    # request (caching.py). Applied only when base_url is OpenRouter, which forwards the
+    # markers to caching providers and strips them elsewhere. DRA_PROMPT_CACHING=false
+    # is the kill switch.
+    prompt_caching: bool = True
+    # Full-page reader tool (tools/fetch.py): web_fetch returns a page's complete
+    # readable text so sub-agents can cite substance, not snippets. Oversized pages
+    # offload to the sandbox like any big tool result. DRA_WEB_FETCH=false disables.
+    web_fetch: bool = True
     # Per-call MCP result threshold (events.py). With a sandbox, a result over EITHER bound is
     # written to a file under offload_dir and only a compact stub (path, row count, columns,
     # head) enters context — the model then processes the file with the `execute` tool. Without
@@ -312,6 +350,14 @@ class ResearchConfig:
     sandbox_token: str = ""
     sandbox_network: bool = False
     sandbox_session_timeout: int = 900
+
+    @property
+    def is_openrouter(self) -> bool:
+        """The ONE provider-detection gate for OpenRouter-only behaviors (cost
+        reporting in models.py, cache_control breakpoints in agent.py). A self-hosted
+        OpenRouter-compatible gateway whose URL lacks the substring silently loses
+        those features — extend here, not at the call sites."""
+        return "openrouter" in self.base_url.lower()
 
     @classmethod
     def from_runnable_config(cls, config: dict | None) -> "ResearchConfig":
@@ -467,6 +513,13 @@ class ResearchConfig:
             max_total_tokens=int(_pick(
                 c, "max_total_tokens", env="DRA_MAX_TOTAL_TOKENS",
                 default=cls.max_total_tokens)),
+            compaction_tokens=int(_pick(
+                c, "compaction_tokens", env="DRA_COMPACTION_TOKENS",
+                default=cls.compaction_tokens)),
+            prompt_caching=_flag(c, "prompt_caching", env="DRA_PROMPT_CACHING",
+                                 default=cls.prompt_caching),
+            web_fetch=_flag(c, "web_fetch", env="DRA_WEB_FETCH",
+                            default=cls.web_fetch),
             max_result_chars=int(_pick(
                 c, "max_result_chars", env="DRA_MAX_RESULT_CHARS",
                 default=cls.max_result_chars)),

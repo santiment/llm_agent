@@ -359,7 +359,7 @@ That's what keeps the agent portable.
 | `skill` | "Skill applied: …" |
 | `subagent_findings` | a folded findings table from a worker |
 | `clarification` | the question card (re-enables input) |
-| `status` | lifecycle: `mcp_ready` / `mcp_error` (tool loading), `budget_soft` / `budget_halt` (ceilings), `revising` (a gate bounced a deliverable back), then exactly one end-state — `done` or `error`, with a `reason` code |
+| `status` | lifecycle: `mcp_ready` / `mcp_error` (tool loading), `budget_soft` / `budget_halt` (ceilings), `revising` (a gate bounced a deliverable back), `compacting` / `compacted` (context compaction), `loop_detected` / `loop_halt` (repeated-identical-call guard), then exactly one end-state — `done` or `error`, with a `reason` code |
 | `usage` | the per-run usage summary |
 | `report` | the final markdown answer (also persisted in state) |
 
@@ -473,6 +473,9 @@ All overridable per-run (`configurable`) or via env var; defaults shown.
 | MCP servers | `DRA_MCP_SERVERS` / `DRA_MCP_URL` | none | data sources |
 | `max_tool_calls` | `DRA_MAX_TOOL_CALLS` | 200 | runaway-run ceiling |
 | `max_total_tokens` | `DRA_MAX_TOTAL_TOKENS` | 4,000,000 | runaway-run ceiling |
+| `compaction_tokens` | `DRA_COMPACTION_TOKENS` | 100,000 | in-flight context compaction trigger (est. tokens); older messages summarized on the utility model, budget counters carry over; 0 = off |
+| `prompt_caching` | `DRA_PROMPT_CACHING` | true | `cache_control` breakpoints on system prompt + newest messages (OpenRouter only) |
+| `web_fetch` | `DRA_WEB_FETCH` | true | full-page reader tool for sub-agents (big pages offload to the sandbox) |
 | `mcp_max_concurrency` | `DRA_MCP_MAX_CONCURRENCY` | 10 | simultaneous MCP calls cap |
 | `mcp_rate_limit_max_wait` | `DRA_MCP_RATE_LIMIT_MAX_WAIT` | 120 | seconds a rate-limited MCP call may back off before giving up |
 | `max_result_chars` / `max_result_rows` | `DRA_MAX_RESULT_*` | 60k / 1000 | offload/truncate threshold |
