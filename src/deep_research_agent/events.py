@@ -8,6 +8,7 @@ producer; your app is just a consumer — this is what keeps the agent portable.
 Render mapping (Claude / Gemini deep-research UIs) — one line per registered type,
 in ``EVENT_SCHEMAS`` order:
   - ``run_start``      -> protocol handshake; pin/verify before rendering anything else
+                          (``started_at``, UTC: the anchor for run time if a run dies early)
   - ``search_query``   -> the globe row ("how to analyze key metrics")
   - ``search_results`` -> the favicon + title grid ("7 results")
   - ``source``         -> registered citation (for the live source list)
@@ -19,10 +20,13 @@ in ``EVENT_SCHEMAS`` order:
   - ``report``         -> final markdown answer (also persisted in state)
   - ``status``         -> lifecycle: mcp_ready | mcp_error | budget_soft | budget_halt |
                           revising | compacting | compacted | loop_detected | loop_halt |
-                          done | error (the last two are the run's end-state, classified
-                          in citations.py; ``reason`` carries the specific code)
+                          subagent_start | subagent_done (``role`` + ``model`` of the
+                          sub-agent) | done | error (the last two are the run's end-state,
+                          classified in citations.py; ``reason`` carries the specific code,
+                          ``elapsed_s`` / ``elapsed`` the run time, also appended to ``detail``)
   - ``clarification``  -> the questions the agent needs answered before it can proceed
-  - ``usage``          -> end-of-run tool-call / token counters against their limits
+  - ``usage``          -> end-of-run tool-call / token counters against their limits,
+                          plus run time (``elapsed_s``, ``elapsed``, ``started_at``, ``finished_at``)
   - ``subagent_findings`` -> one research unit's summary, findings and gaps
 
 Assistant *reasoning* prose (the italic narration between steps) is NOT a custom
@@ -52,6 +56,8 @@ from urllib.parse import urlparse
 
 from langchain_core.tools import BaseTool, StructuredTool
 
+from .series import MAX_SCAN_BYTES, SERIES_RULE, find_series, summary_block
+
 log = logging.getLogger("deep_research_agent.events")
 
 # Bump ONLY on a breaking change to a shipped event's shape (removed/renamed key or
@@ -75,7 +81,7 @@ def engine_version() -> str:
 # against this registry and WARNS on violation; it never raises (observability must not
 # break a run). Adding an event type without registering it here is itself a warning.
 EVENT_SCHEMAS: dict[str, frozenset[str]] = {
-    "run_start": frozenset({"protocol_version", "engine_version"}),
+    "run_start": frozenset({"protocol_version", "engine_version", "started_at"}),
     "search_query": frozenset({"id", "query"}),
     "search_results": frozenset({"id", "query", "ok", "results"}),
     "source": frozenset({"title", "url", "domain"}),
@@ -88,7 +94,7 @@ EVENT_SCHEMAS: dict[str, frozenset[str]] = {
     "status": frozenset({"state"}),
     "clarification": frozenset({"questions"}),
     "usage": frozenset({"tool_calls", "input_tokens", "output_tokens",
-                        "total_tokens", "limits"}),
+                        "total_tokens", "limits", "elapsed_s"}),
     "subagent_findings": frozenset({"unit", "summary", "findings", "gaps"}),
 }
 
@@ -98,6 +104,10 @@ EVENT_SCHEMAS: dict[str, frozenset[str]] = {
 STATUS_STATES = frozenset({
     "mcp_ready", "mcp_error", "budget_soft", "budget_halt", "revising",
     "compacting", "compacted", "loop_detected", "loop_halt", "done", "error",
+    # A sub-agent run began / ended: ``role`` (research-subagent | extract-subagent) and
+    # ``model`` say WHICH agent ran on WHAT model — the only live signal that the cheap
+    # utility model is doing the reading (the end-of-run ``usage`` rollup comes too late).
+    "subagent_start", "subagent_done",
 })
 
 
@@ -279,9 +289,15 @@ def _offload_result(
     tool_name: str,
     call_id: str,
     head_rows: int = 5,
+    series: dict | None = None,
 ) -> tuple[str | None, str | None]:
     """Persist a large tool result to a file in the sandbox and return a compact stub
     the model can act on, INSTEAD of truncating and discarding rows.
+
+    ``series`` — the result's time series (``series.find_series``), when the caller already
+    detected them; computed here otherwise. A result holding a series gets the SERIES stub:
+    the file path plus a computed summary per series (span, first/last, min/max with when,
+    mean, direction) and the rule that rows are never listed — the model never sees a row.
 
     The full result lands at ``{offload_dir}/{tool}-{call_id}.json`` inside the
     container's persistent /workspace; the stub carries the path, row count, column
@@ -316,6 +332,25 @@ def _offload_result(
     except Exception as exc:  # never lose data silently / break the run on offload failure
         log.warning("offload failed (%s): %s", tool_name, exc)
         return None, None
+
+    if series is None:
+        series = find_series(result) if len(payload) <= MAX_SCAN_BYTES else {}
+    if series:
+        counts = ", ".join(f"{label or 'series'}: {len(pts)} points" for label, pts in series.items())
+        note = f"time series offloaded to {path} ({counts}, {len(payload)} bytes)"
+        stub = (
+            f"[Time series saved to a file — NOT shown inline. {SERIES_RULE}]\n"
+            f"file: {path}\n"
+            f"format: JSON exactly as the tool returned it ({len(payload)} bytes)\n"
+            f"series: {counts}\n"
+            "summary:\n" + summary_block(series) + "\n"
+            "\nNumeric work over the points (percentile or z-score of a window, correlation with "
+            "another series, sums, custom windows): `json.load(open(path))` in `execute` and "
+            "compute; the points are where the tool put them (e.g. `data.<slug>`, a list of "
+            "{datetime, value}). Report the computed numbers only — never print the points. "
+            "Do NOT re-call this tool to page the same rows."
+        )
+        return stub, note
 
     n = len(rows) if isinstance(rows, list) else None
     columns = ""
@@ -448,20 +483,32 @@ def instrument_tool(
                 or (max_result_chars and raw_bytes > max_result_chars)
             )
             capped: str | None = None
+            # A TIME SERIES leaves the context whatever its size: shown the rows, the model
+            # transcribes them into a date/value table (the live failure). Detection parses
+            # JSON, so it runs off the loop; a too-big result is offloaded regardless and
+            # `_offload_result` detects the series itself for the stub.
+            series: dict = {}
+            if not too_big and raw_bytes <= MAX_SCAN_BYTES:
+                series = await asyncio.to_thread(find_series, result)
             # Prefer OFFLOAD to a sandbox file over truncation: keeps the full data
             # available (the model reads it back with `execute`) instead of dropping rows.
-            if too_big and offload_sink is not None:
+            if (too_big or series) and offload_sink is not None:
                 # to_thread: the offload serializes megabytes and uploads them over a
                 # SYNC HTTP client. Called inline it would freeze the event loop — and
                 # with it every other tool call in flight — for the whole upload.
                 stub, note = await asyncio.to_thread(
                     _offload_result,
                     result, sink=offload_sink, offload_dir=offload_dir,
-                    tool_name=tool.name, call_id=call_id)
+                    tool_name=tool.name, call_id=call_id, series=series or None)
                 if stub is not None:
                     result, capped = stub, note
                     log.info("RESULT OFFLOADED (%s): %s [raw: %d bytes, rows=%s]",
                              tool.name, note, raw_bytes, raw_rows)
+            elif series and isinstance(result, str):
+                # No sandbox to offload to: the rows stay, but the summary leads and the
+                # rule is stated, so the model has the numbers it needs without the table.
+                result = (f"[Time series. {SERIES_RULE}]\nsummary:\n{summary_block(series)}"
+                          f"\n\n{result}")
             if capped is None:
                 # No sandbox (or offload failed) → fall back to the truncation caps.
                 result, capped = cap_result(

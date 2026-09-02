@@ -149,3 +149,43 @@ if __name__ == "__main__":
     test_resubmit_nudge_is_not_a_turn_boundary()
     test_salvage_classifies_as_done_not_error()
     print("OK — prose reports get one verbatim resubmit nudge, salvage is a recovery.")
+
+
+def test_end_status_carries_run_time_in_success_and_error() -> None:
+    """Run time reaches the consumer in EVERY end-state: on the status event as
+    ``elapsed_s`` / ``elapsed`` and inside the human ``detail`` sentence — so a frontend
+    that only shows ``detail`` (the 'finished without producing a report' message) still
+    says how long the run took."""
+    from deep_research_agent import citations as cit
+    from deep_research_agent.metering import RunMeter
+
+    meter = RunMeter()
+    meter.start()
+    meter.started_mono -= 90                        # pretend 1m 30s passed
+    events: list[dict] = []
+    orig = cit.emit
+    cit.emit = events.append
+    try:
+        mw = ResearchOutputMiddleware(max_tool_calls=80, max_total_tokens=1_000_000, meter=meter)
+        # error end: research happened, then an intent stub and no report
+        mw.after_agent(_state(*_WORK, AIMessage("Now I will compare the metrics.")), None)
+        # success end: delivered through submit_report
+        rep = "# R\n\nText[1].\n\n## Sources\n- [1] https://x.example/a\n"
+        call = {"name": "submit_report", "args": {"report_markdown": rep}, "id": "t1"}
+        mw.after_agent(_state(HumanMessage("q"), AIMessage("", tool_calls=[call]),
+                              ToolMessage("ok", tool_call_id="t1")), None)
+        # no meter wired (offline use): still a valid end status, just without a run time
+        ResearchOutputMiddleware(max_tool_calls=80, max_total_tokens=1_000_000).after_agent(
+            _state(*_WORK, AIMessage("Now I will compare the metrics.")), None)
+    finally:
+        cit.emit = orig
+
+    ends = [e for e in events if e["type"] == "status" and e["state"] in ("done", "error")]
+    assert [(e["state"], e["reason"]) for e in ends] == [
+        ("error", "ended_without_report"), ("done", "report_delivered"),
+        ("error", "ended_without_report")]
+    for e in ends[:2]:
+        assert 90 <= e["elapsed_s"] < 91 and e["elapsed"].startswith("1m 3")
+        assert e["detail"].endswith(f"Run time {e['elapsed']}.")
+    assert ends[2]["elapsed_s"] is None and ends[2]["elapsed"] == "n/a"
+    assert "Run time" not in ends[2]["detail"]

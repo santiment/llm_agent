@@ -129,3 +129,31 @@ if __name__ == "__main__":
     test_subagent_middleware_folds_its_own_compaction()
     test_usage_event_carries_fleet_cost_and_compaction()
     print("OK — sub-agent usage rollup + cost accounting verified.")
+
+
+def test_subagent_middleware_marks_start_and_done_with_role_and_model() -> None:
+    from deep_research_agent import events
+
+    captured: list[dict] = []
+    orig = events._writer
+    events._writer = lambda: captured.append
+    try:
+        m = RunMeter()
+        mw = SubagentUsageMiddleware(m, "extract-subagent", model="qwen/qwen3-30b")
+        mw.before_agent({"messages": []}, None)
+        state = {"messages": [
+            HumanMessage("read the file"),
+            AIMessage("done", usage_metadata={"input_tokens": 1000, "output_tokens": 20,
+                                              "total_tokens": 1020}),
+        ]}
+        mw.after_agent(state, None)
+    finally:
+        events._writer = orig
+
+    assert [e["state"] for e in captured] == ["subagent_start", "subagent_done"]
+    assert all(e["type"] == "status" for e in captured)
+    assert captured[0]["role"] == "extract-subagent" and captured[0]["model"] == "qwen/qwen3-30b"
+    assert captured[1]["model_calls"] == 1 and captured[1]["total_tokens"] == 1020
+    assert m.subagent_usage["extract-subagent"]["runs"] == 1
+    # Old two-arg construction still works (model optional).
+    SubagentUsageMiddleware(m, "research-subagent").before_agent({"messages": []}, None)

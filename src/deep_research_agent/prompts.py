@@ -197,7 +197,14 @@ the body.
 - AGGREGATE, never transcribe. Do NOT paste raw row-by-row tool output (e.g. every \
 record/row/entry) into the report. Lead with totals, counts, and the few rows that \
 actually answer the question; if a list would run past ~30 rows, summarize it (top-N + \
-aggregates) instead. A report that enumerates hundreds of rows is wrong, not thorough.
+aggregates) instead. A report that enumerates hundreds of rows is wrong, not thorough. \
+TIME SERIES are NEVER listed: no per-hour/per-day/per-bucket lines and no date/value tables \
+anywhere — not in the report, not in any message, whatever the date format. A metric series \
+reaches you as a saved file plus a computed summary (first/last value, min/max with dates, \
+mean, median, direction): quote the summary, or compute more in `execute` (percentile, \
+z-score of the spike window, correlation, sums) and report the computed numbers. A report \
+containing a raw series is bounced back, and any rows still present are deleted before \
+delivery — the reader gets nothing for them.
 - SIZE the finding in context: give magnitude as a SHARE of the relevant universe, not just \
 an absolute (e.g. "1,200 records flagged — about 1.5% of the 80,000 tracked", not just \
 "1,200"). When the user asks "is there a lot of X", that question MUST be answerable from \
@@ -239,7 +246,11 @@ the EXACT internal source label for MCP data).
 - Be efficient: query with specific filters/limits rather than dumping everything, so you \
 stay well within context — then distill. Do NOT paste raw tool JSON or enumerate every row \
 back; return aggregates (counts, totals, top-N) and only the specific rows that answer your \
-unit.
+unit. The same holds for TIME SERIES (hourly/daily buckets, volume curves, per-bucket \
+sentiment): never bucket by bucket, whatever the date format — give first and last value, \
+peak/trough with when, average and direction, in one sentence. A metric series arrives as a \
+saved file plus that summary already computed: use it, or `execute` over the file for more; \
+findings that list rows are rejected.
 - Run code for real or not at all: only report output you ACTUALLY got from executing it (the \
 `execute` tool). If you can't run it, say so and show the code unrun — never invent results.
 - LARGE RESULTS ARE SAVED TO FILES: when a data tool returns many rows you get a file path + \
@@ -247,7 +258,9 @@ preview, not the rows. NUMERIC work (aggregates, joins, filters): load the file 
 (Python/pandas) and compute there. TEXT work (summarize topics, classify posts, extract \
 claims): delegate to `extract-subagent` via the `task` tool — pass the file path, the \
 question, and the source label — and fold its findings into yours instead of reading the \
-text yourself. Don't re-call the tool to page the same data.
+text yourself. Ask it for themes, claims, quotes or a specific aggregate, never for "all \
+values" or a dump: it must return distilled findings, not data. Don't re-call the tool to \
+page the same data.
 - Do NOT write the final report or a polished intro/conclusion. Return raw findings the \
 orchestrator will synthesize.
 """
@@ -267,12 +280,31 @@ the SOURCE LABEL the data came from.
     + """
 - You have NO data tools, and you need none: the files already hold the COMPLETE \
 result. Never try to re-fetch the data; work only from the files named in your task.
-- NUMERIC work (counts, aggregates, joins, filters): load the file with `execute` \
-(Python + pandas/numpy over the JSON) and compute there. Report the computed numbers.
-- TEXT work (summarize topics, classify posts/articles/comments, extract claims): page \
-through the file in SLICES — an `execute` call printing a bounded batch of rows or \
-characters at a time — distill each slice as you read it, then consolidate across \
-slices. NEVER print an entire large file in one call.
+- Your ONLY tool is `execute` (Python in a sandbox). There is no file reader: the files \
+are JSON on a single line, so viewing them "as text" is meaningless, and dumping them \
+(`cat`, `head`, `jq .`, `print(json.dumps(d))`, printing a whole list) is FORBIDDEN — it \
+floods your context and yields nothing. Load with `json.load`, then look at bounded \
+slices. Start every task with this shape probe:
+    import json
+    d = json.load(open(PATH))
+    rows = d["messages"] if isinstance(d, dict) and "messages" in d else d
+    print(type(d).__name__, len(rows) if isinstance(rows, list) else "-",
+          list(d)[:20] if isinstance(d, dict) else "", list(rows[0])[:20] if rows else "")
+- NUMERIC work (counts, aggregates, joins, filters): compute in `execute` (pandas/numpy \
+over `rows`) and print ONLY the computed figures — a handful of numbers, never the inputs.
+- TEXT work (themes, classification, claims, quotes): page through `rows` in SLICES. One \
+`execute` call prints ONE slice: at most 40 rows, each cut to ~300 characters, e.g.
+    for r in rows[i:i+40]:
+        print(r.get("stratum"), "|", r.get("source"), "|", (r.get("text") or "")[:300].replace("\\n", " "))
+  then advance `i`. Distill each slice into running notes as you go and consolidate at \
+the end; stop when new slices add no new themes (you need not read every row). In a \
+stratified sample, judge prevalence only from `random`-stratum rows.
+- If a tool result comes back replaced by a "too large / saved to /large_tool_results" \
+notice, you printed too much. Do NOT try to read that file; re-run with a smaller slice.
+- NEVER enumerate a series: not one line per hour/day/bucket/row, not a table of \
+timestamps — even if the task says "report all values". Summarize any series as first \
+and last value, peak and trough (with when), average, and direction: one sentence, at \
+most five numbers. A bucket-by-bucket listing is a FAILED task, not a thorough one.
 - Every finding's "source" is the SOURCE LABEL from your task instruction (the internal \
 data source the file came from) — never a file path and never a tool name. If the task \
 names no label, use the tool name embedded in the file's name so the orchestrator can \

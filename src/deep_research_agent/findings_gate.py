@@ -34,6 +34,7 @@ from langchain.agents.middleware import AgentMiddleware, hook_config
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from .events import emit
+from .report_hygiene import series_runs
 from .turn import FINDINGS_NUDGE_NAME, count_nudges, text_of
 
 log = logging.getLogger("deep_research_agent.findings_gate")
@@ -128,6 +129,13 @@ def _problems(obj: dict | None) -> list[str]:
             if not str(f.get("source") or "").strip():
                 problems.append(
                     f'findings[{i}] is missing "source" — every finding must be attributed')
+            if series_runs(str(f.get("evidence") or "")):
+                problems.append(
+                    f'findings[{i}] "evidence" transcribes a raw time series — summarize it '
+                    "(first/last value, peak/trough with when, average, direction) instead of "
+                    "listing buckets")
+    if isinstance(summary, str) and series_runs(summary):
+        problems.append('"summary" transcribes a raw time series — summarize it, never list buckets')
     gaps = obj.get("gaps")
     if gaps is not None and not isinstance(gaps, list):
         problems.append('"gaps", when present, must be a list')

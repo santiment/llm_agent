@@ -174,3 +174,17 @@ if __name__ == "__main__":
     test_findings_nudge_is_not_a_turn_boundary()
     test_accepted_findings_emit_structured_event()
     print("OK — structured-findings gate verified.")
+
+
+def test_findings_evidence_with_raw_series_is_bounced() -> None:
+    import json
+
+    rows = "\n".join(f"2026-09-01T{h:02d}:00:00Z: bearish=0.05, bullish=0.38, neutral=0.57"
+                     for h in range(9, 16))
+    obj = {"summary": "Mood stayed bullish.",
+           "findings": [{"finding": "Bullish share held near 38%.", "evidence": rows,
+                         "source": "Santiment social messages"}]}
+    probs = findings_problems(json.dumps(obj))
+    assert any("raw time series" in p for p in probs)
+    obj["findings"][0]["evidence"] = "bullish share 0.36–0.41 across 7 hours, flat, peak 11:00"
+    assert findings_problems(json.dumps(obj)) == []

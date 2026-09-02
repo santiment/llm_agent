@@ -7,7 +7,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from deep_research_agent.report_hygiene import lint_citations, report_problems, scrub_report
+from deep_research_agent.report_hygiene import (collapse_series, lint_citations, report_problems, scrub_report,
+                                                series_row_count, series_runs)
 
 
 def test_scrub_strips_tool_name_parenthetical_on_sources_line():
@@ -153,3 +154,106 @@ def test_scrub_debolds_source_bullets():
     assert "**" not in out
     # Bold elsewhere in prose is untouched.
     assert "**key**" in scrub_report("This is a **key** point.")
+
+
+# ---- raw time series: detect (gate) and collapse (last-mile) ------------------------------
+
+
+_HOURLY = "\n".join(
+    f"- 2026-09-01T{h:02d}:00:00.000Z: bearish=0.0{h}44, bullish=0.3833, neutral=0.5622"
+    for h in range(9, 18))  # 9 hourly buckets — the shape rejected live
+
+_SERIES_REPORT = f"""# Bitcoin crowd mood
+
+Sentiment stayed net-bullish through the day[1].
+
+Hourly sentiment buckets:
+{_HOURLY}
+
+## Sources
+- [1] Santiment social messages
+"""
+
+
+def test_series_runs_finds_hourly_bucket_list():
+    runs = series_runs(_SERIES_REPORT)
+    assert len(runs) == 1
+    start, end, first, last = runs[0]
+    assert end - start == 9
+    assert first == "2026-09-01T09:00:00.000Z" and last == "2026-09-01T17:00:00.000Z"
+
+
+def test_series_runs_finds_timestamp_table():
+    rows = "\n".join(f"| 2026-09-0{d} | {d * 100} | 0.{d}1 |" for d in range(1, 8))
+    md = f"| date | volume | balance |\n|---|---|---|\n{rows}\n"
+    assert len(series_runs(md)) == 1
+
+
+def test_series_runs_ignores_short_dated_lists_and_prose():
+    md = (
+        "On 2026-08-01 the price hit $60,000 and 2026-08-02 saw a pullback.\n"
+        "- 2026-08-01: launch raised $5M in Series A funding\n"
+        "- 2026-08-03: partnership announced with 3 exchanges\n"
+        "- 2026-08-05: mainnet v2 shipped, 40% faster blocks\n"
+        "- 2026-08-07: 12 new listings\n"
+    )
+    assert series_runs(md) == []  # 4 dated bullets, one number each with prose — a timeline
+
+
+def test_report_problems_flags_raw_series():
+    probs = " | ".join(report_problems(_SERIES_REPORT))
+    assert "raw time series" in probs
+    assert "9 consecutive timestamped rows" in probs
+    assert "2026-09-01T09:00:00.000Z" in probs
+
+
+def test_collapse_series_replaces_run_with_one_line_and_is_idempotent():
+    out = collapse_series(_SERIES_REPORT)
+    assert "bearish=0.0944" not in out
+    assert "Raw series of 9 timestamped rows" in out
+    assert "Sentiment stayed net-bullish through the day[1]." in out  # prose intact
+    assert "- [1] Santiment social messages" in out
+    assert collapse_series(out) == out
+    assert report_problems(out) == []
+
+
+def test_collapse_series_noop_on_clean_report():
+    md = "# R\n\nThe metric rose to 12%[1].\n\n## Sources\n- [1] Data Provider\n"
+    assert collapse_series(md) == md
+    assert collapse_series("") == ""
+
+
+# ---- the live leak shape: whitespace-separated date/value rows, other date formats ----------
+
+_DOMINANCE = "Date    Value (%)\n" + "\n".join(
+    f"2026-06-{d:02d}    {v}" for d, v in
+    [(4, 19.189), (5, 15.980), (6, 14.982), (7, 14.532), (8, 12.040), (9, 11.487), (10, 11.772)])
+
+
+def test_series_runs_catch_space_separated_rows_and_other_date_formats():
+    assert len(series_runs(_DOMINANCE)) == 1
+    assert len(series_runs(_DOMINANCE.replace("    ", "\t"))) == 1
+    month = "\n".join(f"| Jun {d}, 2026 | {d * 1.5}% |" for d in range(1, 8))
+    assert series_runs(month)[0][2:] == ("Jun 1, 2026", "Jun 7, 2026")
+    euro = "\n".join(f"{d:02d}.06.2026  {d * 100}  {d}" for d in range(1, 8))
+    assert len(series_runs(euro)) == 1
+    dmy = "\n".join(f"- 1{d} Jun 2026: 0.{d}1" for d in range(0, 6))
+    assert len(series_runs(dmy)) == 1
+
+
+def test_series_runs_survive_blank_lines_between_rows():
+    spaced = "\n\n".join(_DOMINANCE.splitlines()[1:])            # one blank line between rows
+    runs = series_runs(spaced)
+    assert len(runs) == 1
+    start, end, first, last = runs[0]
+    assert (first, last) == ("2026-06-04", "2026-06-10")
+    assert series_row_count(spaced, start, end) == 7               # blanks not counted as rows
+    assert "7 consecutive timestamped rows" in " ".join(report_problems(spaced))
+
+
+def test_collapse_note_keeps_the_statistics_the_rows_carried():
+    out = collapse_series(_DOMINANCE)
+    assert "19.189" not in out and "2026-06-07" not in out
+    assert "Raw series of 7 timestamped rows, 2026-06-04 to 2026-06-10" in out
+    assert "first 19.19, last 11.77, min 11.49 at 2026-06-09, max 19.19 at 2026-06-04, mean 14.28" in out
+    assert collapse_series(out) == out and series_runs(out) == []

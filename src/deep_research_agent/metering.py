@@ -26,7 +26,9 @@ Scope (honest):
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
@@ -37,6 +39,22 @@ from .events import PROTOCOL_VERSION, emit, engine_version
 from .turn import current_turn, message_tokens, tool_calls_in
 
 log = logging.getLogger("deep_research_agent.usage")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def fmt_elapsed(seconds: float | None) -> str:
+    """Human run time: ``12.3s`` / ``4m 12s`` / ``1h 04m 12s``; ``n/a`` if the clock never ran."""
+    if seconds is None:
+        return "n/a"
+    s = max(0.0, float(seconds))
+    if s < 60:
+        return f"{s:.1f}s"
+    m, sec = divmod(int(round(s)), 60)
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m {sec:02d}s" if h else f"{m}m {sec:02d}s"
 
 
 def sum_usage(messages: list) -> dict[str, Any]:
@@ -77,6 +95,20 @@ class RunMeter:
     # Per-role sub-agent model usage (research-subagent / extract-subagent), accumulated
     # across every `task` invocation of the run by SubagentUsageMiddleware.
     subagent_usage: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Run clock, started by UsageMeterMiddleware.before_agent (the first hook of a run):
+    # monotonic for the duration, wall-clock ISO for the consumer's own arithmetic.
+    started_mono: float | None = None
+    started_at: str = ""
+
+    def start(self) -> None:
+        self.started_mono = time.monotonic()
+        self.started_at = utc_now()
+
+    def elapsed_s(self) -> float | None:
+        """Seconds since ``start`` (one decimal), or None when the clock never started."""
+        if self.started_mono is None:
+            return None
+        return round(time.monotonic() - self.started_mono, 1)
 
     def record_tool_result(self, *, ok: bool, result_bytes: int = 0,
                            result_rows: int | None = None, capped: bool = False) -> None:
@@ -103,12 +135,24 @@ class SubagentUsageMiddleware(AgentMiddleware):
     """Attached to a SUB-AGENT spec (never the orchestrator): ``after_agent`` fires once
     per ``task`` invocation with that sub-agent's own isolated message state, so summing
     it here is what makes the fleet's model usage visible at all — the orchestrator's
-    state only ever contains the returned findings text."""
+    state only ever contains the returned findings text.
 
-    def __init__(self, meter: RunMeter, role: str) -> None:
+    It also marks the sub-agent's START and END (``status`` events ``subagent_start`` /
+    ``subagent_done`` + a log line each, carrying role and model). Without these, nothing
+    in the stream or the log says a cheaper model ran at all until the run's final
+    ``usage`` rollup — which never arrives if the run is cancelled mid-way."""
+
+    def __init__(self, meter: RunMeter, role: str, model: str = "") -> None:
         super().__init__()
         self.meter = meter
         self.role = role
+        self.model = model or ""
+
+    def before_agent(self, state: dict, runtime) -> dict[str, Any] | None:
+        log.info("SUBAGENT START role=%s model=%s", self.role, self.model or "?")
+        emit({"type": "status", "state": "subagent_start", "role": self.role,
+              "model": self.model})
+        return None
 
     def after_agent(self, state: dict, runtime) -> dict[str, Any] | None:
         usage = sum_usage(state.get("messages") or [])
@@ -117,12 +161,20 @@ class SubagentUsageMiddleware(AgentMiddleware):
         _calls, compacted_tokens = compacted_counts(state)
         usage["total_tokens"] += compacted_tokens
         self.meter.record_subagent_usage(self.role, usage)
+        log.info("SUBAGENT DONE role=%s model=%s model_calls=%d tokens=%d cost_usd=%.6f",
+                 self.role, self.model or "?", usage["model_calls"], usage["total_tokens"],
+                 usage["cost_usd"])
+        emit({"type": "status", "state": "subagent_done", "role": self.role,
+              "model": self.model, "model_calls": usage["model_calls"],
+              "total_tokens": usage["total_tokens"]})
         return None
 
 
 class UsageMeterMiddleware(AgentMiddleware):
-    """Emit the ``run_start`` version handshake at the start and a per-run ``usage``
-    event + ``RESEARCH USAGE`` log at the end of every run."""
+    """Start the run clock and emit the ``run_start`` version handshake at the start; emit
+    the per-run ``usage`` event + ``RESEARCH USAGE`` log — both carrying the run time — at
+    the end of every run. ``ResearchOutputMiddleware`` reads the same clock for its end
+    ``status``, so the run time reaches the consumer in the success AND the no-report case."""
 
     def __init__(self, meter: RunMeter, *, max_tool_calls: int,
                  max_total_tokens: int, recursion_limit: int) -> None:
@@ -136,8 +188,9 @@ class UsageMeterMiddleware(AgentMiddleware):
         # Version handshake, first event of every run: a consumer pins the
         # protocol_version it renders and can flag a mismatch up-front instead of
         # breaking on an unfamiliar shape mid-run.
+        self.meter.start()
         emit({"type": "run_start", "protocol_version": PROTOCOL_VERSION,
-              "engine_version": engine_version()})
+              "engine_version": engine_version(), "started_at": self.meter.started_at})
         return None
 
     def after_agent(self, state: dict, runtime) -> dict[str, Any] | None:
@@ -149,6 +202,7 @@ class UsageMeterMiddleware(AgentMiddleware):
         orch_total = (orch["total_tokens"] or (orch["input_tokens"] + orch["output_tokens"])) \
             + compacted_tokens
 
+        elapsed = self.meter.elapsed_s()
         sub_total_tokens = sum(u["total_tokens"] for u in self.meter.subagent_usage.values())
         cost = orch["cost_usd"] + sum(u["cost_usd"] for u in self.meter.subagent_usage.values())
 
@@ -174,6 +228,12 @@ class UsageMeterMiddleware(AgentMiddleware):
             "total_tokens_all_agents": orch_total + sub_total_tokens,
             # BEST-EFFORT actual cost (OpenRouter, non-streamed calls only — see module doc).
             "cost_usd": round(cost, 6),
+            # Wall-clock run time — the first thing asked when a run ends without a report.
+            # Always present; None only if before_agent never ran (offline tests).
+            "elapsed_s": elapsed,
+            "elapsed": fmt_elapsed(elapsed),
+            "started_at": self.meter.started_at,
+            "finished_at": utc_now(),
             # configured ceilings, for at-a-glance "how close did we get?"
             "limits": {
                 "max_tool_calls": self.max_tool_calls,
@@ -181,6 +241,6 @@ class UsageMeterMiddleware(AgentMiddleware):
                 "recursion_limit": self.recursion_limit,
             },
         }
-        log.info("RESEARCH USAGE: %s", usage)
+        log.info("RESEARCH USAGE (run time %s): %s", fmt_elapsed(elapsed), usage)
         emit({"type": "usage", **usage})
         return None

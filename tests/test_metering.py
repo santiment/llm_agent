@@ -10,7 +10,7 @@ from __future__ import annotations
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from deep_research_agent import metering
-from deep_research_agent.metering import RunMeter, UsageMeterMiddleware
+from deep_research_agent.metering import RunMeter, UsageMeterMiddleware, fmt_elapsed
 
 
 def test_meter_accumulates() -> None:
@@ -50,9 +50,36 @@ def test_usage_event_has_all_categories() -> None:
     assert captured["total_tokens"] == 200 and captured["model_calls"] == 2
     assert captured["tool_calls_in_context"] == 1
     assert captured["limits"]["recursion_limit"] == 4500
+    # before_agent never ran here → no clock, but the keys are still there (schema).
+    assert captured["elapsed_s"] is None and captured["elapsed"] == "n/a"
+
+
+def test_run_time_is_on_run_start_and_usage() -> None:
+    assert fmt_elapsed(None) == "n/a" and fmt_elapsed(0) == "0.0s" and fmt_elapsed(12.34) == "12.3s"
+    assert fmt_elapsed(65) == "1m 05s" and fmt_elapsed(252) == "4m 12s"
+    assert fmt_elapsed(3852) == "1h 04m 12s"
+    events: list[dict] = []
+    orig = metering.emit
+    metering.emit = events.append
+    try:
+        m = RunMeter()
+        mw = UsageMeterMiddleware(m, max_tool_calls=1, max_total_tokens=1, recursion_limit=1)
+        assert m.elapsed_s() is None
+        mw.before_agent({}, None)
+        m.started_mono -= 252                      # pretend the run took 4m 12s
+        mw.after_agent({"messages": []}, None)
+    finally:
+        metering.emit = orig
+    start, usage = events
+    assert start["type"] == "run_start"
+    assert "T" in start["started_at"] and start["started_at"].endswith("Z")
+    assert usage["type"] == "usage" and 252 <= usage["elapsed_s"] < 253
+    assert usage["elapsed"] in ("4m 12s", "4m 13s")
+    assert usage["started_at"] == start["started_at"] and usage["finished_at"] >= start["started_at"]
 
 
 if __name__ == "__main__":
     test_meter_accumulates()
     test_usage_event_has_all_categories()
+    test_run_time_is_on_run_start_and_usage()
     print("OK — usage ledger verified.")

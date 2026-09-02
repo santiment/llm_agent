@@ -135,3 +135,52 @@ def test_extract_prompt_renders_domain_block() -> None:
     assert "DOMAIN CONTEXT" in prompt
     assert "Focus on crypto assets." in prompt
     assert "DOMAIN CONTEXT" not in extract_prompt("")
+
+
+# ---- execute-only extractor: every other built-in is hidden from the utility model ------
+
+from deep_research_agent.tool_filter import (EXTRACT_EXCLUDED_TOOLS,  # noqa: E402
+                                             ExcludeToolsMiddleware, filter_tools)
+
+
+def test_extract_subagent_hides_everything_but_execute(monkeypatch) -> None:
+    monkeypatch.delenv("LLM_SANDBOX_URL", raising=False)
+    config = _base_config()
+    config["configurable"]["sandbox_url"] = "http://sandbox.invalid:8080"
+    captured = _make_graph(monkeypatch, config)
+
+    extract = next(s for s in captured["subagents"] if s["name"] == "extract-subagent")
+    filters = [m for m in extract["middleware"] if isinstance(m, ExcludeToolsMiddleware)]
+    assert len(filters) == 1
+    assert {"read_file", "ls", "glob", "grep", "write_file", "edit_file"} <= filters[0].excluded
+    assert "execute" not in filters[0].excluded
+    # The filter must come AFTER anything that injects tools (deepagents appends spec
+    # middleware after its default filesystem stack, so last-in-spec is late enough).
+    assert isinstance(extract["middleware"][-1], ExcludeToolsMiddleware)
+
+    research = next(s for s in captured["subagents"] if s["name"] == "research-subagent")
+    task_mw = next(m for m in research["middleware"] if isinstance(m, SubAgentMiddleware))
+    nested_mw = task_mw._subagents[0]["middleware"]
+    fs_idx = next(i for i, m in enumerate(nested_mw) if isinstance(m, FilesystemMiddleware))
+    filt_idx = next(i for i, m in enumerate(nested_mw) if isinstance(m, ExcludeToolsMiddleware))
+    assert fs_idx < filt_idx
+    # The research-subagent itself keeps its full toolbox.
+    assert not any(isinstance(m, ExcludeToolsMiddleware) for m in research["middleware"])
+
+
+def test_filter_tools_drops_by_name_for_objects_and_dicts() -> None:
+    class _T:
+        def __init__(self, name):
+            self.name = name
+
+    tools = [_T("read_file"), _T("execute"), {"name": "grep"}, {"name": "my_tool"}, _T("ls")]
+    kept = filter_tools(tools, EXTRACT_EXCLUDED_TOOLS)
+    assert [getattr(t, "name", None) or t["name"] for t in kept] == ["execute", "my_tool"]
+
+
+def test_extract_prompt_forbids_dumps_and_series() -> None:
+    prompt = extract_prompt()
+    assert "ONLY tool is `execute`" in prompt
+    assert "jq ." in prompt and "FORBIDDEN" in prompt
+    assert "NEVER enumerate a series" in prompt
+    assert "/large_tool_results" in prompt

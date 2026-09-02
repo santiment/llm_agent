@@ -84,6 +84,7 @@ def test_status_states_pinned():
     assert STATUS_STATES == {
         "mcp_ready", "mcp_error", "budget_soft", "budget_halt", "revising",
         "compacting", "compacted", "loop_detected", "loop_halt", "done", "error",
+        "subagent_start", "subagent_done",
     }
 
 
@@ -125,6 +126,7 @@ def test_run_start_handshake():
     assert ev["type"] == "run_start"
     assert ev["protocol_version"] == PROTOCOL_VERSION
     assert isinstance(ev["engine_version"], str) and ev["engine_version"]
+    assert ev["started_at"].endswith("Z")        # UTC anchor for run time if the run dies early
 
 
 def test_engine_version_never_raises():

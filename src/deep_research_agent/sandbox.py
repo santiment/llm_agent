@@ -49,7 +49,8 @@ class HttpSandboxBackend(BaseSandbox):
     """SandboxBackendProtocol backed by the llm-sandbox HTTP API (provider-agnostic)."""
 
     def __init__(self, base_url: str, token: str = "", *, network: bool = False,
-                 session_timeout: int = 900, http_timeout: float = 120.0) -> None:
+                 session_timeout: int = 900, http_timeout: float = 120.0,
+                 seed_files: list[tuple[str, bytes]] | None = None) -> None:
         self._base = base_url.rstrip("/")
         self._headers = {"Content-Type": "application/json"}
         if token:
@@ -57,6 +58,11 @@ class HttpSandboxBackend(BaseSandbox):
         self._network = network
         self._session_timeout = int(session_timeout)
         self._http_timeout = http_timeout
+        # ``(container_path, bytes)`` PUT into every new session right after it is created and
+        # before any execute/file op can run — skill helper modules such as
+        # /workspace/recipes.py (see agent.skill_seed_files), so the model imports tested code
+        # instead of retyping it out of a skill's markdown.
+        self._seed_files = list(seed_files or [])
         # `id` must not create a session (deepagents may read it eagerly), so it's a stable
         # instance id; the actual sandbox session is created lazily on first execute/file op.
         import uuid
@@ -87,7 +93,25 @@ class HttpSandboxBackend(BaseSandbox):
                         "network": self._network, "timeout_seconds": self._session_timeout})
                     self._session_id = data["session_id"]
                     log.info("sandbox session %s opened (%s)", self._session_id, self._base)
+                    self._seed(self._session_id)
         return self._session_id
+
+    def _seed(self, sid: str) -> None:
+        """Upload the seed files into a just-created session. Runs under the session lock, so
+        no execute/file op can race ahead of them. Failures are logged, never raised — a missing
+        helper degrades a skill (its fallback is to write the file itself); it must not kill
+        the run. Direct PUTs, not ``upload_files``: that would re-enter the non-reentrant lock."""
+        if not self._seed_files:
+            return
+        for path, content in self._seed_files:
+            try:
+                self._http("PUT", f"/sessions/{sid}/files",
+                           {"path": path, "content": base64.b64encode(content).decode("ascii"),
+                            "encoding": "base64"})
+            except Exception as exc:
+                log.warning("sandbox seed %s failed: %s", path, exc)
+        log.info("sandbox session %s seeded with %d file(s): %s", sid, len(self._seed_files),
+                 ", ".join(p for p, _ in self._seed_files))
 
     @property
     def id(self) -> str:

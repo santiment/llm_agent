@@ -59,6 +59,36 @@ def build_skills(cfg: ResearchConfig) -> tuple[list[str] | None, object | None]:
     return [SKILLS_MOUNT], FilesystemBackend(root_dir=skills_dir, virtual_mode=True)
 
 
+SANDBOX_SEED_DIR = "/workspace"
+
+
+def skill_seed_files(skills_dir: str) -> list[tuple[str, bytes]]:
+    """Python helpers shipped with skills (``skills/<skill>/*.py``) as ``(container_path,
+    bytes)`` pairs, seeded into every sandbox session at ``/workspace/<file>`` (the ``execute``
+    cwd) — so a skill's recipes are imported (``import recipes as R``) instead of retyped by the
+    model out of its markdown. Underscore-prefixed files stay private. Basenames must be unique
+    across skills: a later skill's clash is skipped with a warning, never silently overwritten."""
+    out: list[tuple[str, bytes]] = []
+    owner: dict[str, str] = {}
+    if not skills_dir or not os.path.isdir(skills_dir):
+        return out
+    for skill in sorted(os.listdir(skills_dir)):
+        sdir = os.path.join(skills_dir, skill)
+        if not os.path.isdir(sdir):
+            continue
+        for fn in sorted(os.listdir(sdir)):
+            if not fn.endswith(".py") or fn.startswith("_"):
+                continue
+            if fn in owner:
+                log.warning("sandbox seed %s from skill %s clashes with skill %s — skipped",
+                            fn, skill, owner[fn])
+                continue
+            owner[fn] = skill
+            with open(os.path.join(sdir, fn), "rb") as f:
+                out.append((f"{SANDBOX_SEED_DIR}/{fn}", f.read()))
+    return out
+
+
 async def make_graph(config: dict | None = None):
     cfg = ResearchConfig.from_runnable_config(config)
 
@@ -100,11 +130,14 @@ async def make_graph(config: dict | None = None):
     backend = None
     if cfg.sandbox_url:
         from .sandbox import HttpSandboxBackend, SandboxCompositeBackend
+        seeds = skill_seed_files(cfg.skills_dir)
         sandbox = HttpSandboxBackend(
             cfg.sandbox_url, cfg.sandbox_token,
-            network=cfg.sandbox_network, session_timeout=cfg.sandbox_session_timeout)
+            network=cfg.sandbox_network, session_timeout=cfg.sandbox_session_timeout,
+            seed_files=seeds)
         backend = SandboxCompositeBackend(default=sandbox, routes=routes)
-        log.info("Code sandbox enabled at %s (execute tool ON)", cfg.sandbox_url)
+        log.info("Code sandbox enabled at %s (execute tool ON; %d skill helper(s) seeded per "
+                 "session: %s)", cfg.sandbox_url, len(seeds), ", ".join(p for p, _ in seeds) or "-")
     elif routes:
         backend = CompositeBackend(default=StateBackend(), routes=routes)
 
@@ -176,7 +209,8 @@ async def make_graph(config: dict | None = None):
         # SubagentUsageMiddleware is what makes the fleet's model usage visible in the
         # run's `usage` event — the orchestrator's state never sees these tokens.
         "middleware": [SubagentFindingsMiddleware(),
-                       SubagentUsageMiddleware(meter, "research-subagent"),
+                       SubagentUsageMiddleware(meter, "research-subagent",
+                                               model=cfg.subagent_model),
                        *shared_middleware],
     }
     if skills:  # give the sub-agent the same routing skill it needs to execute
@@ -185,11 +219,15 @@ async def make_graph(config: dict | None = None):
 
     # Utility-model consumer: reads offloaded /workspace result files on the cheapest
     # model. Registered only when offloading is live. `tools: []` — no data tools to
-    # re-fetch with; deepagents still mounts the filesystem + `execute` built-ins.
+    # re-fetch with; deepagents still mounts the filesystem + `execute` built-ins, and
+    # ExcludeToolsMiddleware then hides every built-in except `execute`: the extractor
+    # works ONLY through bounded Python slices (see tool_filter.py for why).
     if offload_sink is not None:
         from deepagents.middleware.filesystem import FilesystemMiddleware
         from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
         from deepagents.middleware.subagents import SubAgentMiddleware
+
+        from .tool_filter import EXTRACT_EXCLUDED_TOOLS, ExcludeToolsMiddleware
 
         extract_spec = {
             "name": "extract-subagent",
@@ -205,8 +243,10 @@ async def make_graph(config: dict | None = None):
             "tools": [],
             "model": utility_model,
             "middleware": [SubagentFindingsMiddleware(),
-                           SubagentUsageMiddleware(meter, "extract-subagent"),
-                           *shared_middleware],
+                           SubagentUsageMiddleware(meter, "extract-subagent",
+                                                   model=cfg.utility_model),
+                           *shared_middleware,
+                           ExcludeToolsMiddleware(EXTRACT_EXCLUDED_TOOLS)],
         }
         subagents.append(extract_spec)
 
@@ -219,7 +259,13 @@ async def make_graph(config: dict | None = None):
         nested_extract_spec = {
             **extract_spec,
             "middleware": [
-                FilesystemMiddleware(backend=backend),
+                # Custom prompt: the default one advertises read_file/grep paging, which
+                # the tool filter below takes away — don't teach a workflow it can't run.
+                FilesystemMiddleware(
+                    backend=backend,
+                    system_prompt=("Files live under /workspace. You operate on them ONLY "
+                                   "through the `execute` tool (Python), in bounded slices."),
+                ),
                 PatchToolCallsMiddleware(),
                 *extract_spec["middleware"],
             ],
@@ -253,6 +299,7 @@ async def make_graph(config: dict | None = None):
             max_tool_calls=cfg.max_tool_calls,
             max_total_tokens=cfg.max_total_tokens,
             tool_names=data_tool_names,
+            meter=meter,   # run clock → run time on the end status (done and error)
         ),
         SkillUsageMiddleware(),
         # Block request_clarification once research has started (TRIAGE-only), then the
