@@ -64,9 +64,7 @@ class ResearchOutputMiddleware(AgentMiddleware):
     def __init__(self, *, max_tool_calls: int, max_total_tokens: int, tool_names=(),
                  meter=None) -> None:
         super().__init__()
-        # The run's RunMeter (started by UsageMeterMiddleware.before_agent): its clock puts
-        # the run time on the end status — done or error alike. Optional for offline use.
-        self.meter = meter
+        self.meter = meter  # RunMeter; its clock puts the run time on the end status
         # Ceilings are needed to distinguish "ran out of budget" from "just gave up" when
         # classifying WHY a run ended without a report.
         self.max_tool_calls = max_tool_calls
@@ -117,9 +115,7 @@ class ResearchOutputMiddleware(AgentMiddleware):
         # persisted final_report (and the salvage emit below) match what submit_report already
         # scrubbed on its live emit. Idempotent, so double-scrubbing the submit path is safe.
         report = scrub_report(report, self.tool_names)
-        # A raw time series the quality gate could not get rewritten (revisions exhausted)
-        # is dropped rather than shipped: the reader asked for a report, not a data dump.
-        report = collapse_series(report)
+        report = collapse_series(report)  # drop raw series the gate could not get rewritten
 
         # submit_report already emitted the live `report` event; only emit on fallback.
         if report and not via_tool:
@@ -131,9 +127,7 @@ class ResearchOutputMiddleware(AgentMiddleware):
         # an error and is logged + emitted as one. NOTE: this only runs on a clean end — its
         # ABSENCE in the logs means the run died via an exception (e.g. GraphRecursionError)
         # before after_agent, which the host streams as a stream error.
-        # turn_spend includes what compaction summarized out of the transcript — the
-        # classifier must still recognize a budget-exhausted end after compaction.
-        calls, tokens = turn_spend(state)
+        calls, tokens = turn_spend(state)  # includes compacted-away spend
         nudges = count_nudges(messages, NUDGE_NAME)
         last_ai = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
         end_state, reason, detail = self._classify(
@@ -141,15 +135,14 @@ class ResearchOutputMiddleware(AgentMiddleware):
             clarified=called(messages, "request_clarification"),
             calls=calls, tokens=tokens, nudges=nudges)
 
-        # Run time goes on the end status in every end-state and INTO the human detail
-        # sentence, so a consumer that only shows `detail` still shows how long it took.
         elapsed = self.meter.elapsed_s() if self.meter is not None else None
         if elapsed is not None:
             detail = f"{detail} Run time {fmt_elapsed(elapsed)}."
 
         cite = lint_citations(report)
         summary = {
-            "reason": reason, "detail": detail, "elapsed_s": elapsed, "submit_report": via_tool, "salvaged": salvaged,
+            "reason": reason, "detail": detail, "elapsed_s": elapsed, "submit_report": via_tool,
+            "salvaged": salvaged,
             "tool_results": calls, "tokens": tokens, "nudges": nudges,
             "report_chars": len(report or ""), "sources": len(sources),
             "last_ai_had_tool_calls": bool(getattr(last_ai, "tool_calls", None)),

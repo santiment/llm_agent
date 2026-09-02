@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from deep_research_agent import events
 from deep_research_agent.events import instrument_tool
 from deep_research_agent.tools.report import build_submit_report_tool
-from tests.test_series import santiment
+from test_series import santiment
 
 
 class _EmptyArgs(BaseModel):

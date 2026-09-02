@@ -1,27 +1,10 @@
-"""Repeated-identical-call guard — crush's loop detector, middleware-shaped.
+"""Repeated-identical-call guard (after crush's loop detector).
 
-A weak model can wedge into re-issuing the SAME tool call (same tool, same args)
-and getting the same result back — burning budget without gaining information.
-The per-args permanent-failure memo in ``events.py`` already short-circuits
-repeated FAILED calls; this guard catches the successful-but-useless loop (e.g.
-re-fetching the identical page or metric forever).
-
-Detection (adapted from crush's ``loop_detection.go``): fingerprint every
-COMPLETED call this turn as ``sha256((tool, args, result-prefix))``, then count
-how often the MOST RECENT call's fingerprint recurs in the last ``WINDOW``
-calls. Keying on the most recent call means the guard goes quiet the moment the
-model changes behavior — old repeats sliding out of the window never re-trigger.
-
-Two stages, the codebase's usual pattern:
-  - ``SOFT_REPEATS`` identical → inject a break-the-loop nudge (capped at
-    ``MAX_LOOP_NUDGES`` per turn so the nudge itself can't loop);
-  - ``HARD_REPEATS`` identical → jump to ``end``. On the orchestrator,
-    ``ResearchOutputMiddleware`` then salvages what was gathered; on a sub-agent
-    the findings-so-far return to the orchestrator, which is still strictly
-    better than burning the remaining budget on the same call.
-
-Stateless and turn-scoped (everything is derived from the messages), so ONE
-instance is safely shared by the orchestrator and every sub-agent.
+Fingerprints every completed tool call this turn as sha256((tool, args, result prefix))
+and counts how often the MOST RECENT call recurs in the last ``WINDOW`` calls, so the
+guard goes quiet as soon as the model changes behavior. ``SOFT_REPEATS`` → nudge (at most
+``MAX_LOOP_NUDGES`` per turn); ``HARD_REPEATS`` → jump to ``end``. Stateless; one instance
+is shared by the orchestrator and every sub-agent.
 """
 
 from __future__ import annotations
@@ -40,11 +23,11 @@ from .turn import (LOOP_NUDGE_NAME, count_nudges, current_turn, raw_text, tc_arg
 
 log = logging.getLogger("deep_research_agent.loop_guard")
 
-WINDOW = 10          # look-back over the last N completed calls
-SOFT_REPEATS = 3     # identical calls within the window → nudge
-HARD_REPEATS = 6     # identical calls within the window → end the run
+WINDOW = 10
+SOFT_REPEATS = 3
+HARD_REPEATS = 6
 MAX_LOOP_NUDGES = 2
-_RESULT_PREFIX = 1_000  # of the result, enough to distinguish without hashing megabytes
+_RESULT_PREFIX = 1_000
 
 _NUDGE = (
     "You are repeating the IDENTICAL tool call (same tool, same arguments) and receiving "
@@ -56,13 +39,9 @@ _NUDGE = (
 
 
 def _fingerprints(messages: list) -> list[str]:
-    """One sha256 per COMPLETED tool call, in completion order: (name, args, result
-    prefix). Args come from the requesting AIMessage via tool_call_id; a ToolMessage
-    whose request isn't found still fingerprints on (name, result)."""
+    """One sha256 per completed tool call, in order: (name, args, result prefix)."""
     args_by_id: dict[str, tuple[str, dict]] = {}
     prints: list[str] = []
-    # Single pass: a ToolMessage always follows its requesting AIMessage in the
-    # transcript, so its args are registered by the time we reach it.
     for m in messages:
         if isinstance(m, AIMessage):
             for tc in getattr(m, "tool_calls", None) or []:
@@ -85,7 +64,6 @@ class LoopGuardMiddleware(AgentMiddleware):
         window = _fingerprints(turn)[-WINDOW:]
         if not window:
             return None
-        # Repeats of the LATEST call only — a loop that is still going on right now.
         repeats = window.count(window[-1])
         if repeats < SOFT_REPEATS:
             return None
@@ -97,7 +75,7 @@ class LoopGuardMiddleware(AgentMiddleware):
             return {"jump_to": "end"}
 
         if count_nudges(turn, LOOP_NUDGE_NAME) >= MAX_LOOP_NUDGES:
-            return None  # already told it twice; let the hard stop end the loop
+            return None
         log.warning("LOOP GUARD: last call repeated %d× in the last %d calls — nudging",
                     repeats, len(window))
         emit({"type": "status", "state": "loop_detected", "repeats": repeats})

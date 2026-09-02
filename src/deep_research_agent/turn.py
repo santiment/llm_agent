@@ -30,10 +30,8 @@ BUDGET_NUDGE_NAME = "dra_budget_nudge"
 FINDINGS_NUDGE_NAME = "dra_findings_format_nudge"
 RESUBMIT_NUDGE_NAME = "dra_resubmit_nudge"
 LOOP_NUDGE_NAME = "dra_loop_nudge"
-# The HumanMessage carrying the compaction summary (compaction.py) — placed BEFORE the
-# turn's anchor precisely so current_turn() skips it.
 COMPACTION_SUMMARY_NAME = "dra_compaction_summary"
-# Every synthetic HumanMessage name — none of these may be read as a turn boundary.
+# Synthetic HumanMessages — never a turn boundary.
 _SYNTHETIC_HUMAN_NAMES = {
     NUDGE_NAME, BUDGET_NUDGE_NAME, FINDINGS_NUDGE_NAME, RESUBMIT_NUDGE_NAME,
     LOOP_NUDGE_NAME, COMPACTION_SUMMARY_NAME,
@@ -44,10 +42,7 @@ _TERMINAL_TOOLS = {"submit_report", "request_clarification"}
 
 
 def turn_anchor_index(messages: list) -> int:
-    """Index of the current turn's anchor — the last REAL (non-synthetic) HumanMessage —
-    or -1 when there is none. The one definition of "where does the current turn start";
-    ``current_turn`` and the compaction partitioner both build on it so they can never
-    disagree about the boundary."""
+    """Index of the current turn's anchor (the last real HumanMessage), or -1."""
     for i in range(len(messages) - 1, -1, -1):
         m = messages[i]
         if isinstance(m, HumanMessage) and getattr(m, "name", None) not in _SYNTHETIC_HUMAN_NAMES:
@@ -144,24 +139,18 @@ def did_research_work(messages: list) -> bool:
     return any(n not in _TERMINAL_TOOLS for n in tool_names_in(messages))
 
 
-# Fallback estimate ratio when usage_metadata is absent. Shared by the budget ceiling
-# (tokens_in), the usage report (metering.sum_usage) and the compaction trigger
-# (compaction._context_estimate) — one ratio, so those numbers can't desynchronize.
-CHARS_PER_TOKEN = 4
+CHARS_PER_TOKEN = 4  # fallback ratio when usage_metadata is absent
 
 
 def raw_text(content) -> str:
-    """Full-fidelity stringification of a message's content. Deliberately NOT
-    ``text_of`` (which drops non-text blocks): size estimates and loop fingerprints
-    must see everything the transcript carries, or they undercount / miss repeats."""
+    """Full stringification of message content; unlike ``text_of`` it keeps non-text
+    blocks, which size estimates and loop fingerprints need."""
     return content if isinstance(content, str) else str(content)
 
 
 def message_tokens(m) -> int:
-    """One message's model-token count, with fallbacks: ``usage_metadata`` →
-    ``response_metadata.token_usage`` → chars/4 estimate. THE per-message ladder —
-    BudgetMiddleware's enforcement total and metering's reported totals are both sums
-    of this, so they can never disagree about the same messages."""
+    """One message's tokens: ``usage_metadata`` → ``response_metadata.token_usage`` →
+    chars/4. Budget enforcement and metering both sum this."""
     um = getattr(m, "usage_metadata", None)
     t = um.get("total_tokens") if isinstance(um, dict) else None
     if not t:

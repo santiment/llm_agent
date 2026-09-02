@@ -49,9 +49,11 @@ def _read_prompt_file(path: str) -> str:
         log.warning("cannot read prompt file %s: %s", path, exc)
         return ""
 
-# Hostnames that resolve to cloud-metadata endpoints — never a legitimate target for
-# ANY outbound URL (MCP config or model-supplied web_fetch).
+# Cloud-metadata hostnames — never a legitimate outbound target.
 _BLOCKED_HOSTNAMES = {"metadata", "metadata.google.internal"}
+# Dotted/decimal/hex numeric hosts that ipaddress rejects but the resolver accepts
+# (``127.1``, ``2130706433``, ``0x7f000001``, ``0177.0.0.1``).
+_NUMERIC_HOST = re.compile(r"(?:0x[0-9a-f]+|\d+)(?:\.(?:0x[0-9a-f]+|\d+))*")
 
 # Default for the ``streaming_denylist`` field — a module constant so the field default
 # and the resolver share ONE list instead of repeating the model substring.
@@ -156,20 +158,12 @@ def _allowed_base_urls() -> set[str]:
 
 
 def url_blocked(url: str, *, allow_private: bool) -> str | None:
-    """SSRF vetting shared by every outbound-URL consumer. Returns a reason string if
-    the URL must be refused, else ``None``. One skeleton (scheme allowlist, host
-    presence, cloud-metadata denylist, IP-literal properties) so hardening it — e.g.
-    adding a metadata alias — protects every caller at once; only the PRIVATE-address
-    policy diverges per caller:
-
-      - ``allow_private=True`` (operator-supplied MCP URLs): loopback/private hosts are
-        legitimate (the internal gateway uses them); only link-local / metadata targets
-        (169.254.0.0/16, fe80::/10, ``metadata.*``) are blocked.
-      - ``allow_private=False`` (MODEL-supplied web_fetch URLs): localhost and any
-        non-public IP literal are refused too.
-
-    A DNS name that RESOLVES to a private address is a known residual gap for both
-    (no resolve-and-pin here); the network posture is the second fence."""
+    """Reason an outbound URL must be refused, else None. Always blocked: non-http(s)
+    schemes, missing host, cloud-metadata hosts, link-local addresses. With
+    ``allow_private=False`` (model-supplied URLs) localhost, any non-public IP literal and
+    numeric shorthand hosts are refused too; ``allow_private=True`` (operator MCP URLs)
+    keeps loopback/private hosts. A DNS name resolving to a private address is a known
+    residual gap."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return f"scheme {parsed.scheme!r} not allowed"
@@ -183,7 +177,9 @@ def url_blocked(url: str, *, allow_private: bool) -> str | None:
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
-        return None  # a DNS name (e.g. host.docker.internal) — not an IP literal to vet
+        if not allow_private and _NUMERIC_HOST.fullmatch(host):
+            return f"malformed numeric host {host!r} blocked"
+        return None  # a DNS name — not an IP literal to vet
     if ip.is_link_local:
         return f"link-local address {host} blocked"
     if not allow_private and (ip.is_private or ip.is_loopback or ip.is_reserved
@@ -313,22 +309,14 @@ class ResearchConfig:
     # call ceiling can be generous. Without a sandbox these still backstop runaway runs.
     max_tool_calls: int = 200
     max_total_tokens: int = 4_000_000
-    # In-flight context compaction (compaction.py): when an agent's estimated context
-    # crosses this many tokens, older messages are summarized on utility_model and
-    # replaced with the summary. The knob is ABSOLUTE (not a window fraction) because an
-    # OpenRouter slug does not expose its context size; sized for the ~256k-window models
-    # the default tiers use, with headroom for the response. 0 disables compaction
-    # entirely (a run that outgrows the window then dies on the provider error, as
-    # before). DRA_COMPACTION_TOKENS.
+    # In-flight context compaction (compaction.py): an estimated context above this many
+    # tokens summarizes older messages on utility_model. Absolute, since an OpenRouter slug
+    # does not expose its window; 0 disables. DRA_COMPACTION_TOKENS.
     compaction_tokens: int = 100_000
-    # Inject Anthropic-style prompt-cache breakpoints (cache_control) into every model
-    # request (caching.py). Applied only when base_url is OpenRouter, which forwards the
-    # markers to caching providers and strips them elsewhere. DRA_PROMPT_CACHING=false
-    # is the kill switch.
+    # cache_control breakpoints on every model request (caching.py); OpenRouter only.
+    # DRA_PROMPT_CACHING.
     prompt_caching: bool = True
-    # Full-page reader tool (tools/fetch.py): web_fetch returns a page's complete
-    # readable text so sub-agents can cite substance, not snippets. Oversized pages
-    # offload to the sandbox like any big tool result. DRA_WEB_FETCH=false disables.
+    # web_fetch tool (tools/fetch.py): a page's full readable text. DRA_WEB_FETCH.
     web_fetch: bool = True
     # Per-call MCP result threshold (events.py). With a sandbox, a result over EITHER bound is
     # written to a file under offload_dir and only a compact stub (path, row count, columns,
@@ -353,10 +341,7 @@ class ResearchConfig:
 
     @property
     def is_openrouter(self) -> bool:
-        """The ONE provider-detection gate for OpenRouter-only behaviors (cost
-        reporting in models.py, cache_control breakpoints in agent.py). A self-hosted
-        OpenRouter-compatible gateway whose URL lacks the substring silently loses
-        those features — extend here, not at the call sites."""
+        """OpenRouter-only behaviors (cost reporting, cache_control) key off this."""
         return "openrouter" in self.base_url.lower()
 
     @classmethod

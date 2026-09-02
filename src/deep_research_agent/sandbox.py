@@ -58,10 +58,7 @@ class HttpSandboxBackend(BaseSandbox):
         self._network = network
         self._session_timeout = int(session_timeout)
         self._http_timeout = http_timeout
-        # ``(container_path, bytes)`` PUT into every new session right after it is created and
-        # before any execute/file op can run — skill helper modules such as
-        # /workspace/recipes.py (see agent.skill_seed_files), so the model imports tested code
-        # instead of retyping it out of a skill's markdown.
+        # (container_path, bytes) uploaded into every new session (agent.skill_seed_files).
         self._seed_files = list(seed_files or [])
         # `id` must not create a session (deepagents may read it eagerly), so it's a stable
         # instance id; the actual sandbox session is created lazily on first execute/file op.
@@ -97,10 +94,8 @@ class HttpSandboxBackend(BaseSandbox):
         return self._session_id
 
     def _seed(self, sid: str) -> None:
-        """Upload the seed files into a just-created session. Runs under the session lock, so
-        no execute/file op can race ahead of them. Failures are logged, never raised — a missing
-        helper degrades a skill (its fallback is to write the file itself); it must not kill
-        the run. Direct PUTs, not ``upload_files``: that would re-enter the non-reentrant lock."""
+        """Upload seed files into a just-created session (under the session lock). Failures
+        are logged, not raised. Direct PUTs: ``upload_files`` would re-enter the lock."""
         if not self._seed_files:
             return
         for path, content in self._seed_files:

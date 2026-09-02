@@ -26,8 +26,7 @@ from langchain_core.tools import StructuredTool
 
 _TIMEOUT = 60
 _SLUG_RE = re.compile(r"^[a-z0-9-]+$")
-# The source ids metrics-hub accepts (its DEFAULT_SAMPLE_SOURCES). Anything else is a 400
-# from the server, so reject it here with the valid list instead of burning a round-trip.
+# Source ids metrics-hub accepts; anything else is a server 400, so reject up front.
 VALID_SOURCES = ("telegram", "reddit", "twitter_crypto", "4chan", "bitcointalk", "farcaster")
 
 _DESCRIPTION = (
@@ -102,10 +101,8 @@ def build_tools(cfg) -> list:
         data = await _call(url, body)
         if isinstance(data, str):
             return data
-        # A project slug resolves to the project's curated query, which can legitimately
-        # match nothing (e.g. a small project's ticker rules) while the name itself is
-        # discussed. Fall back to a free-text search for the same word before declaring
-        # the crowd silent — one extra request, only on an empty result.
+        # A slug's curated query can match nothing while the name itself is discussed;
+        # fall back to a free-text search before declaring the crowd silent.
         if by_slug and _total(data) == 0:
             text_body = {k: v for k, v in body.items() if k != "slug"}
             text_body["search_text"] = asset

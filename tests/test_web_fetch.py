@@ -40,6 +40,10 @@ def test_private_and_special_targets_are_blocked() -> None:
         "http://metadata.google.internal/computeMetadata/",
         "http://[::1]/",
         "http://0.0.0.0/",
+        "http://127.1/",                   # numeric shorthand the resolver accepts
+        "http://2130706433/",
+        "http://0x7f000001/",
+        "http://0177.0.0.1/",
     ):
         assert fetch_url_blocked(url) is not None, url
 
@@ -103,12 +107,21 @@ def test_fetch_refuses_redirect_to_private_address() -> None:
     def handler(request):
         if request.url.host == "example.com":
             return httpx.Response(302, headers={"location": "http://127.0.0.1/latest"})
-        return httpx.Response(200, headers={"content-type": "text/html"},
-                              content=b"<p>internal</p>")
+        raise AssertionError("the private redirect target was requested")  # vet BEFORE the hop
 
     err = _fetch_error("https://example.com/go", handler)
     assert "[permanent]" in err and "refused after redirect" in err
-    assert "internal" not in err
+
+
+def test_fetch_follows_redirect_to_public_address() -> None:
+    def handler(request):
+        if request.url.path == "/go":
+            return httpx.Response(301, headers={"location": "https://example.com/final"})
+        return httpx.Response(200, headers={"content-type": "text/html"},
+                              content=b"<title>Final</title><p>landed</p>")
+
+    out = _fetch("https://example.com/go", handler)
+    assert "URL: https://example.com/final" in out and "landed" in out
 
 
 def test_fetch_skips_binary_content_types() -> None:

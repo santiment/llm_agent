@@ -12,13 +12,10 @@ shared by:
 Scope (honest):
   - tool_calls / errors / rows / bytes are GLOBAL (include sub-agents).
   - input/output/total tokens and model_calls are per-agent: the orchestrator's from its
-    own messages, each sub-agent fleet's via ``SubagentUsageMiddleware`` (attached to the
-    sub-agent specs in agent.py — ``after_agent`` runs once per ``task`` call with that
-    sub-agent's isolated message state). The ``usage`` event carries both, plus a grand
-    total.
-  - cost_usd is BEST-EFFORT: OpenRouter returns the actual charged cost only on
-    non-streamed calls that asked for it (``usage: {include: true}``, models.py) —
-    streamed calls contribute 0. Treat it as a lower bound, not an invoice.
+    own messages, each sub-agent's via ``SubagentUsageMiddleware`` (``after_agent`` runs
+    once per ``task`` call with that sub-agent's isolated state).
+  - cost_usd is a lower bound: OpenRouter reports cost only on non-streamed calls that
+    asked for it (models.py); streamed calls contribute 0.
   - LangGraph does not surface the consumed super-step count to middleware, so model_calls
     / messages are the practical proxy for recursion depth.
 """
@@ -59,11 +56,7 @@ def fmt_elapsed(seconds: float | None) -> str:
 
 def sum_usage(messages: list) -> dict[str, Any]:
     """Token / model-call / cost totals over the AIMessages of one agent's transcript.
-
-    Per-message totals come from ``turn.message_tokens`` — the same ladder
-    BudgetMiddleware enforces with, so the two can never disagree about the same
-    messages. ``cost_usd`` is read defensively from OpenRouter's ``token_usage.cost``
-    (present only on non-streamed calls that requested it)."""
+    Per-message totals use ``turn.message_tokens``, the same ladder BudgetMiddleware uses."""
     in_tok = out_tok = total = model_calls = 0
     cost = 0.0
     for m in messages:
@@ -92,11 +85,8 @@ class RunMeter:
     capped_calls: int = 0
     result_bytes: int = 0
     result_rows: int = 0
-    # Per-role sub-agent model usage (research-subagent / extract-subagent), accumulated
-    # across every `task` invocation of the run by SubagentUsageMiddleware.
-    subagent_usage: dict[str, dict[str, Any]] = field(default_factory=dict)
-    # Run clock, started by UsageMeterMiddleware.before_agent (the first hook of a run):
-    # monotonic for the duration, wall-clock ISO for the consumer's own arithmetic.
+    subagent_usage: dict[str, dict[str, Any]] = field(default_factory=dict)  # per role
+    # Run clock, started by UsageMeterMiddleware.before_agent.
     started_mono: float | None = None
     started_at: str = ""
 
@@ -132,15 +122,9 @@ class RunMeter:
 
 
 class SubagentUsageMiddleware(AgentMiddleware):
-    """Attached to a SUB-AGENT spec (never the orchestrator): ``after_agent`` fires once
-    per ``task`` invocation with that sub-agent's own isolated message state, so summing
-    it here is what makes the fleet's model usage visible at all — the orchestrator's
-    state only ever contains the returned findings text.
-
-    It also marks the sub-agent's START and END (``status`` events ``subagent_start`` /
-    ``subagent_done`` + a log line each, carrying role and model). Without these, nothing
-    in the stream or the log says a cheaper model ran at all until the run's final
-    ``usage`` rollup — which never arrives if the run is cancelled mid-way."""
+    """Attached to sub-agent specs only. ``after_agent`` fires once per ``task`` call with the
+    sub-agent's own message state; summing it here is what makes fleet usage visible. Also
+    emits ``subagent_start`` / ``subagent_done`` status events carrying role and model."""
 
     def __init__(self, meter: RunMeter, role: str, model: str = "") -> None:
         super().__init__()
@@ -156,10 +140,7 @@ class SubagentUsageMiddleware(AgentMiddleware):
 
     def after_agent(self, state: dict, runtime) -> dict[str, Any] | None:
         usage = sum_usage(state.get("messages") or [])
-        # A long sub-agent run can compact its own context; those tokens were still
-        # spent — fold them in, same as the orchestrator total below.
-        _calls, compacted_tokens = compacted_counts(state)
-        usage["total_tokens"] += compacted_tokens
+        usage["total_tokens"] += compacted_counts(state)[1]  # compacted-away tokens were spent
         self.meter.record_subagent_usage(self.role, usage)
         log.info("SUBAGENT DONE role=%s model=%s model_calls=%d tokens=%d cost_usd=%.6f",
                  self.role, self.model or "?", usage["model_calls"], usage["total_tokens"],
@@ -171,10 +152,8 @@ class SubagentUsageMiddleware(AgentMiddleware):
 
 
 class UsageMeterMiddleware(AgentMiddleware):
-    """Start the run clock and emit the ``run_start`` version handshake at the start; emit
-    the per-run ``usage`` event + ``RESEARCH USAGE`` log — both carrying the run time — at
-    the end of every run. ``ResearchOutputMiddleware`` reads the same clock for its end
-    ``status``, so the run time reaches the consumer in the success AND the no-report case."""
+    """Starts the run clock and emits ``run_start``; at the end emits the per-run ``usage``
+    event and the ``RESEARCH USAGE`` log line, both carrying the run time."""
 
     def __init__(self, meter: RunMeter, *, max_tool_calls: int,
                  max_total_tokens: int, recursion_limit: int) -> None:
@@ -196,11 +175,8 @@ class UsageMeterMiddleware(AgentMiddleware):
     def after_agent(self, state: dict, runtime) -> dict[str, Any] | None:
         msgs = current_turn(state.get("messages") or [])
         orch = sum_usage(msgs)
-        # Messages summarized away by compaction still spent their tokens — add them back
-        # so the reported orchestrator total reflects what the run actually consumed.
         compacted_calls, compacted_tokens = compacted_counts(state)
-        orch_total = (orch["total_tokens"] or (orch["input_tokens"] + orch["output_tokens"])) \
-            + compacted_tokens
+        orch_total = orch["total_tokens"] + compacted_tokens  # compacted-away tokens were spent
 
         elapsed = self.meter.elapsed_s()
         sub_total_tokens = sum(u["total_tokens"] for u in self.meter.subagent_usage.values())
@@ -226,11 +202,8 @@ class UsageMeterMiddleware(AgentMiddleware):
             # Sub-agent fleet model usage, per role, + a whole-run token grand total.
             "subagents": self.meter.subagent_usage,
             "total_tokens_all_agents": orch_total + sub_total_tokens,
-            # BEST-EFFORT actual cost (OpenRouter, non-streamed calls only — see module doc).
-            "cost_usd": round(cost, 6),
-            # Wall-clock run time — the first thing asked when a run ends without a report.
-            # Always present; None only if before_agent never ran (offline tests).
-            "elapsed_s": elapsed,
+            "cost_usd": round(cost, 6),  # lower bound — see module doc
+            "elapsed_s": elapsed,  # None only if before_agent never ran
             "elapsed": fmt_elapsed(elapsed),
             "started_at": self.meter.started_at,
             "finished_at": utc_now(),

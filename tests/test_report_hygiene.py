@@ -200,6 +200,13 @@ def test_series_runs_ignores_short_dated_lists_and_prose():
     assert series_runs(md) == []  # 4 dated bullets, one number each with prose — a timeline
 
 
+def test_series_runs_ignores_long_dated_timeline_with_numbers():
+    md = "\n".join(
+        f"- 2026-08-{d:02d}: ETF inflows hit ${d}.2B, the {d}rd largest day on record"
+        for d in range(1, 9))
+    assert series_runs(md) == []  # 8 dated bullets, two numbers each, but prose
+
+
 def test_report_problems_flags_raw_series():
     probs = " | ".join(report_problems(_SERIES_REPORT))
     assert "raw time series" in probs

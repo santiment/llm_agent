@@ -63,11 +63,9 @@ SANDBOX_SEED_DIR = "/workspace"
 
 
 def skill_seed_files(skills_dir: str) -> list[tuple[str, bytes]]:
-    """Python helpers shipped with skills (``skills/<skill>/*.py``) as ``(container_path,
-    bytes)`` pairs, seeded into every sandbox session at ``/workspace/<file>`` (the ``execute``
-    cwd) — so a skill's recipes are imported (``import recipes as R``) instead of retyped by the
-    model out of its markdown. Underscore-prefixed files stay private. Basenames must be unique
-    across skills: a later skill's clash is skipped with a warning, never silently overwritten."""
+    """``skills/<skill>/*.py`` as ``(container_path, bytes)`` pairs seeded into every sandbox
+    session at ``/workspace/<file>``. Underscore-prefixed files stay private; a basename
+    clash between skills is skipped with a warning."""
     out: list[tuple[str, bytes]] = []
     owner: dict[str, str] = {}
     if not skills_dir or not os.path.isdir(skills_dir):
@@ -108,8 +106,7 @@ async def make_graph(config: dict | None = None):
     # Always a fresh build — never alias the orchestrator's instance on string-equal
     # ids, so future per-tier kwargs (temperature, callbacks) can't be silently shared.
     subagent_model = build_chat_model(cfg.subagent_model, cfg)
-    # The flash-class floor. This ONE instance is deliberately shared by its two
-    # consumers below (extract-subagent's loop + the compaction summarizer).
+    # Shared by the extract-subagent and the compaction summarizer.
     utility_model = build_chat_model(cfg.utility_model, cfg)
     log.info("models: research=%s subagent=%s utility=%s",
              cfg.research_model, cfg.subagent_model, cfg.utility_model)
@@ -157,10 +154,7 @@ async def make_graph(config: dict | None = None):
         tools.append(instrument_tool(
             custom, kind="tool", **result_handling(cfg, meter, offload_sink)))
 
-    # Full-page reader: search snippets are ~600 chars, and citing a page on its snippet
-    # alone is the failure this closes. Same wrapper as MCP/custom tools, so a huge page
-    # offloads to the sandbox instead of flooding a sub-agent's context. Its own
-    # semaphore bounds concurrent full-page downloads across the whole sub-agent fleet.
+    # Full-page reader; its own semaphore bounds concurrent downloads across the fleet.
     if cfg.web_fetch:
         tools.append(instrument_tool(
             build_fetch_tool(cfg), kind="tool", semaphore=asyncio.Semaphore(4),
@@ -174,17 +168,10 @@ async def make_graph(config: dict | None = None):
     # "execute" appear in legitimate report prose all the time.
     data_tool_names = tuple(sorted(t.name for t in tools))
 
-    # Middleware shared by the orchestrator AND every sub-agent — all stateless or
-    # message-derived, so single instances are safe across the sub-graphs:
-    #   - loop guard: break identical-tool-call loops (nudge, then end);
-    #   - compaction: summarize-and-shrink when a context nears the window
-    #     (0 = disabled; runs the summary on the cheap utility model);
-    #   - prompt cache: cache_control breakpoints, OpenRouter-only (it forwards the
-    #     markers to caching providers and strips them elsewhere; a plain OpenAI-compat
-    #     gateway might reject the unknown block key instead).
+    # Shared by the orchestrator and every sub-agent (all stateless). Compaction
+    # self-disables at trigger_tokens <= 0; cache breakpoints are OpenRouter-only.
     shared_middleware: list = [
         LoopGuardMiddleware(),
-        # Self-disables when trigger_tokens <= 0 — no wiring guard needed here.
         ContextCompactionMiddleware(utility_model, trigger_tokens=cfg.compaction_tokens),
     ]
     if cfg.prompt_caching and cfg.is_openrouter:
@@ -206,8 +193,7 @@ async def make_graph(config: dict | None = None):
         "system_prompt": subagent_prompt(mcp_prompt, cfg.domain_prompt),
         "tools": tools,
         "model": subagent_model,
-        # SubagentUsageMiddleware is what makes the fleet's model usage visible in the
-        # run's `usage` event — the orchestrator's state never sees these tokens.
+        # SubagentUsageMiddleware: the orchestrator's state never sees sub-agent tokens.
         "middleware": [SubagentFindingsMiddleware(),
                        SubagentUsageMiddleware(meter, "research-subagent",
                                                model=cfg.subagent_model),
@@ -220,8 +206,7 @@ async def make_graph(config: dict | None = None):
     # Utility-model consumer: reads offloaded /workspace result files on the cheapest
     # model. Registered only when offloading is live. `tools: []` — no data tools to
     # re-fetch with; deepagents still mounts the filesystem + `execute` built-ins, and
-    # ExcludeToolsMiddleware then hides every built-in except `execute`: the extractor
-    # works ONLY through bounded Python slices (see tool_filter.py for why).
+    # ExcludeToolsMiddleware hides every built-in except `execute` (see tool_filter.py).
     if offload_sink is not None:
         from deepagents.middleware.filesystem import FilesystemMiddleware
         from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
@@ -253,14 +238,11 @@ async def make_graph(config: dict | None = None):
         # Offloaded files appear in the research-subagents' context (they make the data
         # calls), so nest a `task` tool there, restricted to extract-subagent. This
         # direct path skips deepagents' default stack — carry our own filesystem stack,
-        # then the same findings-gate/metering/shared trio as the top-level spec (the
-        # nested run has its OWN isolated state, so without its own usage middleware
-        # those tokens would never reach the meter).
+        # then the same middleware as the top-level spec.
         nested_extract_spec = {
             **extract_spec,
             "middleware": [
-                # Custom prompt: the default one advertises read_file/grep paging, which
-                # the tool filter below takes away — don't teach a workflow it can't run.
+                # The default prompt advertises read_file/grep, which the tool filter removes.
                 FilesystemMiddleware(
                     backend=backend,
                     system_prompt=("Files live under /workspace. You operate on them ONLY "
@@ -281,9 +263,8 @@ async def make_graph(config: dict | None = None):
     # findings, and synthesizes. Gathering lives in sub-agents, so raw data can't
     # enter the expensive orchestrator context at all.
     middleware = [
-        # Shared trio first (loop guard / compaction / prompt cache) — compaction must
-        # run BEFORE BudgetMiddleware so the budget check each step sees the shrunk
-        # transcript plus the compacted_* counters it folds back in (never a half-state).
+        # Compaction must run before BudgetMiddleware so the budget check sees the shrunk
+        # transcript plus the compacted_* counters.
         *shared_middleware,
         # Hard backstop against runaway runs: cumulative tool-call + token ceilings,
         # soft wrap-up nudge then hard stop.
@@ -299,7 +280,7 @@ async def make_graph(config: dict | None = None):
             max_tool_calls=cfg.max_tool_calls,
             max_total_tokens=cfg.max_total_tokens,
             tool_names=data_tool_names,
-            meter=meter,   # run clock → run time on the end status (done and error)
+            meter=meter,
         ),
         SkillUsageMiddleware(),
         # Block request_clarification once research has started (TRIAGE-only), then the

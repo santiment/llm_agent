@@ -34,10 +34,8 @@ def build_chat_model(model_id: str, cfg: ResearchConfig) -> ChatOpenAI:
         extra_body["reasoning"] = {"enabled": False}
     elif cfg.reasoning_effort:
         extra_body["reasoning"] = {"effort": cfg.reasoning_effort}
-    # Ask OpenRouter to put the ACTUAL charged cost into the response's usage object
-    # (surfaces as response_metadata["token_usage"]["cost"]; metering.sum_usage reads it).
-    # Non-streamed calls only: streamed usage arrives as a trailing usage-only chunk —
-    # the exact off-spec-merge path the stream_usage note below avoids.
+    # OpenRouter puts the charged cost into usage (response_metadata["token_usage"]["cost"],
+    # read by metering.sum_usage). Non-streamed calls only — see the stream_usage note below.
     if not streaming and cfg.is_openrouter:
         extra_body["usage"] = {"include": True}
     return ChatOpenAI(

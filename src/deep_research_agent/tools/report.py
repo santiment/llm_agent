@@ -31,9 +31,7 @@ def build_submit_report_tool(tool_names=()) -> StructuredTool:
         # Last-mile guard: strip any data-layer machinery (tool names / call syntax) that
         # leaked past the prompt rules, so the user never sees tool names in the report.
         md = scrub_report(md, tool_names)
-        # A raw time series the quality gate could not get rewritten is DELETED here, on the
-        # live emit — the same collapse the persisted report gets — so a bucket-by-bucket
-        # table never reaches the user through either path.
+        # Raw series the quality gate could not get rewritten are dropped on the live emit too.
         collapsed = collapse_series(md)
         if collapsed != md:
             log.warning("REPORT: raw time series collapsed on delivery (%d -> %d chars)",

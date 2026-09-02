@@ -1,12 +1,10 @@
-"""Time series in tool results: detect them, summarize them, keep the rows out of context.
+"""Time series in tool results: detect, summarize, keep the rows out of context.
 
-The one result shape the model must NEVER hold verbatim is a metric series —
-``{"data": {"bitcoin": [{"datetime": ..., "value": ...}, ...]}}``, a bare list of dated rows,
-or the JSON text of either. Given the rows, it transcribes them into a date/value table in
-the report (a 90-row table was the live failure). So ``instrument_tool`` offloads any detected
-series to a file REGARDLESS of size and shows the model a computed summary
-(``summary_block``) instead; the report side (``report_hygiene``) deletes any rows that still
-get written. Stdlib only; tolerant of the field names metric servers use.
+Shown a metric series (``{"data": {"bitcoin": [{"datetime", "value"}, ...]}}``, a bare list
+of dated rows, or the JSON text of either) the model transcribes it into a date/value table.
+``instrument_tool`` therefore offloads any detected series to a file regardless of size and
+shows a computed ``summary_block`` instead; ``report_hygiene`` deletes rows that still get
+written. Stdlib only.
 """
 
 from __future__ import annotations
@@ -16,8 +14,8 @@ import statistics
 from datetime import datetime, timezone
 from typing import Any
 
-MIN_SERIES_POINTS = 8          # fewer dated rows is a fact list, not a series
-MAX_SCAN_BYTES = 4_000_000     # bigger strings are offloaded by size anyway; don't parse twice
+MIN_SERIES_POINTS = 8
+MAX_SCAN_BYTES = 4_000_000  # bigger strings are offloaded by size anyway
 
 _TS_KEYS = ("datetime", "dt", "timestamp", "ts", "date", "time", "t", "d")
 _VAL_KEYS = ("value", "v", "val", "y", "count", "close", "price")
@@ -25,15 +23,14 @@ _WRAPPERS = ("data", "rows", "values", "result", "results", "series", "timeserie
 
 
 def parse_ts(x: Any) -> datetime | None:
-    """Epoch seconds/ms, ISO 8601 (Z / offset / fractional seconds) or a bare date → aware UTC
-    datetime; None for anything else."""
+    """Epoch seconds/ms, ISO 8601 or a bare date → aware UTC datetime; None otherwise."""
     if x is None or isinstance(x, bool):
         return None
     if isinstance(x, (int, float)):
         v = float(x)
-        if v > 1e11:                    # epoch milliseconds
+        if v > 1e11:  # epoch milliseconds
             v /= 1000.0
-        if not 0 < v < 4e9:             # 1970..2096
+        if not 0 < v < 4e9:
             return None
         return datetime.fromtimestamp(v, tz=timezone.utc)
     if not isinstance(x, str):
@@ -43,12 +40,6 @@ def parse_ts(x: Any) -> datetime | None:
         return None
     if s[-1] in "Zz":
         s = s[:-1] + "+00:00"
-    if "." in s:                        # fractional seconds → at most 6 digits
-        head, _, tail = s.partition(".")
-        i = 0
-        while i < len(tail) and tail[i].isdigit():
-            i += 1
-        s = head + (("." + tail[:i][:6].ljust(6, "0")) if i else "") + tail[i:]
     try:
         dt = datetime.fromisoformat(s)
     except ValueError:
@@ -60,7 +51,7 @@ def _num(x: Any) -> float | None:
     if x is None or isinstance(x, bool):
         return None
     if isinstance(x, (int, float)):
-        return float(x) if x == x else None          # NaN out
+        return float(x) if x == x else None  # drop NaN
     if isinstance(x, str):
         try:
             return float(x.replace(",", ""))
@@ -70,10 +61,9 @@ def _num(x: Any) -> float | None:
 
 
 def points_of(rows: Any) -> list[tuple[datetime, float]] | None:
-    """The sorted (ts, value) points of a list of dated rows — dicts with a timestamp key and a
-    value key, or [ts, value] pairs. None unless the list has >= MIN_SERIES_POINTS rows, at least
-    90% of them are shaped like that (a list of records with an incidental date is NOT a
-    series), and >= MIN_SERIES_POINTS carry a numeric value (nulls are allowed gaps)."""
+    """Sorted (ts, value) points of a list of dated rows (dicts with timestamp + value keys,
+    or [ts, value] pairs). None unless >= MIN_SERIES_POINTS rows, >= 90% of them shaped like
+    that, and >= MIN_SERIES_POINTS with a numeric value (nulls are allowed gaps)."""
     if not isinstance(rows, list) or len(rows) < MIN_SERIES_POINTS:
         return None
     shaped = 0
@@ -100,11 +90,8 @@ def points_of(rows: Any) -> list[tuple[datetime, float]] | None:
 
 
 def find_series(result: Any) -> dict[str, list[tuple[datetime, float]]]:
-    """Every series in a tool result, by label: '' for a bare list, the map key for one nested
-    under a wrapper (``data.bitcoin`` → 'bitcoin'). Handles a list, a dict holding a list or a
-    {label: list} map under a wrapper key (or at top level), and the JSON text of any of these.
-    {} when the result holds no series — e.g. a social_messages payload (its `messages` rows
-    have no value field) or an assets_by_metric ranking (no timestamps)."""
+    """Every series in a tool result by label: '' for a bare list, the map key for one under
+    a wrapper (``data.bitcoin`` → 'bitcoin'). Accepts a list, a dict, or their JSON text."""
     obj = result
     if isinstance(obj, str):
         s = obj.strip()
@@ -159,9 +146,8 @@ def fmt_num(v: float | None) -> str:
 
 
 def describe(points: list[tuple[datetime, float]]) -> dict[str, Any]:
-    """The numbers a report may say about a series: span, first/last (+change), min/max with
-    when, mean, median, direction (last third vs first third, ±10%), and a note when the last
-    point is a zero that the rest of the series is not (an incomplete current bucket)."""
+    """Span, first/last (+change), min/max with when, mean, median, direction (last third vs
+    first third, ±10%), and a note when only the last point is zero (incomplete bucket)."""
     vals = [v for _, v in points]
     n = len(vals)
     (t0, v0), (t1, v1) = points[0], points[-1]
@@ -197,7 +183,7 @@ def describe_text(label: str, points: list[tuple[datetime, float]]) -> str:
 
 
 def summary_block(series: dict[str, list[tuple[datetime, float]]]) -> str:
-    """One indented summary line per series — what the model gets INSTEAD of the rows."""
+    """One indented summary line per series — what the model gets instead of the rows."""
     return "\n".join("  " + describe_text(label, pts) for label, pts in series.items())
 
 

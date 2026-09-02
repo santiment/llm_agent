@@ -1,35 +1,12 @@
-"""In-flight context compaction — the run shrinks instead of dying.
+"""In-flight context compaction: shrink a long transcript instead of dying on the window.
 
-A LangGraph thread replays every message on every model call, and a long research
-turn accumulates tool stubs, sub-agent findings and narration without bound.
-``BudgetMiddleware`` *stops* a run at its ceilings; nothing *shrank* one — a run
-that outgrew the model's context window died with a provider error. This is the
-missing shrink step, adapted from crush's auto-compaction:
-
-  - TRIGGER on the estimated size of the NEXT model call crossing
-    ``trigger_tokens``. The estimate anchors on real ``usage_metadata`` when the
-    provider reports it and falls back to chars/4. The knob is absolute
-    (DRA_COMPACTION_TOKENS) because an OpenRouter slug doesn't carry its context
-    window size; 0 disables the feature (crush likewise disables compaction when
-    the window is unknown — never compact blind).
-  - SUMMARIZE everything before a recent tail on the cheap long-context
-    ``utility_model``. The prompt mandates the sections a successor needs —
-    findings WITH exact figures and sources, offloaded file paths, gaps, next
-    steps — because the final report's citations are rebuilt from them.
-  - REPLACE history with ``[summary, anchor, tail]``. The summary is a
-    HumanMessage tagged ``COMPACTION_SUMMARY_NAME`` placed BEFORE the anchor (the
-    turn's real user message), so ``current_turn()`` and every turn-scoped gate
-    keep working unchanged.
-  - BOOKKEEP what was dropped: the current turn's summarized-away tool calls and
-    tokens go to state (``compacted_tool_calls`` / ``compacted_tokens``), keyed to
-    the anchor's message id (``compaction_anchor_id``) so a stale counter from a
-    previous turn can never leak into a new one. ``compacted_counts`` is how
-    budget.py / citations.py / metering.py add them back — compaction must never
-    grant fresh budget.
-
-Failure policy: any summarizer problem logs a warning and compacts NOTHING — the
-run continues exactly as if this middleware didn't exist (and may still die on
-the provider's context limit, as it would have anyway).
+When the estimated size of the next model call crosses ``trigger_tokens`` (absolute, since an
+OpenRouter slug does not expose its window; 0 disables), everything before a recent tail is
+summarized on the utility model and the history becomes ``[summary, anchor, tail]``. The
+summary is a HumanMessage tagged ``COMPACTION_SUMMARY_NAME`` placed BEFORE the turn's anchor
+(the real user message), so ``current_turn()`` keeps working. The dropped tool calls/tokens
+are kept in state keyed to the anchor id (``compacted_counts``) so budget/metering still see
+the whole turn — compaction never grants fresh budget. Any summarizer problem compacts nothing.
 """
 
 from __future__ import annotations
@@ -49,14 +26,9 @@ from .turn import (CHARS_PER_TOKEN, COMPACTION_SUMMARY_NAME, current_turn, raw_t
 
 log = logging.getLogger("deep_research_agent.compaction")
 
-# Keep at least this many messages verbatim behind the anchor (never split an
-# AIMessage from its ToolMessages — the tail start walks back over orphans).
-DEFAULT_KEEP_RECENT = 12
-# Don't bother summarizing fewer messages than this — the summary itself plus the
-# model call would cost more than it frees.
-_MIN_TO_SUMMARIZE = 6
-# Transcript bounds for the summarizer call itself (it runs on a flash-class model).
-_MAX_ENTRY_CHARS = 2_000
+DEFAULT_KEEP_RECENT = 12       # messages kept verbatim behind the anchor
+_MIN_TO_SUMMARIZE = 6          # fewer messages are not worth a summarizer call
+_MAX_ENTRY_CHARS = 2_000       # transcript bounds for the summarizer input
 _MAX_TRANSCRIPT_CHARS = 400_000
 
 _SUMMARY_SYSTEM = """You are compressing a deep-research agent's working context so a \
@@ -94,17 +66,15 @@ _SUMMARY_PREFIX = (
 
 
 class CompactionState(AgentState):
-    """State extension: what compaction summarized out of the CURRENT turn, so budget
-    ceilings and usage accounting still see the whole turn."""
+    """What compaction summarized out of the CURRENT turn."""
     compacted_tool_calls: NotRequired[int]
     compacted_tokens: NotRequired[int]
     compaction_anchor_id: NotRequired[str]
 
 
 def compacted_counts(state: dict) -> tuple[int, int]:
-    """``(tool_calls, tokens)`` summarized out of the current turn — ``(0, 0)`` unless a
-    compaction happened THIS turn. Keyed to the anchor message id: a counter left over
-    from a previous turn (new user question, same thread) never inflates the new turn."""
+    """``(tool_calls, tokens)`` summarized out of the current turn; ``(0, 0)`` unless the
+    stored anchor id matches the current turn's anchor (stale counters never leak)."""
     anchor_id = state.get("compaction_anchor_id")
     if not anchor_id:
         return 0, 0
@@ -116,11 +86,8 @@ def compacted_counts(state: dict) -> tuple[int, int]:
 
 
 def turn_spend(state: dict) -> tuple[int, int]:
-    """The current turn's REAL spend as ``(tool_calls, tokens)`` — what is visible in
-    the transcript PLUS what compaction summarized away. The one accessor every
-    enforcement/classification consumer (budget.py, citations.py) reads, so
-    "compaction never grants fresh budget" holds by construction, not by each call
-    site remembering to fold the counters in."""
+    """The turn's real ``(tool_calls, tokens)``: transcript plus compacted-away spend.
+    The one accessor budget.py and citations.py read."""
     turn = current_turn(state.get("messages") or [])
     compacted_calls, compacted_tokens = compacted_counts(state)
     return tool_calls_in(turn) + compacted_calls, tokens_in(turn) + compacted_tokens
@@ -131,10 +98,8 @@ def _short(s: str, n: int) -> str:
 
 
 def _context_estimate(messages: list) -> int:
-    """Tokens the NEXT model call will roughly carry. The latest AIMessage with real
-    usage_metadata already measured the whole prompt up to itself (input + output), so
-    anchor there and add chars/4 for everything after it; chars/4 over everything when
-    no usage exists (same fallback philosophy as turn.tokens_in)."""
+    """Rough tokens of the next model call: the latest AIMessage with usage_metadata already
+    measured the prompt up to itself (input + output); add chars/4 for everything after."""
     base, last = 0, -1
     for i in range(len(messages) - 1, -1, -1):
         m = messages[i]
@@ -148,7 +113,6 @@ def _context_estimate(messages: list) -> int:
 
 
 def _transcript(messages: list) -> str:
-    """The to-be-summarized messages as a plain-text transcript for the summarizer."""
     lines: list[str] = []
     for m in messages:
         if isinstance(m, SystemMessage):
@@ -161,7 +125,6 @@ def _transcript(messages: list) -> str:
         lines.append(f"--- {label} ---\n{body}")
     text = "\n".join(lines)
     if len(text) > _MAX_TRANSCRIPT_CHARS:
-        # The newest entries matter most for continuing — trim from the oldest end.
         text = "[…oldest messages trimmed…]\n" + text[-_MAX_TRANSCRIPT_CHARS:]
     return text
 
@@ -176,10 +139,8 @@ class ContextCompactionMiddleware(AgentMiddleware):
         self.trigger_tokens = int(trigger_tokens)
         self.keep_recent = max(1, int(keep_recent))
 
-    # -- pure planning ----------------------------------------------------------
-
     def _plan(self, messages: list) -> dict[str, Any] | None:
-        """Decide whether/where to compact. Returns the partition or None (don't)."""
+        """The partition to compact, or None when there is nothing to do."""
         if self.trigger_tokens <= 0 or len(messages) < _MIN_TO_SUMMARIZE + self.keep_recent:
             return None
         estimate = _context_estimate(messages)
@@ -190,22 +151,16 @@ class ContextCompactionMiddleware(AgentMiddleware):
             return None
         anchor = messages[anchor_i]
         if getattr(anchor, "id", None) is None:
-            # Unreachable behind LangGraph's add_messages reducer (it assigns every
-            # message an id) — but the counters are keyed to this id, so without one
-            # we bail rather than mutate a state-owned message to invent it.
-            return None
-        # Tail = the newest keep_recent messages, but never before the anchor and never
-        # starting on a ToolMessage (its AIMessage must stay adjacent or providers reject
-        # the transcript) — walk back until the boundary is clean.
+            return None  # counters are keyed to this id; never invent one
+        # The tail never starts before the anchor and never on a ToolMessage (its AIMessage
+        # must stay adjacent or providers reject the transcript).
         tail_start = max(anchor_i + 1, len(messages) - self.keep_recent)
         while anchor_i + 1 < tail_start < len(messages) and isinstance(messages[tail_start], ToolMessage):
             tail_start -= 1
         summarized = messages[:tail_start]
-        # Everything summarized that belongs to the CURRENT turn — its calls/tokens must
-        # keep counting against the budget after they leave the transcript.
-        zone_current = messages[anchor_i + 1:tail_start]
         if len(summarized) < _MIN_TO_SUMMARIZE:
             return None
+        zone_current = messages[anchor_i + 1:tail_start]  # this turn's summarized-away work
         return {
             "estimate": estimate,
             "anchor": anchor,
@@ -220,7 +175,7 @@ class ContextCompactionMiddleware(AgentMiddleware):
                 HumanMessage(content="Transcript to compress:\n\n" + _transcript(plan["summarized"]))]
 
     def _apply(self, state: dict, plan: dict[str, Any], summary: str) -> dict[str, Any]:
-        anchor = plan["anchor"]  # always carries an id — _plan bailed otherwise
+        anchor = plan["anchor"]
         prev_calls, prev_tokens = compacted_counts(state)
         summary_msg = HumanMessage(content=_SUMMARY_PREFIX + summary,
                                    name=COMPACTION_SUMMARY_NAME)
@@ -241,10 +196,7 @@ class ContextCompactionMiddleware(AgentMiddleware):
             "compaction_anchor_id": anchor.id,
         }
 
-    # -- hooks: sync + async differ ONLY in how the summarizer is invoked ---------
-
     def _begin(self, state: dict) -> dict[str, Any] | None:
-        """Plan + the single "compacting" emit; None when there is nothing to do."""
         plan = self._plan(state.get("messages") or [])
         if plan is not None:
             emit({"type": "status", "state": "compacting",

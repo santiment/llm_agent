@@ -29,7 +29,7 @@ cp .env.example .env          # set OPENAI_API_KEY, TAVILY_API_KEY (+ optional D
 | `./run.sh doctor` | Check deps, `.env` keys, whether the server is up, and whether the sandbox is reachable — starts nothing. |
 | `./run.sh test` | Sync, then run the offline `pytest` suite (no API keys / network). |
 
-Host/port follow `DRA_HOST` (default `127.0.0.1`) and `DRA_PORT` (default `2024`; bare `PORT` still works). `ask`/`smoke` need the server up in another shell first — or use `run-stack.sh` below, which starts everything for you.
+Host/port follow `DRA_HOST` (default `127.0.0.1`) `DRA_PORT` (default `2024`; bare `PORT` still works) and `DRA_JOBS` (default `10`, passed as `--n-jobs-per-worker`; without it `langgraph dev` executes one run at a time, so a slow run leaves every later run stuck in `pending`). Auto-reload is off unless `DRA_RELOAD=1`: every source save would otherwise restart the server and kill in-flight runs. `ask`/`smoke` need the server up in another shell first — or use `run-stack.sh` below, which starts everything for you.
 
 ### `run-stack.sh` — agent + sandbox together
 
@@ -57,7 +57,7 @@ The equivalent manual commands:
 
 ```bash
 uv sync --extra dev           # create ./.venv with all deps + the langgraph CLI
-uv run langgraph dev --host 127.0.0.1 --port 2024
+uv run langgraph dev --host 127.0.0.1 --port 2024 --n-jobs-per-worker 10 --no-reload
 uv run python examples/client.py "What are the recent trends across the tracked entities, and where can I find supporting data?"
 ```
 

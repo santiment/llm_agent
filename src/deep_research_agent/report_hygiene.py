@@ -8,11 +8,9 @@ Two pure helpers applied to the final report markdown:
   - ``lint_citations``: report inline-``[n]`` vs ``## Sources`` ``[n]`` mismatches (orphans /
     danglers) for observability. DETECTION only — auto-pruning a source the model merely
     forgot to cite would lose a real source, so this warns rather than edits.
-  - ``series_runs`` / ``collapse_series``: a RAW TIME SERIES transcribed into the report
-    (consecutive timestamped data rows — hourly sentiment buckets, a volume curve as a
-    table). ``report_problems`` flags it so the quality gate bounces the report for a
-    summary rewrite; ``collapse_series`` is the last-mile fallback that drops the rows if
-    the rewrite still ships them. A report describes a series; it never lists it.
+  - ``series_runs`` / ``collapse_series``: runs of timestamped data rows (a raw time series).
+    ``report_problems`` flags them so the quality gate bounces the report; ``collapse_series``
+    drops any that still ship, leaving a one-line note with the statistics.
 """
 
 from __future__ import annotations
@@ -22,6 +20,8 @@ import statistics
 from collections import Counter
 from functools import lru_cache
 from typing import NamedTuple
+
+from .series import fmt_num
 
 # Tool names leak into reports in several shapes; handle each, since the model varies
 # the delimiter (parentheses one run, an em-dash list the next). Which names to scrub
@@ -89,12 +89,8 @@ _SRC_LABEL = re.compile(r"^\s*-?\s*(?:\[\d+\])+\s*(.+?)\s*$")
 # every other check only counts numbers, not whether an entry names its source.
 _SRC_EMPTY = re.compile(r"^\s*-\s*(?:\s*\[\d+\])+\s*$")
 # ---- Raw time series in the report body ------------------------------------------------
-# The shape rejected live as "completely unreadable": consecutive lines each opening with a
-# date/timestamp followed by numbers — `- 2026-09-01T09:00:00.000Z: bearish=0.0544,
-# bullish=0.3833, neutral=0.5622` for 24 hours, `| 2026-09-01 | 0.05 | 0.38 |` table rows,
-# or `2026-06-04    19.189` for 90 days. Detection is per LINE and only a RUN of such lines
-# counts, so a dated fact in prose or a short dated list is left alone. Blank lines inside a
-# run do not end it (a table pasted with spacing is still a table).
+# A line opening with a timestamp followed by numbers and little prose is a data row; only
+# a run of >= MIN_SERIES_ROWS such lines counts (blank lines inside a run don't end it).
 _MONTHS = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
 _TS = (
     r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?"  # ISO
@@ -124,9 +120,9 @@ def _series_row_ts(line: str) -> str | None:
         return None
     rest = m.group("rest")
     nums, words = len(_NUM.findall(rest)), len(_WORD.findall(rest))
-    # `bearish=0.05, bullish=0.38` → 2+ numbers; `| 0.05 |` → 1 number, 0 words. A dated
-    # headline ("2026-08-01: launch raised $5M in Series A") has one number and prose.
-    if nums >= 2 or (nums == 1 and words <= 3):
+    # `bearish=0.05, bullish=0.38` → 2 numbers, 2 words; `| 0.05 |` → 1 number, 0 words. A
+    # dated headline ("2026-08-01: ETF inflows hit $1.2B, 3rd largest day") is prose.
+    if nums >= 1 and words <= max(3, nums + 1):
         return m.group(1)
     return None
 
@@ -179,49 +175,36 @@ def series_runs(md: str, min_rows: int = MIN_SERIES_ROWS) -> list[tuple[int, int
 
 def series_row_count(md: str, start: int, end: int) -> int:
     """Data rows inside a run (blank lines excluded)."""
-    return sum(1 for l in md.splitlines()[start:end] if _series_row_ts(l) is not None)
-
-
-def _fmt_num(v: float) -> str:
-    a = abs(v)
-    if a >= 1000:
-        return f"{v:,.0f}"
-    if a >= 1:
-        return f"{v:.2f}".rstrip("0").rstrip(".")
-    return f"{v:.4g}"
+    return sum(1 for ln in md.splitlines()[start:end] if _series_row_ts(ln) is not None)
 
 
 def _run_summary(rows: list[str]) -> str:
-    """One sentence of statistics over a run's first value column — the collapse keeps the
-    information the rows carried, not the rows. '' when the rows carry no consistent value."""
-    data = [(t, v) for t, v in ((_series_row_ts(l), _row_value(l)) for l in rows)
+    """Statistics over a run's first value column; '' when fewer than 2 rows carry one."""
+    data = [(t, v) for t, v in ((_series_row_ts(ln), _row_value(ln)) for ln in rows)
             if t is not None and v is not None]
     if len(data) < 2:
         return ""
     vals = [v for _, v in data]
     imin = min(range(len(vals)), key=vals.__getitem__)
     imax = max(range(len(vals)), key=vals.__getitem__)
-    multi = any(len(_NUM.findall(_SERIES_ROW.match(l).group("rest"))) > 1
-                for l in rows if _series_row_ts(l) is not None)
+    multi = any(len(_NUM.findall(_SERIES_ROW.match(ln).group("rest"))) > 1
+                for ln in rows if _series_row_ts(ln) is not None)
     col = "first value column" if multi else "values"
-    return (f" Summary of the {col}: first {_fmt_num(vals[0])}, last {_fmt_num(vals[-1])}, "
-            f"min {_fmt_num(vals[imin])} at {data[imin][0]}, max {_fmt_num(vals[imax])} at "
-            f"{data[imax][0]}, mean {_fmt_num(statistics.fmean(vals))}.")
+    return (f" Summary of the {col}: first {fmt_num(vals[0])}, last {fmt_num(vals[-1])}, "
+            f"min {fmt_num(vals[imin])} at {data[imin][0]}, max {fmt_num(vals[imax])} at "
+            f"{data[imax][0]}, mean {fmt_num(statistics.fmean(vals))}.")
 
 
 def collapse_series(md: str) -> str:
-    """Last-mile fallback: replace every raw series run with ONE line saying what was
-    dropped, plus the statistics the rows carried. Idempotent (the replacement is not itself
-    a series row). Normally the quality gate has already made the model rewrite the series as
-    a summary; this fires — on the live `submit_report` emit and on the persisted report —
-    when the rewrite still shipped the rows."""
+    """Replace every raw series run with one line saying what was dropped plus its
+    statistics. Idempotent."""
     runs = series_runs(md or "")
     if not runs:
         return md
     lines = md.splitlines(keepends=True)
     for start, end, first, last in reversed(runs):
-        rows = [l.rstrip("\n") for l in lines[start:end]]
-        n = sum(1 for l in rows if _series_row_ts(l) is not None)
+        rows = [ln.rstrip("\n") for ln in lines[start:end]]
+        n = sum(1 for ln in rows if _series_row_ts(ln) is not None)
         note = (f"*(Raw series of {n} timestamped rows, {first} to {last}, omitted — a report "
                 f"describes a series, it never lists it.{_run_summary(rows)})*\n")
         lines[start:end] = [note]

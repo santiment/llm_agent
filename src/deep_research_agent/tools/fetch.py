@@ -1,21 +1,10 @@
-"""Full-page web fetch — a report should not cite a page seen only as a snippet.
+"""``web_fetch``: one URL → its readable text (HTML converted with the stdlib parser,
+JSON/text passed through). Registered through ``events.instrument_tool`` like every data
+tool, so an oversized page offloads to the sandbox instead of flooding context.
 
-``web_search`` returns ~600-char snippets; when the substance of a page matters
-(methodology, exact figures, a table), the model needs the page itself. This
-tool fetches ONE url and returns its readable text — HTML converted to
-markdown-ish plain text with a stdlib parser (no bs4 dependency), JSON/text
-passed through.
-
-Registered through ``events.instrument_tool`` like every data tool (agent.py),
-so a page bigger than ``max_result_chars`` is OFFLOADED to the sandbox
-filesystem and only a stub enters context — the crush "spill to file" behavior,
-reusing the machinery that already exists here.
-
-SSRF policy — ``config.url_blocked`` with ``allow_private=False``, the strict end
-of the shared vetting, because the URL here is MODEL-supplied (from arbitrary web
-content), not operator-supplied. Applied to the initial URL and every redirect
-hop. The residual DNS-rebinding gap is documented on ``url_blocked``; the
-sandbox/network posture is the second fence.
+SSRF policy is ``config.url_blocked`` with ``allow_private=False`` — the URL is
+model-supplied. Redirects are followed by hand so every hop is vetted BEFORE it is
+requested. A DNS name resolving to a private address is the documented residual gap.
 """
 
 from __future__ import annotations
@@ -30,7 +19,8 @@ from langchain_core.tools import StructuredTool
 from ..config import ResearchConfig, url_blocked
 from ..events import source_events
 
-MAX_FETCH_BYTES = 2_000_000  # stop reading the body past this; enough for any article
+MAX_FETCH_BYTES = 2_000_000
+MAX_REDIRECTS = 5
 _UA = "Mozilla/5.0 (compatible; deep-research-agent/1.0)"
 
 _TEXT_CTYPES = {"application/json", "application/xml", "application/xhtml+xml"}
@@ -38,11 +28,10 @@ _HTML_CTYPES = {"text/html", "application/xhtml+xml"}
 
 
 def fetch_url_blocked(url: str) -> str | None:
-    """Reason this URL must not be fetched, or ``None`` when it is fine."""
     return url_blocked(url, allow_private=False)
 
 
-# --- HTML → readable text (stdlib only) --------------------------------------
+# --- HTML → readable text --------------------------------------------------------
 
 _DROP = {"script", "style", "noscript", "template", "svg", "iframe"}
 _BLOCK = {"p", "div", "section", "article", "header", "footer", "main", "aside",
@@ -92,7 +81,7 @@ class _HTMLToText(HTMLParser):
             href = self._href
             self._href = None
             if text:
-                # Absolute links only — the model needs citable URLs, not /relative paths.
+                # Absolute links only — the model needs citable URLs.
                 keep = href.startswith(("http://", "https://")) and href != text
                 self.parts.append(f"{text} ({href})" if keep else text)
         elif tag in _HEADINGS or tag in _BLOCK:
@@ -115,66 +104,64 @@ def html_to_text(html: str) -> tuple[str, str]:
     try:
         parser.feed(html)
         parser.close()
-    except Exception:  # noqa: BLE001 — a malformed page must degrade, not raise
+    except Exception:  # noqa: BLE001 — a malformed page degrades, never raises
         pass
     text = "".join(parser.parts)
-    text = re.sub(r"[ \t\r\f\v]+", " ", text)          # collapse runs of spaces
-    text = re.sub(r" ?\n ?", "\n", text)               # trim space around breaks
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()     # at most one blank line
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r" ?\n ?", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return parser.title.strip(), text
 
 
-# --- the tool -----------------------------------------------------------------
+# --- the tool ----------------------------------------------------------------------
+
+def _refuse(reason: str) -> RuntimeError:
+    return RuntimeError(f"[permanent] Fetch refused ({reason}) — this URL cannot be fetched.")
+
 
 def build_fetch_tool(cfg: ResearchConfig) -> StructuredTool:
-    # ONE client for the whole run (connection pooling across fetches), created lazily
-    # on the first call so it binds to the running event loop. Never closed explicitly:
-    # its lifetime IS the run's process/loop lifetime, and httpx cleans up at GC.
-    client: httpx.AsyncClient | None = None
+    # One client per run for connection pooling; httpx cleans it up at GC. Redirects are
+    # followed manually so each Location is vetted before it is requested.
+    client = httpx.AsyncClient(follow_redirects=False, timeout=cfg.request_timeout,
+                               headers={"User-Agent": _UA})
 
     async def web_fetch(url: str) -> str:
-        # Failures RAISE tagged errors so instrument_tool (agent.py wires it) counts
-        # them as failures, memoizes [permanent] ones per-args, and converts them to
-        # model-facing text — string returns here would meter every failure as ok=True.
-        nonlocal client
+        # Failures RAISE tagged errors: instrument_tool meters them as failures, memoizes
+        # [permanent] ones per-args and turns them into model-facing text.
         blocked = fetch_url_blocked(url)
         if blocked:
-            raise RuntimeError(f"[permanent] Fetch refused ({blocked}) — this URL "
-                               "cannot be fetched.")
-        if client is None:
-            client = httpx.AsyncClient(
-                follow_redirects=True, timeout=cfg.request_timeout,
-                headers={"User-Agent": _UA})
+            raise _refuse(blocked)
         try:
-            async with client.stream("GET", url) as resp:
-                # Vet every hop — a public page redirecting to 169.254.… is the
-                # classic SSRF laundering move.
-                for r in (*resp.history, resp):
-                    hop = fetch_url_blocked(str(r.url))
-                    if hop:
-                        raise RuntimeError(f"[permanent] Fetch refused after "
-                                           f"redirect ({hop}).")
-                if resp.status_code >= 400:
-                    tag = ("transient" if resp.status_code in (408, 429)
-                           or resp.status_code >= 500 else "permanent")
-                    raise RuntimeError(f"[{tag}] Fetch failed: HTTP "
-                                       f"{resp.status_code} for {url}.")
-                ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
-                if ctype and not ctype.startswith("text/") and ctype not in _TEXT_CTYPES:
-                    raise RuntimeError(f"[permanent] Fetch skipped: content type "
-                                       f"{ctype!r} is not readable text (only HTML / "
-                                       "text / JSON pages can be fetched).")
-                buf = bytearray()
-                truncated = False
-                async for chunk in resp.aiter_bytes():
-                    buf += chunk
-                    if len(buf) >= MAX_FETCH_BYTES:
-                        truncated = True
-                        break
-                enc = resp.encoding or "utf-8"  # header-derived; read inside the stream
+            for hop in range(MAX_REDIRECTS + 1):
+                async with client.stream("GET", url) as resp:
+                    if resp.next_request is not None:
+                        if hop == MAX_REDIRECTS:
+                            raise RuntimeError("[permanent] Fetch failed: too many redirects.")
+                        url = str(resp.next_request.url)
+                        blocked = fetch_url_blocked(url)
+                        if blocked:
+                            raise RuntimeError(f"[permanent] Fetch refused after redirect ({blocked}).")
+                        continue
+                    if resp.status_code >= 400:
+                        tag = ("transient" if resp.status_code in (408, 429)
+                               or resp.status_code >= 500 else "permanent")
+                        raise RuntimeError(f"[{tag}] Fetch failed: HTTP {resp.status_code} for {url}.")
+                    ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+                    if ctype and not ctype.startswith("text/") and ctype not in _TEXT_CTYPES:
+                        raise RuntimeError(f"[permanent] Fetch skipped: content type {ctype!r} is "
+                                           "not readable text (only HTML / text / JSON pages can "
+                                           "be fetched).")
+                    buf = bytearray()
+                    truncated = False
+                    async for chunk in resp.aiter_bytes():
+                        buf += chunk
+                        if len(buf) >= MAX_FETCH_BYTES:
+                            truncated = True
+                            break
+                    enc = resp.encoding or "utf-8"
+                    break
         except httpx.HTTPError as exc:
-            raise RuntimeError(f"[transient] Fetch failed "
-                               f"({type(exc).__name__}): {exc}") from exc
+            raise RuntimeError(f"[transient] Fetch failed ({type(exc).__name__}): {exc}") from exc
 
         def _decode_and_extract() -> tuple[str, str]:
             body = bytes(buf[:MAX_FETCH_BYTES]).decode(enc, errors="replace")
@@ -182,8 +169,7 @@ def build_fetch_tool(cfg: ResearchConfig) -> StructuredTool:
                 return html_to_text(body)
             return "", body
 
-        # Decode + parse of a 2MB page is 100s of ms of pure CPU — off the shared
-        # event loop (same rule as the offload machinery in events.py).
+        # Decoding + parsing a 2 MB page is CPU-bound; keep it off the event loop.
         title, text = await asyncio.to_thread(_decode_and_extract)
         if not text.strip():
             return f"Fetched {url} but found no readable text on the page."

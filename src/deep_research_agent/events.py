@@ -98,16 +98,11 @@ EVENT_SCHEMAS: dict[str, frozenset[str]] = {
     "subagent_findings": frozenset({"unit", "summary", "findings", "gaps"}),
 }
 
-# Every ``state`` a status event may carry — the docstring enumeration, as code.
-# A consumer switch()es on these; an unlisted state renders as nothing, so adding
-# one without registering it here is the same drift EVENT_SCHEMAS guards against.
+# Every ``state`` a status event may carry; ``_check_shape`` warns on an unregistered one.
 STATUS_STATES = frozenset({
     "mcp_ready", "mcp_error", "budget_soft", "budget_halt", "revising",
     "compacting", "compacted", "loop_detected", "loop_halt", "done", "error",
-    # A sub-agent run began / ended: ``role`` (research-subagent | extract-subagent) and
-    # ``model`` say WHICH agent ran on WHAT model — the only live signal that the cheap
-    # utility model is doing the reading (the end-of-run ``usage`` rollup comes too late).
-    "subagent_start", "subagent_done",
+    "subagent_start", "subagent_done",  # carry ``role`` + ``model``
 })
 
 
@@ -294,10 +289,9 @@ def _offload_result(
     """Persist a large tool result to a file in the sandbox and return a compact stub
     the model can act on, INSTEAD of truncating and discarding rows.
 
-    ``series`` — the result's time series (``series.find_series``), when the caller already
-    detected them; computed here otherwise. A result holding a series gets the SERIES stub:
-    the file path plus a computed summary per series (span, first/last, min/max with when,
-    mean, direction) and the rule that rows are never listed — the model never sees a row.
+    ``series`` — the result's time series (``series.find_series``) if the caller already
+    detected them; computed here otherwise. A series result gets a stub with the file path
+    and a computed summary instead of any rows.
 
     The full result lands at ``{offload_dir}/{tool}-{call_id}.json`` inside the
     container's persistent /workspace; the stub carries the path, row count, column
@@ -483,12 +477,11 @@ def instrument_tool(
                 or (max_result_chars and raw_bytes > max_result_chars)
             )
             capped: str | None = None
-            # A TIME SERIES leaves the context whatever its size: shown the rows, the model
-            # transcribes them into a date/value table (the live failure). Detection parses
-            # JSON, so it runs off the loop; a too-big result is offloaded regardless and
-            # `_offload_result` detects the series itself for the stub.
+            # A time series leaves the context whatever its size (shown the rows, the model
+            # transcribes them into a table). A too-big result is offloaded regardless and
+            # `_offload_result` detects the series itself.
             series: dict = {}
-            if not too_big and raw_bytes <= MAX_SCAN_BYTES:
+            if not too_big:
                 series = await asyncio.to_thread(find_series, result)
             # Prefer OFFLOAD to a sandbox file over truncation: keeps the full data
             # available (the model reads it back with `execute`) instead of dropping rows.
@@ -505,8 +498,7 @@ def instrument_tool(
                     log.info("RESULT OFFLOADED (%s): %s [raw: %d bytes, rows=%s]",
                              tool.name, note, raw_bytes, raw_rows)
             elif series and isinstance(result, str):
-                # No sandbox to offload to: the rows stay, but the summary leads and the
-                # rule is stated, so the model has the numbers it needs without the table.
+                # No sandbox: the rows stay, but the summary and the rule lead.
                 result = (f"[Time series. {SERIES_RULE}]\nsummary:\n{summary_block(series)}"
                           f"\n\n{result}")
             if capped is None:
