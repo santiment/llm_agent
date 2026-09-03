@@ -1,5 +1,6 @@
 """extract-subagent wiring: registered only when offloading is live, runs on
-cfg.utility_model with no data tools, and returns the gated findings format."""
+cfg.utility_model with no data tools, and returns the gated findings format. The
+coding-subagent that shares the sandbox-only path is covered in test_coding_subagent.py."""
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.subagents import SubAgentMiddleware
 
 import deep_research_agent.agent as agent_mod
+from deep_research_agent.config import DEFAULT_MODEL_TIER, MODEL_TIERS
 from deep_research_agent.findings_gate import SubagentFindingsMiddleware
 from deep_research_agent.prompts import extract_prompt
 
@@ -49,10 +51,11 @@ def test_extract_subagent_wired_when_offloading(monkeypatch) -> None:
     captured = _make_graph(monkeypatch, config)
 
     specs = {s["name"]: s for s in captured["subagents"]}
-    assert set(specs) == {"research-subagent", "extract-subagent"}
+    assert set(specs) == {"research-subagent", "extract-subagent", "coding-subagent"}
 
     extract = specs["extract-subagent"]
-    assert extract["model"].model_name != specs["research-subagent"]["model"].model_name
+    # Runs on the utility slot (which a tier MAY point at the same slug as the fleet).
+    assert extract["model"].model_name == MODEL_TIERS[DEFAULT_MODEL_TIER]["utility_model"]
     assert list(extract["tools"]) == []
     assert any(isinstance(m, SubagentFindingsMiddleware) for m in extract["middleware"])
     assert "RETURN FORMAT" in extract["system_prompt"]
@@ -66,7 +69,7 @@ def test_extract_subagent_uses_utility_model(monkeypatch) -> None:
     captured = _make_graph(monkeypatch, config)
 
     extract = next(s for s in captured["subagents"] if s["name"] == "extract-subagent")
-    assert extract["model"].model_name == "qwen/qwen3-30b-a3b-instruct-2507"
+    assert extract["model"].model_name == MODEL_TIERS["extra-low"]["utility_model"]
 
 
 def test_extract_subagent_disabled_when_offload_off(monkeypatch) -> None:
@@ -76,7 +79,8 @@ def test_extract_subagent_disabled_when_offload_off(monkeypatch) -> None:
     config["configurable"]["offload_results"] = False
     captured = _make_graph(monkeypatch, config)
     names = [s["name"] for s in captured["subagents"]]
-    assert names == ["research-subagent"]
+    assert "extract-subagent" not in names
+    assert names[0] == "research-subagent"  # the coding-subagent needs only the sandbox
 
 
 def test_research_subagent_delegates_to_extract(monkeypatch) -> None:
@@ -89,9 +93,9 @@ def test_research_subagent_delegates_to_extract(monkeypatch) -> None:
     research = next(s for s in captured["subagents"] if s["name"] == "research-subagent")
     task_mws = [m for m in research["middleware"] if isinstance(m, SubAgentMiddleware)]
     assert len(task_mws) == 1
-    assert task_mws[0].subagent_names == frozenset({"extract-subagent"})
+    assert task_mws[0].subagent_names == frozenset({"extract-subagent", "coding-subagent"})
     # Nested spec must carry its own filesystem stack (no default stack on this path).
-    nested = task_mws[0]._subagents[0]
+    nested = next(s for s in task_mws[0]._subagents if s["name"] == "extract-subagent")
     assert any(isinstance(m, FilesystemMiddleware) for m in nested["middleware"])
     assert any(isinstance(m, SubagentFindingsMiddleware) for m in nested["middleware"])
 
@@ -126,7 +130,8 @@ def test_orchestrator_holds_no_data_tools(monkeypatch) -> None:
 def test_extract_prompt_contract() -> None:
     prompt = extract_prompt()
     assert "RETURN FORMAT" in prompt
-    assert "<<" not in prompt
+    # No unfilled slot markers (the heredoc hint legitimately contains `<<`).
+    assert "<<MCP_TOOLS>>" not in prompt and "<<DOMAIN>>" not in prompt
     assert "NO data tools" in prompt
 
 
@@ -160,7 +165,7 @@ def test_extract_subagent_hides_everything_but_execute(monkeypatch) -> None:
 
     research = next(s for s in captured["subagents"] if s["name"] == "research-subagent")
     task_mw = next(m for m in research["middleware"] if isinstance(m, SubAgentMiddleware))
-    nested_mw = task_mw._subagents[0]["middleware"]
+    nested_mw = next(s for s in task_mw._subagents if s["name"] == "extract-subagent")["middleware"]
     fs_idx = next(i for i, m in enumerate(nested_mw) if isinstance(m, FilesystemMiddleware))
     filt_idx = next(i for i, m in enumerate(nested_mw) if isinstance(m, ExcludeToolsMiddleware))
     assert fs_idx < filt_idx

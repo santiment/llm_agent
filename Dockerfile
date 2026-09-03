@@ -36,6 +36,9 @@ COPY tests ./tests
 # The suite asserts the checkout-default content dirs resolve (test_domain_prompt's
 # test_repo_dir_resolves_in_checkout) — mirror the checkout layout.
 COPY skills ./skills
+# Tests for deployment-provided tools load the checked-out plugin module directly.
+# Keep the test image's runtime assets aligned with the production image.
+COPY custom_tools ./custom_tools
 # The build stage never puts the venv on PATH (uv addresses it directly);
 # pytest needs it.
 ENV PATH="/app/.venv/bin:$PATH"

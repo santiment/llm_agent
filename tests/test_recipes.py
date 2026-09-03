@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import math
 import random
 import sys
 from datetime import datetime, timedelta, timezone
@@ -235,18 +234,18 @@ def test_context_and_verdict(data):
 
 def test_price_levels_counts_voices_not_bot_prints(data):
     out = R.price_levels(data["messages"], PX)
-    levels = {l["level"]: l for l in out}
-    assert [l["level"] for l in out[:3]] == [58000, 68000, 62000]        # ranked by voices
+    levels = {lvl["level"]: lvl for lvl in out}
+    assert [lvl["level"] for lvl in out[:3]] == [58000, 68000, 62000]        # ranked by voices
     assert levels[58000]["voices"] == 30 and levels[58000]["side"] == "below"
     assert levels[68000]["voices"] == 20 and levels[68000]["side"] == "above"
     # 10 people typed "62k"; the price bot's 85 prints in the same bin are ONE voice and do not
     # drag the reported level away from what the people typed
     assert levels[62000]["voices"] == 11 and levels[62000]["msgs"] == 95
-    bot_bins = [l for l in out if l["voices"] == 1]
-    assert bot_bins and all(l["side"] in {"at", "above"} for l in bot_bins)
+    bot_bins = [lvl for lvl in out if lvl["voices"] == 1]
+    assert bot_bins and all(lvl["side"] in {"at", "above"} for lvl in bot_bins)
     # bare texts: one voice per text
     plain = R.price_levels(["support 58000", "58,000 holds", "target $68k"], PX)
-    assert [(l["level"], l["voices"], l["msgs"]) for l in plain] == [(58000, 2, 2), (68000, 1, 1)]
+    assert [(lvl["level"], lvl["voices"], lvl["msgs"]) for lvl in plain] == [(58000, 2, 2), (68000, 1, 1)]
     assert R.price_levels(["100% sure 5x from here, call 555-0100, 2024 was wild"], PX) == []
     with pytest.raises(ValueError):
         R.price_levels(["x"], 0)
@@ -373,17 +372,17 @@ def test_question_ratio(data):
 
 def test_sanity_flags(data):
     lines = R.sanity(data)
-    assert any(l.startswith("OK total_matching=7600") for l in lines)
-    assert any("OK by_source" in l for l in lines) and any("OK volume_curve" in l for l in lines)
-    assert any("OK random stratum n=1000" in l for l in lines)
-    assert not any("FLAG" in l for l in lines)
+    assert any(line.startswith("OK total_matching=7600") for line in lines)
+    assert any("OK by_source" in line for line in lines) and any("OK volume_curve" in line for line in lines)
+    assert any("OK random stratum n=1000" in line for line in lines)
+    assert not any("FLAG" in line for line in lines)
     broken = {"stats": {"total_matching": 100, "sampled": 5, "unique_after_dedup": 200,
                         "by_source": {"a": 10}, "volume_curve": [{"count": 50}]},
               "messages": [{"text": "x"}] * 3}
-    flags = [l for l in R.sanity(broken) if l.startswith("FLAG")]
+    flags = [line for line in R.sanity(broken) if line.startswith("FLAG")]
     assert len(flags) >= 5 and any("LOW-N" in f for f in flags) and any("!= stats.sampled" in f for f in flags)
-    assert any(l.startswith("NOTE") and "user" in l for l in R.sanity(broken))
-    assert any("NO crowd data" in l for l in R.sanity({"stats": {"total_matching": 0}, "messages": []}))
+    assert any(line.startswith("NOTE") and "user" in line for line in R.sanity(broken))
+    assert any("NO crowd data" in line for line in R.sanity({"stats": {"total_matching": 0}, "messages": []}))
 
 
 def test_card_runs_every_local_recipe_and_leaks_no_text(data):
@@ -400,3 +399,49 @@ def test_card_runs_every_local_recipe_and_leaks_no_text(data):
     organic_texts = [m["text"] for m in data["messages"] if m["user"].startswith("org_")]
     assert not any(t[:60] in text for t in organic_texts)
     assert len(text) < 6000
+
+
+# ------------------------------------------------- review fixes: bounds, unknowns, ends ---
+
+def test_extreme_respects_spike_end_for_a_past_window():
+    rng = random.Random(2)
+    base = [{"datetime": _iso(T0 - timedelta(days=60 - i)), "value": 10 + rng.random()} for i in range(60)]
+    spike = [{"datetime": _iso(T0 + timedelta(hours=h)), "value": 50} for h in range(24)]
+    after = [{"datetime": _iso(T0 + timedelta(days=1 + i)), "value": 10} for i in range(30)]   # calm days after
+    series = base + spike + after
+    polluted = R.extreme(series, T0)                              # window runs to the end: mean diluted
+    clean = R.extreme(series, T0, spike_end=T0 + timedelta(days=1))
+    assert clean["n_window"] == 24 and clean["window"] == 50 and clean["pct"] == 100
+    assert polluted["n_window"] == 54 and polluted["window"] < clean["window"]
+    assert clean["n_base"] == 60                                   # the days after never enter the baseline
+    with pytest.raises(ValueError):
+        R.extreme(series, T0, spike_end=T0)
+    with pytest.raises(ValueError):
+        R.extreme(series, T0, spike_end="nope")
+    assert "note" in R.extreme(spike, T0)                          # unbaselined says what it needs
+
+
+def test_unknown_accounts_never_read_as_a_three_account_push():
+    # 300 identical posts with NO user field: accounts unknown, not "one account"
+    rows = [{"text": "same coordinated message about the coin going up", "stratum": "random"}] * 300
+    rows += [{"text": " ".join(f"w{i}{j}" for j in range(8)), "stratum": "random"} for i in range(100)]
+    rep = R.dedup_report(rows)
+    top = rep["top_clusters"][0]
+    assert top["users"] == 0 and top["kind"] == "repeated (accounts unknown)"
+    verdict, rule = R.organic_verdict(rep, {})
+    assert verdict == "manufactured" and "account(s)" not in rule      # fired on organic_share, not on accounts
+
+
+def test_price_levels_defaults_are_report_sized(data):
+    out = R.price_levels(data["messages"], PX)
+    assert len(out) <= 6
+    assert all(isinstance(lvl["level"], int) for lvl in out)           # BTC-sized: whole dollars
+    small = R.price_levels(["support at 0.58", "0.58 holds", "target 0.72"], 0.6)
+    assert [(lvl["level"], lvl["voices"]) for lvl in small] == [(0.58, 2), (0.72, 1)]
+
+
+def test_context_does_not_trust_top_channels_order():
+    stats = {"total_matching": 1000,
+             "top_channels": [{"unit": "a", "count": 10}, {"unit": "b", "count": 500},
+                              {"unit": "c", "count": 200}, {"unit": "d", "count": 100}]}
+    assert R.context(stats)["chan_conc"] == 80

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from itertools import islice
 from typing import Any
 
@@ -55,6 +56,18 @@ _BOUNCE = (
     "Fix ONLY these problems and resend your COMPLETE findings as one JSON object in "
     "the RETURN FORMAT from your instructions. Do not alter any finding, number, or "
     "source you already gathered."
+)
+
+
+# A "source" that names WHERE a number came from instead of WHOSE data it is: a sandbox
+# path, a result-file name, or a function call ("R.price_levels(d) on /workspace/data/…").
+# Copied verbatim into the report by the orchestrator, so it is caught at the handoff.
+_BAD_SOURCE = re.compile(
+    r"/workspace|/skills|/large_tool_results"
+    r"|(?<![\w/.:])[\w\-]+\.(?:json|py|csv|parquet)\b"
+    r"|\b[A-Za-z_]\w*\.[a-z_]+\([^()\n]*\)"
+    r"|\boffloaded?\b|\bexecute\b",
+    re.IGNORECASE,
 )
 
 
@@ -126,9 +139,16 @@ def _problems(obj: dict | None) -> list[str]:
                 continue
             if not str(f.get("finding") or "").strip():
                 problems.append(f'findings[{i}] is missing "finding"')
-            if not str(f.get("source") or "").strip():
+            src = str(f.get("source") or "").strip()
+            if not src:
                 problems.append(
                     f'findings[{i}] is missing "source" — every finding must be attributed')
+            elif not src.lower().startswith(("http://", "https://")) and _BAD_SOURCE.search(src):
+                problems.append(
+                    f'findings[{i}] "source" names a file, path or function ({src[:60]!r}) — the '
+                    "source is the LABEL of the data source the file came from (as listed under "
+                    "DATA SOURCES, or the label in your task) or a URL; never a path, tool, "
+                    "recipe or file name")
             if series_runs(str(f.get("evidence") or "")):
                 problems.append(
                     f'findings[{i}] "evidence" transcribes a raw time series — summarize it '

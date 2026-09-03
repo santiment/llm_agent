@@ -13,13 +13,8 @@ from __future__ import annotations
 
 import asyncio
 
-from pydantic import BaseModel
-
 from deep_research_agent.events import instrument_tool
-
-
-class _EmptyArgs(BaseModel):
-    pass
+from conftest import FakeTool
 
 
 def _expect_tool_error(make_coro) -> str:
@@ -29,19 +24,6 @@ def _expect_tool_error(make_coro) -> str:
     result = asyncio.run(make_coro())
     assert isinstance(result, str) and result.startswith("TOOL ERROR"), result
     return result
-
-
-class _FakeTool:
-    """Minimal stand-in exposing only what ``instrument_tool`` reads."""
-
-    def __init__(self, behavior):
-        self.name = "fake_mcp_tool"
-        self.description = "fake"
-        self.args_schema = _EmptyArgs
-        self._behavior = behavior
-
-    async def ainvoke(self, _kwargs):
-        return await self._behavior()
 
 
 def test_semaphore_caps_concurrency() -> None:
@@ -60,7 +42,7 @@ def test_semaphore_caps_concurrency() -> None:
         live -= 1
         return "ok"
 
-    wrapped = instrument_tool(_FakeTool(behavior), kind="mcp", semaphore=gate)
+    wrapped = instrument_tool(FakeTool(behavior), kind="mcp", semaphore=gate)
 
     async def drive():
         await asyncio.gather(*(wrapped.ainvoke({}) for _ in range(20)))
@@ -82,7 +64,7 @@ def test_waits_then_succeeds_on_rate_limit() -> None:
         return "recovered"
 
     wrapped = instrument_tool(
-        _FakeTool(behavior), kind="mcp", rate_limit_max_wait=60.0, base_delay=0.0
+        FakeTool(behavior), kind="mcp", rate_limit_max_wait=60.0, base_delay=0.0
     )
     result = asyncio.run(wrapped.ainvoke({}))
     assert result == "recovered"
@@ -101,7 +83,7 @@ def test_rate_limit_gives_up_after_budget() -> None:
 
     # delays 0.01, 0.02, 0.04 → waits 0.01 then 0.03; next would hit 0.07 > 0.05 → gives up.
     wrapped = instrument_tool(
-        _FakeTool(behavior), kind="mcp", rate_limit_max_wait=0.05, base_delay=0.01
+        FakeTool(behavior), kind="mcp", rate_limit_max_wait=0.05, base_delay=0.01
     )
     _expect_tool_error(lambda: wrapped.ainvoke({}))
 
@@ -117,7 +99,7 @@ def test_non_rate_limit_error_is_not_retried() -> None:
         raise RuntimeError("connection refused")
 
     wrapped = instrument_tool(
-        _FakeTool(behavior), kind="mcp", rate_limit_max_wait=60.0, base_delay=0.0
+        FakeTool(behavior), kind="mcp", rate_limit_max_wait=60.0, base_delay=0.0
     )
     result = _expect_tool_error(lambda: wrapped.ainvoke({}))
     assert calls == 1, f"non-rate-limit error must not retry, got {calls} calls"

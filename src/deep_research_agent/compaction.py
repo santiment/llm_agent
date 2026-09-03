@@ -2,7 +2,7 @@
 
 When the estimated size of the next model call crosses ``trigger_tokens`` (absolute, since an
 OpenRouter slug does not expose its window; 0 disables), everything before a recent tail is
-summarized on the utility model and the history becomes ``[summary, anchor, tail]``. The
+summarized on the tier's compaction model and the history becomes ``[summary, anchor, tail]``. The
 summary is a HumanMessage tagged ``COMPACTION_SUMMARY_NAME`` placed BEFORE the turn's anchor
 (the real user message), so ``current_turn()`` keeps working. The dropped tool calls/tokens
 are kept in state keyed to the anchor id (``compacted_counts``) so budget/metering still see
@@ -85,10 +85,12 @@ def compacted_counts(state: dict) -> tuple[int, int]:
     return int(state.get("compacted_tool_calls") or 0), int(state.get("compacted_tokens") or 0)
 
 
-def turn_spend(state: dict) -> tuple[int, int]:
+def turn_spend(state: dict, turn: list | None = None) -> tuple[int, int]:
     """The turn's real ``(tool_calls, tokens)``: transcript plus compacted-away spend.
-    The one accessor budget.py and citations.py read."""
-    turn = current_turn(state.get("messages") or [])
+    The one accessor budget.py and citations.py read; they pass the ``current_turn`` slice
+    they already hold so the messages are not walked twice."""
+    if turn is None:
+        turn = current_turn(state.get("messages") or [])
     compacted_calls, compacted_tokens = compacted_counts(state)
     return tool_calls_in(turn) + compacted_calls, tokens_in(turn) + compacted_tokens
 

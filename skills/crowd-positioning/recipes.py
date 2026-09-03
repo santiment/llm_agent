@@ -46,7 +46,11 @@ __all__ = [
 
 def load(path_or_obj):
     """Read the offloaded `social_messages` file (or accept the parsed object) -> {stats, messages}."""
-    d = json.load(open(path_or_obj)) if isinstance(path_or_obj, str) else path_or_obj
+    if isinstance(path_or_obj, str):
+        with open(path_or_obj) as fh:
+            d = json.load(fh)
+    else:
+        d = path_or_obj
     if isinstance(d, list):
         return {"stats": {}, "messages": d}
     if not isinstance(d, dict) or "messages" not in d:
@@ -248,7 +252,10 @@ def describe(raw, slug=None):
     third = max(1, n // 3)
     head, tail = mean(vals[:third]), mean(vals[-third:])
     rel = (tail - head) / abs(head) if head else 0.0
-    when = lambda i: s[i][0].strftime("%Y-%m-%dT%H:%M")
+
+    def when(i):
+        return s[i][0].strftime("%Y-%m-%dT%H:%M")
+
     d = {"n": n, "start": when(0), "end": when(n - 1), "first": vals[0], "last": vals[-1],
          "change_pct": round((vals[-1] - vals[0]) / abs(vals[0]) * 100, 1) if vals[0] else None,
          "min": vals[imin], "min_at": when(imin), "max": vals[imax], "max_at": when(imax),
@@ -259,17 +266,26 @@ def describe(raw, slug=None):
     return d
 
 
-def extreme(raw, spike_start, agg="mean"):
-    """Rank the spike window (rows at/after spike_start) against the trailing baseline of the
-    same series: percentile + z-score. agg="max" ranks the window's peak instead of its mean."""
+def extreme(raw, spike_start, spike_end=None, agg="mean"):
+    """Rank the spike window (rows from spike_start up to spike_end, exclusive; to the end of
+    the series when spike_end is None) against the TRAILING baseline — the rows before
+    spike_start. Rows after spike_end are ignored: a past spike is ranked against what came
+    before it, never against what followed. Returns percentile + z-score; agg="max" ranks the
+    window's peak instead of its mean."""
     cut = parse_ts(spike_start)
     if cut is None:
         raise ValueError(f"unparseable spike_start: {spike_start!r}")
+    end = parse_ts(spike_end) if spike_end is not None else None
+    if spike_end is not None and end is None:
+        raise ValueError(f"unparseable spike_end: {spike_end!r}")
+    if end is not None and end <= cut:
+        raise ValueError("spike_end must be after spike_start")
     s = to_series(raw)
-    win = [v for t, v in s if t >= cut]
+    win = [v for t, v in s if t >= cut and (end is None or t < end)]
     base = [v for t, v in s if t < cut]
     if not win or len(base) < 3:
-        return {"unbaselined": True, "n_window": len(win), "n_base": len(base)}
+        return {"unbaselined": True, "n_window": len(win), "n_base": len(base),
+                "note": "need >= 3 baseline points before spike_start and >= 1 inside the window"}
     wv = max(win) if agg == "max" else mean(win)
     bm, sd = mean(base), pstdev(base)
     pct = 100.0 * sum(1 for b in base if b < wv) / len(base)
@@ -373,6 +389,8 @@ def dedup_report(msgs, top=5):
 def _cluster_kind(posts, users, channels, total):
     if posts < 3:
         return "single post"
+    if users == 0:                      # rows carry no user field: accounts unknown
+        return "repeated (accounts unknown)"
     if users == 1:
         return "single-account bot"
     if (users <= 3 or channels <= 2) and (posts >= 100 or (total and posts / total >= 0.05)):
@@ -382,20 +400,30 @@ def _cluster_kind(posts, users, channels, total):
     return "repeated"
 
 
+def _trend(counts):
+    """rising / fading / flat from the last third of the buckets vs the first third; unknown
+    below 2 buckets."""
+    if len(counts) < 2:
+        return "unknown"
+    third = max(1, len(counts) // 3)
+    first, last = mean(counts[:third]), mean(counts[-third:])
+    return "rising" if last > first * 1.2 else "fading" if last < first * 0.8 else "flat"
+
+
+def _msg_ts(m):
+    """A message's timestamp under whichever field name its source used."""
+    return parse_ts(m.get("ts") or m.get("datetime") or m.get("timestamp"))
+
+
 def context(stats):
     """Population-side context from the stats block: exact-text upper bound, top-3 room
     concentration, first-third vs last-third acceleration."""
     stats = stats or {}
     tm, ud = _f(stats.get("total_matching")), _f(stats.get("unique_after_dedup"))
     tc = stats.get("top_channels") or []
-    top3 = sum(_f(c.get("count")) or 0 for c in tc[:3] if isinstance(c, dict))
-    counts = [c for _, c in _curve(stats.get("volume_curve"))]
-    if len(counts) >= 2:
-        n = max(1, len(counts) // 3)
-        first, last = mean(counts[:n]), mean(counts[-n:])
-        trend = "rising" if last > first * 1.2 else "fading" if last < first * 0.8 else "flat"
-    else:
-        trend = "unknown"
+    counts = sorted((_f(c.get("count")) or 0 for c in tc if isinstance(c, dict)), reverse=True)
+    top3 = sum(counts[:3])
+    trend = _trend([c for _, c in _curve(stats.get("volume_curve"))])
     return {"exact_unique_share": _pct(ud, tm) if ud is not None else None,  # upper bound, NOT organic
             "chan_conc": _pct(top3, tm) if top3 else None,                     # % volume from top-3 rooms
             "trend": trend}
@@ -406,7 +434,7 @@ def organic_verdict(rep, ctx):
     o, big = rep.get("organic_share"), rep.get("biggest_cluster_share") or 0
     cc = (ctx or {}).get("chan_conc")
     small_cluster = next((c for c in rep.get("top_clusters", [])
-                          if c["users"] <= 3 and (c["share"] or 0) >= 20), None)
+                          if 1 <= c["users"] <= 3 and (c["share"] or 0) >= 20), None)
     if o is None:
         return "unknown", "no random-stratum posts to score"
     if o <= 30:
@@ -438,11 +466,12 @@ def _to_num(x):
     return float(x[:-1]) * 1000 if x and x[-1] in "kK" else float(x)
 
 
-def price_levels(msgs_or_texts, px, band=(0.2, 5.0), bin_pct=1.0, top=8):
+def price_levels(msgs_or_texts, px, band=(0.2, 5.0), bin_pct=1.0, top=6):
     """Price levels the crowd names: numbers within band*px, binned to ~bin_pct% of px, ranked by
     VOICES = distinct accounts naming the level (a price bot printing 300 quotes is one voice).
     Given message dicts, uses the random stratum and `user`; given bare texts, one voice per
-    text. -> [{level, voices, msgs, side}]; level = median of what those voices typed."""
+    text. -> [{level, voices, msgs, side}], at most `top`; level = median of what those voices
+    typed. The report names the 1-2 strongest levels per side, never this whole list."""
     px = _f(px)
     if not px or px <= 0:
         raise ValueError("px must be the live price (> 0)")
@@ -468,7 +497,7 @@ def price_levels(msgs_or_texts, px, band=(0.2, 5.0), bin_pct=1.0, top=8):
         for b, v in seen.items():
             voters[b].setdefault(voter, v)
             msgs_in[b] += 1
-    digits = max(0, 3 - int(math.floor(math.log10(step)))) if step < 1000 else 0
+    digits = max(0, 1 - int(math.floor(math.log10(step))))   # 1% bins: BTC -> 0 dp, a $0.60 coin -> 3 dp
     out = []
     for b, vs in sorted(voters.items(), key=lambda kv: (-len(kv[1]), -msgs_in[kv[0]]))[:top]:
         lvl = median(vs.values())             # what the voices typed, not the bin edge
@@ -498,7 +527,7 @@ def account_concentration(msgs, top=5):
             rooms[u].add(m.get("unit"))
         if m.get("source") is not None:
             srcs[u].add(m.get("source"))
-        ts = parse_ts(m.get("ts") or m.get("datetime") or m.get("timestamp"))
+        ts = _msg_ts(m)
         if ts is not None:
             times[u].append(ts)
     posts = sum(by_user.values())
@@ -553,7 +582,7 @@ def burst_shape(volume_curve):
     peak, mean_c = counts[peak_i], total / n
     third = max(1, n // 3)
     first, last = mean(counts[:third]), mean(counts[-third:])
-    trend = "rising" if last > first * 1.2 else "fading" if last < first * 0.8 else "flat"
+    trend = _trend(counts)
     half = None
     for k in range(peak_i + 1, n):
         if counts[k] <= peak / 2:
@@ -654,13 +683,13 @@ def _mood(rows, weight):
     n = sum(w for _, w in rows)
     if not n:
         return {"n": 0}
-    bull = sum(w for l, w in rows if l >= 0.2)
-    bear = sum(w for l, w in rows if l <= -0.2)
+    bull = sum(w for lean, w in rows if lean >= 0.2)
+    bear = sum(w for lean, w in rows if lean <= -0.2)
     return {"n": int(n) if weight == "copies" else round(n, 1),
             "bull_pct": _pct(bull, n), "bear_pct": _pct(bear, n), "neutral_pct": _pct(n - bull - bear, n),
-            "strong_bull_pct": _pct(sum(w for l, w in rows if l >= 0.5), n),
-            "strong_bear_pct": _pct(sum(w for l, w in rows if l <= -0.5), n),
-            "mean_lean": round(sum(l * w for l, w in rows) / n, 2)}
+            "strong_bull_pct": _pct(sum(w for lean, w in rows if lean >= 0.5), n),
+            "strong_bear_pct": _pct(sum(w for lean, w in rows if lean <= -0.5), n),
+            "mean_lean": round(sum(lean * w for lean, w in rows) / n, 2)}
 
 
 def loud_vs_many(msgs):
@@ -670,16 +699,16 @@ def loud_vs_many(msgs):
     strata = defaultdict(list)
     eng_rows, eng_all = [], []
     for m in msgs:
-        l = _lean(m)
+        lean = _lean(m)
         s = m.get("stratum") or "random"
         e = _f(m.get("engagement"))
         if e is not None and e >= 0:
             eng_all.append(e)
-        if l is None:
+        if lean is None:
             continue
-        strata[s].append((l, _w(m)))
+        strata[s].append((lean, _w(m)))
         if e is not None and e > 0:
-            eng_rows.append((l, e))
+            eng_rows.append((lean, e))
     out = {s: _mood(rows, "copies") for s, rows in strata.items()}
     if not out:
         return {"note": "no bull/bear scores on messages"}
@@ -707,7 +736,7 @@ def loud_vs_many(msgs):
 def polarization(msgs):
     """Consensus or split? Random-stratum bull/bear/neutral shares and a split index
     (1 = perfectly even split among leaning posts, 0 = one-sided), with a label."""
-    rows = [(l, _w(m)) for m in _random(_msgs(msgs)) if (l := _lean(m)) is not None]
+    rows = [(lean, _w(m)) for m in _random(_msgs(msgs)) if (lean := _lean(m)) is not None]
     mood = _mood(rows, "copies")
     if not mood.get("n"):
         return {"n": 0, "note": "no bull/bear scores on random rows"}
@@ -842,7 +871,7 @@ def hour_fingerprint(msgs, users=None):
     for m in _msgs(msgs):
         if users is not None and m.get("user") not in users:
             continue
-        ts = parse_ts(m.get("ts") or m.get("datetime") or m.get("timestamp"))
+        ts = _msg_ts(m)
         if ts is not None:
             hist[ts.astimezone(timezone.utc).hour] += _w(m)
     n = sum(hist)

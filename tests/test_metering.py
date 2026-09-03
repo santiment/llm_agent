@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from deep_research_agent import metering
 from deep_research_agent.metering import RunMeter, UsageMeterMiddleware, fmt_elapsed
+from conftest import capture_events_cm
 
 
 def test_meter_accumulates() -> None:
@@ -23,25 +23,21 @@ def test_meter_accumulates() -> None:
 
 
 def test_usage_event_has_all_categories() -> None:
-    captured = {}
-    orig = metering.emit  # middleware calls the `emit` name bound inside metering.py
-    metering.emit = lambda e: captured.update(e) if e.get("type") == "usage" else None
-    try:
-        m = RunMeter()
-        m.record_tool_result(ok=True, result_bytes=2048, result_rows=120, capped=True)
-        mw = UsageMeterMiddleware(m, max_tool_calls=80, max_total_tokens=2_000_000,
-                                  recursion_limit=4500)
-        state = {"messages": [
-            HumanMessage("q"),
-            AIMessage("a", usage_metadata={"input_tokens": 100, "output_tokens": 50,
-                                            "total_tokens": 150}),
-            AIMessage("b", usage_metadata={"input_tokens": 30, "output_tokens": 20,
-                                            "total_tokens": 50}),
-            ToolMessage("r", tool_call_id="1"),
-        ]}
+    m = RunMeter()
+    m.record_tool_result(ok=True, result_bytes=2048, result_rows=120, capped=True)
+    mw = UsageMeterMiddleware(m, max_tool_calls=80, max_total_tokens=2_000_000,
+                              recursion_limit=4500)
+    state = {"messages": [
+        HumanMessage("q"),
+        AIMessage("a", usage_metadata={"input_tokens": 100, "output_tokens": 50,
+                                        "total_tokens": 150}),
+        AIMessage("b", usage_metadata={"input_tokens": 30, "output_tokens": 20,
+                                        "total_tokens": 50}),
+        ToolMessage("r", tool_call_id="1"),
+    ]}
+    with capture_events_cm() as emitted:
         mw.after_agent(state, None)
-    finally:
-        metering.emit = orig
+    captured = next(e for e in emitted if e.get("type") == "usage")
 
     assert captured["type"] == "usage"
     assert captured["tool_calls"] == 1 and captured["capped_calls"] == 1
@@ -58,19 +54,14 @@ def test_run_time_is_on_run_start_and_usage() -> None:
     assert fmt_elapsed(None) == "n/a" and fmt_elapsed(0) == "0.0s" and fmt_elapsed(12.34) == "12.3s"
     assert fmt_elapsed(65) == "1m 05s" and fmt_elapsed(252) == "4m 12s"
     assert fmt_elapsed(3852) == "1h 04m 12s"
-    events: list[dict] = []
-    orig = metering.emit
-    metering.emit = events.append
-    try:
-        m = RunMeter()
-        mw = UsageMeterMiddleware(m, max_tool_calls=1, max_total_tokens=1, recursion_limit=1)
-        assert m.elapsed_s() is None
+    m = RunMeter()
+    mw = UsageMeterMiddleware(m, max_tool_calls=1, max_total_tokens=1, recursion_limit=1)
+    assert m.elapsed_s() is None
+    with capture_events_cm() as emitted:
         mw.before_agent({}, None)
         m.started_mono -= 252                      # pretend the run took 4m 12s
         mw.after_agent({"messages": []}, None)
-    finally:
-        metering.emit = orig
-    start, usage = events
+    start, usage = emitted
     assert start["type"] == "run_start"
     assert "T" in start["started_at"] and start["started_at"].endswith("Z")
     assert usage["type"] == "usage" and 252 <= usage["elapsed_s"] < 253

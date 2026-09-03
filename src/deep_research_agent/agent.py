@@ -12,7 +12,8 @@ import asyncio
 import logging
 import os
 
-from deepagents import create_deep_agent
+from deepagents import (GeneralPurposeSubagentProfile, HarnessProfile, create_deep_agent,
+                        register_harness_profile)
 from deepagents.backends.composite import CompositeBackend
 from deepagents.backends.filesystem import FilesystemBackend
 from deepagents.backends.state import StateBackend
@@ -28,10 +29,13 @@ from .findings_gate import SubagentFindingsMiddleware
 from .loop_guard import LoopGuardMiddleware
 from .metering import RunMeter, SubagentUsageMiddleware, UsageMeterMiddleware
 from .models import build_chat_model
-from .prompts import (describe_mcp_sources, extract_prompt, orchestrator_prompt,
-                      subagent_prompt)
+from .prompts import (coding_prompt, describe_mcp_sources, extract_prompt,
+                      orchestrator_prompt, skills_block, subagent_prompt)
 from .report_gate import ReportQualityGateMiddleware
 from .skill_usage import SkillUsageMiddleware
+from .tool_filter import (CODING_EXCLUDED_TOOLS, EXTRACT_EXCLUDED_TOOLS,
+                          ORCHESTRATOR_EXCLUDED_TOOLS, ExcludeToolsMiddleware)
+from .triage import TriageRouterMiddleware
 from .events import instrument_tool, result_handling
 from .tools.clarify import build_clarify_tool
 from .tools.custom import load_custom_tools
@@ -41,6 +45,33 @@ from .tools.report import build_submit_report_tool
 from .tools.search import build_search_tool
 
 log = logging.getLogger("deep_research_agent.agent")
+
+# deepagents auto-adds a `general-purpose` sub-agent (the planner's own toolbox — i.e. NO
+# data tools) next to ours, and planners delegate to it: a run spent three `task` calls on
+# it and got back "the report has been compiled" with nothing behind it. Provider-wide
+# opt-out, merged onto deepagents' built-in openai profile (registrations are additive);
+# every model here is a ChatOpenAI over OpenRouter, so "openai" covers the whole fleet.
+register_harness_profile(
+    "openai",
+    HarnessProfile(general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False)),
+)
+
+
+def _quiet_third_party_loggers() -> None:
+    """Drop third-party request chatter to WARNING unless the operator asked for DEBUG.
+
+    httpx (and httpx2, the OpenAI SDK's client) log every request at INFO, and the MCP
+    client logs its session handshake. With a fresh streamable-HTTP session per tool
+    call that is ~9 lines per MCP call, burying the agent's own RUN END / budget / loop
+    lines. langgraph_api sets the root level from LOG_LEVEL before importing the graph,
+    so honouring DEBUG here keeps the full trace one env var away."""
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        return
+    for name in ("httpx", "httpx2", "mcp.client", "mcp.client.streamable_http"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+_quiet_third_party_loggers()
 
 # Virtual path the on-disk skills directory is mounted at. The agent reads skills
 # via `read_file("/skills/<name>/SKILL.md")`; everything else stays in the ephemeral
@@ -60,6 +91,34 @@ def build_skills(cfg: ResearchConfig) -> tuple[list[str] | None, object | None]:
 
 
 SANDBOX_SEED_DIR = "/workspace"
+
+
+def describe_skills(skills_dir: str) -> list[tuple[str, str]]:
+    """``(name, description)`` per skill from each ``SKILL.md`` front matter — what the
+    orchestrator gets instead of the files (it has no file tools). Unreadable front matter
+    falls back to the directory name with no description, logged."""
+    import yaml  # a langchain-core dependency; imported here to keep the module import cheap
+
+    out: list[tuple[str, str]] = []
+    if not skills_dir or not os.path.isdir(skills_dir):
+        return out
+    for skill in sorted(os.listdir(skills_dir)):
+        path = os.path.join(skills_dir, skill, "SKILL.md")
+        if not os.path.isfile(path):
+            continue
+        name, desc = skill, ""
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            if text.startswith("---"):
+                front = text.split("---", 2)[1]
+                meta = yaml.safe_load(front) or {}
+                name = str(meta.get("name") or skill)
+                desc = " ".join(str(meta.get("description") or "").split())
+        except Exception as exc:  # a broken skill must not take the graph down
+            log.warning("skill %s: front matter unreadable (%s)", skill, exc)
+        out.append((name, desc))
+    return out
 
 
 def skill_seed_files(skills_dir: str) -> list[tuple[str, bytes]]:
@@ -106,10 +165,15 @@ async def make_graph(config: dict | None = None):
     # Always a fresh build — never alias the orchestrator's instance on string-equal
     # ids, so future per-tier kwargs (temperature, callbacks) can't be silently shared.
     subagent_model = build_chat_model(cfg.subagent_model, cfg)
-    # Shared by the extract-subagent and the compaction summarizer.
+    # The extract-subagent's model (map/extract over offloaded files).
     utility_model = build_chat_model(cfg.utility_model, cfg)
-    log.info("models: research=%s subagent=%s utility=%s",
-             cfg.research_model, cfg.subagent_model, cfg.utility_model)
+    # The compaction summarizer's model — rare, input-heavy, quality over depth.
+    compaction_model = build_chat_model(cfg.compaction_model, cfg)
+    # The coding-subagent's model: a dedicated coder on a small input (below).
+    coding_model = build_chat_model(cfg.coding_model, cfg)
+    log.info("models: research=%s subagent=%s utility=%s compaction=%s coding=%s",
+             cfg.research_model, cfg.subagent_model, cfg.utility_model,
+             cfg.compaction_model, cfg.coding_model)
 
     tools = []
     search = build_search_tool(cfg, meter)
@@ -172,7 +236,7 @@ async def make_graph(config: dict | None = None):
     # self-disables at trigger_tokens <= 0; cache breakpoints are OpenRouter-only.
     shared_middleware: list = [
         LoopGuardMiddleware(),
-        ContextCompactionMiddleware(utility_model, trigger_tokens=cfg.compaction_tokens),
+        ContextCompactionMiddleware(compaction_model, trigger_tokens=cfg.compaction_tokens),
     ]
     if cfg.prompt_caching and cfg.is_openrouter:
         shared_middleware.append(PromptCacheMiddleware())
@@ -197,23 +261,46 @@ async def make_graph(config: dict | None = None):
         "middleware": [SubagentFindingsMiddleware(),
                        SubagentUsageMiddleware(meter, "research-subagent",
                                                model=cfg.subagent_model),
+                       SkillUsageMiddleware(),  # the "Skill applied" chip fires from here
                        *shared_middleware],
     }
-    if skills:  # give the sub-agent the same routing skill it needs to execute
+    # Skills live with the sub-agents ONLY: they hold the file tools that load a SKILL.md.
+    # The orchestrator gets names + descriptions in its prompt (describe_skills) and names
+    # the skill in a brief — never the 4k-token file in its own context on every run.
+    if skills:
         subagent_spec["skills"] = skills
     subagents = [subagent_spec]
 
-    # Utility-model consumer: reads offloaded /workspace result files on the cheapest
-    # model. Registered only when offloading is live. `tools: []` — no data tools to
-    # re-fetch with; deepagents still mounts the filesystem + `execute` built-ins, and
-    # ExcludeToolsMiddleware hides every built-in except `execute` (see tool_filter.py).
-    if offload_sink is not None:
+    # Sandbox-only sub-agents — both work through `execute`, so neither exists without a
+    # sandbox. `tools: []` — no data tools to re-fetch with; deepagents still mounts the
+    # filesystem + `execute` built-ins, and ExcludeToolsMiddleware hides what each role must
+    # not use (see tool_filter.py). Both are ALSO nested into the research-subagent via its
+    # own `task` tool, since offloaded files and failing scripts appear in ITS context. That
+    # direct path skips deepagents' default stack, so a nested spec carries its own
+    # filesystem stack, then the same middleware as the top-level spec.
+    nested_specs: list[dict] = []
+    if sandbox is not None:
         from deepagents.middleware.filesystem import FilesystemMiddleware
         from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
         from deepagents.middleware.subagents import SubAgentMiddleware
 
-        from .tool_filter import EXTRACT_EXCLUDED_TOOLS, ExcludeToolsMiddleware
 
+        def nested(spec: dict, files_prompt: str) -> dict:
+            # The default filesystem prompt advertises read_file/grep, which the tool filter
+            # may remove — so each nested spec states its own file rules.
+            return {
+                **spec,
+                "middleware": [
+                    FilesystemMiddleware(backend=backend, system_prompt=files_prompt),
+                    PatchToolCallsMiddleware(),
+                    *spec["middleware"],
+                ],
+            }
+
+    # Utility-model consumer: reads offloaded /workspace result files on the cheapest
+    # model. Registered only when offloading is live; the filter hides every built-in
+    # except `execute`.
+    if offload_sink is not None:
         extract_spec = {
             "name": "extract-subagent",
             "description": (
@@ -234,35 +321,56 @@ async def make_graph(config: dict | None = None):
                            ExcludeToolsMiddleware(EXTRACT_EXCLUDED_TOOLS)],
         }
         subagents.append(extract_spec)
-
-        # Offloaded files appear in the research-subagents' context (they make the data
-        # calls), so nest a `task` tool there, restricted to extract-subagent. This
-        # direct path skips deepagents' default stack — carry our own filesystem stack,
-        # then the same middleware as the top-level spec.
-        nested_extract_spec = {
-            **extract_spec,
-            "middleware": [
-                # The default prompt advertises read_file/grep, which the tool filter removes.
-                FilesystemMiddleware(
-                    backend=backend,
-                    system_prompt=("Files live under /workspace. You operate on them ONLY "
-                                   "through the `execute` tool (Python), in bounded slices."),
-                ),
-                PatchToolCallsMiddleware(),
-                *extract_spec["middleware"],
-            ],
-        }
-        subagent_spec["middleware"] = [
-            SubAgentMiddleware(backend=backend, subagents=[nested_extract_spec]),
-            *subagent_spec["middleware"],
-        ]
+        nested_specs.append(nested(
+            extract_spec,
+            f"Files live under {SANDBOX_SEED_DIR}. You operate on them ONLY through the "
+            "`execute` tool (Python), in bounded slices."))
         log.info("extract-subagent enabled on %s (reads offloaded files; "
                  "research-subagents delegate to it via task)", cfg.utility_model)
+
+    # Coding worker: writes or fixes ONE script per task on a dedicated coder, so a failed
+    # `execute` is repaired by a model good at it instead of by the planner narrating
+    # shell-quoting retries. Small input (goal, file paths, code, error), so its price
+    # barely registers. No findings gate — its handoff is a script path + output, not
+    # findings. Keeps the file tools (it writes and edits scripts); loses grep/write_todos.
+    if sandbox is not None:
+        coding_spec = {
+            "name": "coding-subagent",
+            "description": (
+                "Writes or fixes a Python script for you on a dedicated coding model. Give it "
+                "the goal, the input file paths under /workspace, any existing code and the "
+                "EXACT error text; it returns the script path and the script's real output. "
+                "Use it for any script longer than a few lines and after ANY failed `execute` "
+                "— never retry shell-quoting variants of `python -c` yourself."
+            ),
+            "system_prompt": coding_prompt(),
+            "tools": [],
+            "model": coding_model,
+            "middleware": [SubagentUsageMiddleware(meter, "coding-subagent",
+                                                   model=cfg.coding_model),
+                           *shared_middleware,
+                           ExcludeToolsMiddleware(CODING_EXCLUDED_TOOLS)],
+        }
+        subagents.append(coding_spec)
+        nested_specs.append(nested(
+            coding_spec,
+            f"Scripts and data files live under {SANDBOX_SEED_DIR}: `write_file` a script "
+            f"there, run it with `execute` (`python {SANDBOX_SEED_DIR}/<name>.py`), fix it "
+            "with `edit_file`."))
+        subagent_spec["middleware"] = [
+            SubAgentMiddleware(backend=backend, subagents=nested_specs),
+            *subagent_spec["middleware"],
+        ]
+        log.info("coding-subagent enabled on %s (writes/fixes scripts for the orchestrator "
+                 "and the research-subagents)", cfg.coding_model)
 
     # The orchestrator holds NO data tools — it plans, delegates (task), verifies
     # findings, and synthesizes. Gathering lives in sub-agents, so raw data can't
     # enter the expensive orchestrator context at all.
     middleware = [
+        # First: a ~250-token verdict on the research model. A pure-knowledge question is
+        # answered right here and the turn ends, never paying the ~12k-token harness below.
+        TriageRouterMiddleware(research_model),
         # Compaction must run before BudgetMiddleware so the budget check sees the shrunk
         # transcript plus the compacted_* counters.
         *shared_middleware,
@@ -271,6 +379,8 @@ async def make_graph(config: dict | None = None):
         BudgetMiddleware(
             max_tool_calls=cfg.max_tool_calls,
             max_total_tokens=cfg.max_total_tokens,
+            max_run_seconds=cfg.max_run_seconds,
+            meter=meter,
         ),
         ForceCompletionMiddleware(),
         # Bounce a finished report back to the model ONCE if it ships with uncited sources,
@@ -281,8 +391,8 @@ async def make_graph(config: dict | None = None):
             max_total_tokens=cfg.max_total_tokens,
             tool_names=data_tool_names,
             meter=meter,
+            max_run_seconds=cfg.max_run_seconds,
         ),
-        SkillUsageMiddleware(),
         # Block request_clarification once research has started (TRIAGE-only), then the
         # fallback that surfaces narrated questions as the clarification card.
         ClarificationGuardMiddleware(),
@@ -293,7 +403,12 @@ async def make_graph(config: dict | None = None):
             max_tool_calls=cfg.max_tool_calls,
             max_total_tokens=cfg.max_total_tokens,
             recursion_limit=cfg.recursion_limit,
+            model=cfg.research_model,
         ),
+        # The orchestrator never touches files: no ls/read/write/edit/glob/grep in its
+        # toolbox (nor their descriptions and schemas on every step). `execute` stays for
+        # the odd one-line aggregate; `task` is how files get read or written.
+        ExcludeToolsMiddleware(ORCHESTRATOR_EXCLUDED_TOOLS),
     ]
     if sandbox is not None:
         from .sandbox import SandboxCleanupMiddleware
@@ -302,10 +417,11 @@ async def make_graph(config: dict | None = None):
     agent = create_deep_agent(
         model=research_model,
         tools=[build_clarify_tool(), build_submit_report_tool(data_tool_names)],
-        system_prompt=orchestrator_prompt(mcp_prompt, cfg.domain_prompt),
+        system_prompt=orchestrator_prompt(
+            mcp_prompt, cfg.domain_prompt, skills_block(describe_skills(cfg.skills_dir))),
         subagents=subagents,
         middleware=middleware,
-        skills=skills,
+        skills=None,  # sub-agents only — see subagent_spec
         backend=backend,
     )
     # deepagents bakes recursion_limit=9_999 into the graph; clamp it on the returned

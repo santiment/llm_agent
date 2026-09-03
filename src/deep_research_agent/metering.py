@@ -29,11 +29,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import AIMessage
+from collections import Counter
+
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from .compaction import compacted_counts
 from .events import PROTOCOL_VERSION, emit, engine_version
-from .turn import current_turn, message_tokens, tool_calls_in
+from .turn import current_turn, message_tokens, raw_text, text_of, tool_calls_in
 
 log = logging.getLogger("deep_research_agent.usage")
 
@@ -121,16 +123,47 @@ class RunMeter:
         u["runs"] += 1
 
 
+def emit_model_call(role: str, model: str, state: dict) -> None:
+    """``status: model_call`` right before a model is invoked: who is thinking, on what, and
+    which step of its turn. A non-streaming model (the streaming denylist) shows NOTHING
+    until its message is complete — minutes, for a long or degenerate generation — and the
+    UI's "quiet for 3m" is that silence. This ping is the heartbeat that names the cause."""
+    turn = current_turn(state.get("messages") or [])
+    step = sum(1 for m in turn if isinstance(m, AIMessage)) + 1
+    # What it is working on (its brief — the user's question for the orchestrator) and what
+    # it just got back (the trailing tool results), so the UI can say what the wait is for.
+    unit = text_of(turn[0].content).strip()[:160] if turn and isinstance(turn[0], HumanMessage) else ""
+    tail: list = []
+    for m in reversed(turn):
+        if isinstance(m, ToolMessage):
+            tail.append(m)
+        else:
+            break
+    event: dict[str, Any] = {"type": "status", "state": "model_call", "role": role,
+                             "model": model, "step": step, "unit": unit}
+    if tail:
+        tail.reverse()
+        names = Counter(getattr(m, "name", None) or "tool" for m in tail)
+        event["after"] = ", ".join(f"{n} ×{c}" if c > 1 else n for n, c in names.items())
+        event["after_chars"] = sum(len(raw_text(m.content)) for m in tail)
+    emit(event)
+
+
 class SubagentUsageMiddleware(AgentMiddleware):
     """Attached to sub-agent specs only. ``after_agent`` fires once per ``task`` call with the
     sub-agent's own message state; summing it here is what makes fleet usage visible. Also
-    emits ``subagent_start`` / ``subagent_done`` status events carrying role and model."""
+    emits ``subagent_start`` / ``subagent_done`` status events carrying role and model, and
+    a ``model_call`` ping before every model step (see ``emit_model_call``)."""
 
     def __init__(self, meter: RunMeter, role: str, model: str = "") -> None:
         super().__init__()
         self.meter = meter
         self.role = role
         self.model = model or ""
+
+    def before_model(self, state: dict, runtime) -> dict[str, Any] | None:
+        emit_model_call(self.role, self.model, state)
+        return None
 
     def before_agent(self, state: dict, runtime) -> dict[str, Any] | None:
         log.info("SUBAGENT START role=%s model=%s", self.role, self.model or "?")
@@ -156,12 +189,17 @@ class UsageMeterMiddleware(AgentMiddleware):
     event and the ``RESEARCH USAGE`` log line, both carrying the run time."""
 
     def __init__(self, meter: RunMeter, *, max_tool_calls: int,
-                 max_total_tokens: int, recursion_limit: int) -> None:
+                 max_total_tokens: int, recursion_limit: int, model: str = "") -> None:
         super().__init__()
         self.meter = meter
         self.max_tool_calls = max_tool_calls
         self.max_total_tokens = max_total_tokens
         self.recursion_limit = recursion_limit
+        self.model = model or ""
+
+    def before_model(self, state: dict, runtime) -> dict[str, Any] | None:
+        emit_model_call("orchestrator", self.model, state)
+        return None
 
     def before_agent(self, state: dict, runtime) -> dict[str, Any] | None:
         # Version handshake, first event of every run: a consumer pins the

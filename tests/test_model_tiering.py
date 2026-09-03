@@ -45,6 +45,8 @@ def test_model_tier_package_selects_all_three() -> None:
         assert cfg.research_model == package["research_model"], name
         assert cfg.subagent_model == package["subagent_model"], name
         assert cfg.utility_model == package["utility_model"], name
+        assert cfg.coding_model == package["coding_model"], name
+        assert cfg.compaction_model == package["compaction_model"], name
     # The rule the "high" package encodes: its top model ORCHESTRATES ONLY — never
     # handed to the sub-agent fleet or the utility slot, which would defeat the
     # tiering. Stated against the slot, not a model name, so swapping the orchestrator
@@ -62,6 +64,8 @@ def test_bare_config_defaults_to_cheapest_tier() -> None:
     assert cfg.research_model == package["research_model"]
     assert cfg.subagent_model == package["subagent_model"]
     assert cfg.utility_model == package["utility_model"]
+    assert cfg.coding_model == package["coding_model"]
+    assert cfg.compaction_model == package["compaction_model"]
 
 
 def test_configurable_tier_beats_env_and_unknown_falls_back() -> None:
@@ -80,11 +84,15 @@ def test_per_model_keys_are_ignored() -> None:
     cfg = _cfg(research_model="anthropic/claude-opus-4.8",
                subagent_model="my/custom-model",
                utility_model="my/other-model",
+               coding_model="my/coder-model",
+               compaction_model="my/summary-model",
                final_report_model="my/report-model",
                compression_model="my/compression-model")
     assert cfg.research_model == package["research_model"]
     assert cfg.subagent_model == package["subagent_model"]
     assert cfg.utility_model == package["utility_model"]
+    assert cfg.coding_model == package["coding_model"]
+    assert cfg.compaction_model == package["compaction_model"]
     assert cfg.report_model == package["research_model"]  # report = research, reserved
 
 
@@ -134,6 +142,16 @@ def test_every_tier_slot_documents_its_price() -> None:
     assert set(prices) == set(MODEL_TIERS), (set(prices), set(MODEL_TIERS))
     for tier, package in MODEL_TIERS.items():
         assert set(prices[tier]) == set(package), tier
+
+
+def test_coding_slot_is_a_dedicated_coder() -> None:
+    # The coding slot exists to put a model GOOD AT CODE behind script writing/fixing, on a
+    # small input — so it is exempt from the fleet-price invariant below but must never be
+    # a silent alias of the fleet model (which would make the slot decorative).
+    for tier, package in MODEL_TIERS.items():
+        coder = package["coding_model"]
+        assert coder != package["subagent_model"], f"{tier}: coding slot just mirrors the fleet"
+        assert coder != package["utility_model"], f"{tier}: coding slot just mirrors utility"
 
 
 def test_subagent_is_never_pricier_than_the_orchestrator() -> None:

@@ -21,6 +21,10 @@ print(R.fmt(R.card(d)))                                    # every local recipe,
   the findings. Do not write your own version.
 - Card numbers go into the report verbatim: `*_share` / `*_pct` are already percentages, `n*` are
   counts. Every percentage travels with its n.
+- The path, the recipe names and the field names are YOUR working vocabulary. None of it reaches
+  the findings or the report: a figure travels with its number and its data-source label
+  ("Santiment social messages"), never with "computed by R.card over /workspace/…". Nobody
+  downstream knows files exist.
 
 ## 0 — The card (run first, read top to bottom)
 
@@ -50,20 +54,34 @@ import json                         # a metric result arrives as a saved file + 
 vol_raw = json.load(open("/workspace/data/<tool>-<id>.json"))   # social_volume_total, trailing >=10x the window
 px_raw  = json.load(open("/workspace/data/<tool>-<id2>.json"))  # price_usd, same range and interval; reused in §3 and §6
 print(R.describe(vol_raw))                          # n, span, first/last, min/max (when), mean, median, direction
-print(R.extreme(vol_raw, SPIKE_START))              # {pct, z, window, base_mean, base_median, n_window, n_base}
-print(R.extreme(vol_raw, SPIKE_START, agg="max"))   # the peak instead of the window mean
+print(R.extreme(vol_raw, SPIKE_START, SPIKE_END))   # {pct, z, window, base_mean, base_median, n_window, n_base}
+print(R.extreme(vol_raw, SPIKE_START, SPIKE_END, agg="max"))   # the peak instead of the window mean
 ```
+
+- `spike_end` bounds the window: rows after it are ignored, so a past spike is ranked against
+  what came BEFORE it, never diluted by the calm days after. Omit it only when the window runs to
+  the series' end (a live spike).
 
 - **Never list a series.** No date/value table, no per-bucket lines — not in the report, not in
   a message, in any date format; rows that reach the report are deleted on delivery. A series is
   *described*: the summary the tool hands you, `R.describe`, or `R.extreme`. The file is for
   `execute`, never for quoting.
 
+- **A metric result is a FILE, not rows to retype.** A pulled series is offloaded to
+  `/workspace/data/<tool>-<id>.json`; pass that path straight to `json.load` / `R.to_series`. If a
+  small series ever arrives inline (rows in the tool result), dump it to a file in ONE `execute`
+  (`json.dump(obj, open(path, "w"))`) and work from the path — NEVER hand-type the rows into a
+  `write_file` or a script. Typing daily rows one by one is the exact move that trips the runaway
+  guard and wastes the run.
+
 - `pct` = share of baseline points below the window value; `z` = (window − base_mean) / base_sd.
   Report both: "top 2% of trailing 90d (z 3.1)". A 40th-pct spike is itself a finding — not extreme.
-- Run it for **social_volume_total**, **social_dominance_total**, and the **sentiment skew** (bull% −
-  bear% per bucket from `stats.sentiment_balance`, ranked against a trailing sentiment series).
-- `{unbaselined: True, n_base: k}` → write "unbaselined (k points of history)", never a percentile.
+- Run it for **social_volume_total**, **social_dominance_total**, and the sentiment metric
+  (**sentiment_balance_total** by default; resolve the name with `metrics_and_assets_discovery`
+  if it is not offered). The in-window shift of `stats.sentiment_balance.by_bucket` explains the
+  mood; the trailing metric is what the window is ranked against.
+- `{unbaselined: True, n_base: k}` → pull a longer trailing window ONCE; if still unbaselined,
+  write "unbaselined (k points of history)", never a percentile, and move on.
 - `R.to_series(raw)` gives `[(ts, value)]` from any `fetch_metric_data` shape; never rewrite parsers.
 
 **(b) Cross-sectional — vs other coins right now.** `assets_by_metric` on `social_volume_total` /
@@ -98,15 +116,16 @@ Reading `organic`:
 | `trend` | volume_curve last third vs first third: rising / fading / flat |
 | `verdict`, `rule` | organic / mixed / manufactured and the rule that fired — quote both |
 
-Verdict rules (`R.organic_verdict`): **manufactured** if organic ≤ 30%, or one cluster from ≤ 3
-accounts holds ≥ 20% of posts, or chan_conc ≥ 70%; **organic** if organic ≥ 60%, chan_conc ≤ 40%
+Verdict rules (`R.organic_verdict`): **manufactured** if organic ≤ 30%, or one cluster from 1–3
+known accounts holds ≥ 20% of posts, or chan_conc ≥ 70%; **organic** if organic ≥ 60%, chan_conc ≤ 40%
 and biggest cluster < 5%; else **mixed**, with the reasons. Pair with `trend`: "62% organic, still
 rising" vs "bot campaign, peaked early".
 
 Cluster `kind`: `single-account bot` (1 user) · `room paste / coordinated push` (≤ 3 users or ≤ 2
 rooms, ≥ 100 posts or ≥ 5%) · `viral copypasta (one message, many people)` (≥ 20 users, ≥ 5 rooms —
-real enthusiasm, but ONE message: counts once for prevalence and themes) · `repeated`. An empty
-`top_clusters` means nothing repeats.
+real enthusiasm, but ONE message: counts once for prevalence and themes) · `repeated` ·
+`repeated (accounts unknown)` (rows carry no user field — say the account read is unavailable, do
+not call it a bot). An empty `top_clusters` means nothing repeats.
 
 Reading `accounts`: `top1_share` ≥ 20% or `top10_share` ≥ 50% = a few accounts *are* the crowd
 (`flags` says so). `cadence: scheduled` (gap CV < 0.35 over ≥ 5 gaps; `median_gap_min` shown) = bot;
@@ -137,7 +156,7 @@ print(R.lead_lag(d["stats"]["volume_curve"], px_raw, max_lag=6))   # price at th
 - `|best_corr| < 0.3` or `n_pairs < 8` → "no usable lead/lag". Say it; do not pick a sign.
   `abs_return_corr_lag0` high while `corr_lag0` is low = volume tracks volatility, not direction.
 - `{unaligned: True}` = buckets carry no timestamps and lengths differ — fetch price at the bucket
-  interval and retry.
+  interval and retry ONCE; if still unaligned, report "no usable lead/lag".
 
 ## 4 — Narrative vs chain (claim → metric map)
 
@@ -182,6 +201,9 @@ for lvl in R.price_levels(d["messages"], px): print(lvl)  # {level, voices, msgs
   `level` = median of one value per voice. Tune band / bin per coin's volatility, never hardcode.
 - `side: below` = where the crowd buys the dip, `above` = targets. Both dense with a `split` mood =
   the two-sided battle map. Report "support @ L (N voices), target @ M (K voices)".
+- The recipe returns at most 6 levels; the report keeps the strongest 1–2 per side and folds the
+  rest into one clause ("nine smaller levels, none above 3 voices"). A table of every level with
+  its mention count is the data dump this skill exists to prevent.
 - A bare-number `trend_words` entry (e.g. "62k") is a level only if it falls inside the band; check
   a candidate isn't a year or a % target before reporting it.
 
@@ -206,8 +228,10 @@ print(R.word_novelty(d["stats"]["trend_words"], prior["stats"]["trend_words"]))
 
 Reading the message text is the token-heavy part of this skill, so it runs on the cheapest model.
 Do not open the text in your own context (no printing of text fields, no slicing text columns). Send
-one `task(subagent_type="extract-subagent", description=...)` per question, in parallel. The reader
-sees NOTHING but your description, so make it self-contained:
+one `task(subagent_type="extract-subagent", description=...)` per question — three tasks, in
+parallel, six at the absolute most (per-source splits only for a file over ~5,000 messages). A thin
+answer is not re-asked; it is the finding. The reader sees NOTHING but your description, so make it
+self-contained:
 
 ```
 FILE: /workspace/data/social_messages-<call_id>.json — JSON object; the posts are the list under
@@ -220,7 +244,10 @@ QUESTION: <one of the three below>
 RULES: judge prevalence and mood ONLY from stratum == "random"; use head/poles for the spread and
   the disagreement. Every item carries the number of messages backing it and 1-2 verbatim quotes
   (with `url` when present). A text repeated many times (same words, different numbers/links) is
-  ONE voice: count it once and say it repeats. Drop vague mood. No financial advice.
+  ONE voice: count it once and say it repeats. Drop vague mood. At most 7 items per question,
+  ranked by prevalence — the key findings, not every item seen. Every finding's source is the
+  SOURCE LABEL above; never mention the file, its path, or what you did not read. No financial
+  advice.
 ```
 
 The three questions (one task each; for monster windows add `only source == "<source>"` and run one
@@ -238,7 +265,8 @@ task per source, then merge):
 
 Fold the returned findings into yours: a theme carries the `trend_words` share (yours) plus the
 one-liner and quote (theirs); claims go to the narrative-vs-chain table; the split goes to WHAT'S
-DRIVING IT next to the `polarization` numbers. Cite all of it as "Santiment social messages".
+DRIVING IT next to the `polarization` numbers. Cite all of it as "Santiment social messages" — the
+file it came from is not a source and never appears in a finding.
 
 ## Corroborate & visualize (optional tools)
 
@@ -260,3 +288,8 @@ DRIVING IT next to the `polarization` numbers. Cite all of it as "Santiment soci
 - Strata discipline (from SKILL.md): prevalence and mood from the `random` stratum + stats block
   only; `head`/`poles` for spread and the extremes of disagreement.
 - Always carry the denominator: "N sampled of M matching", plus any sanity FLAG.
+- **Nothing about the machinery reaches the reader.** No file paths or names, no "offloaded" /
+  "saved to", no recipe or tool names, no stratum or field names, no inventory of files pulled or
+  of "what still needs extraction". A finding is a number, its baseline and its data-source label.
+- **Key findings only.** 3–5 themes, 1–2 price levels per side, 3 venues, ≤ 5 claims; the rest is
+  one aggregate clause. A ranked list of every value is the recap this skill replaces.

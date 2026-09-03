@@ -12,9 +12,9 @@ from __future__ import annotations
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from deep_research_agent import metering
 from deep_research_agent.metering import (RunMeter, SubagentUsageMiddleware,
                                           UsageMeterMiddleware, sum_usage)
+from conftest import capture_events_cm
 
 
 def test_sum_usage_fallback_chain_and_cost() -> None:
@@ -89,31 +89,27 @@ def test_subagent_middleware_folds_its_own_compaction() -> None:
 
 
 def test_usage_event_carries_fleet_cost_and_compaction() -> None:
-    captured: dict = {}
-    orig = metering.emit
-    metering.emit = lambda e: captured.update(e) if e.get("type") == "usage" else None
-    try:
-        meter = RunMeter()
-        meter.record_subagent_usage("research-subagent", {
-            "input_tokens": 500, "output_tokens": 100, "total_tokens": 600,
-            "model_calls": 4, "cost_usd": 0.03})
-        mw = UsageMeterMiddleware(meter, max_tool_calls=80,
-                                  max_total_tokens=2_000_000, recursion_limit=4500)
-        state = {
-            "messages": [
-                HumanMessage("q", id="anchor-1"),
-                AIMessage("a", usage_metadata={"input_tokens": 100, "output_tokens": 50,
-                                               "total_tokens": 150},
-                          response_metadata={"token_usage": {"total_tokens": 150,
-                                                             "cost": 0.02}}),
-            ],
-            # a compaction happened this turn (anchor id matches)
-            "compacted_tool_calls": 12, "compacted_tokens": 40_000,
-            "compaction_anchor_id": "anchor-1",
-        }
+    meter = RunMeter()
+    meter.record_subagent_usage("research-subagent", {
+        "input_tokens": 500, "output_tokens": 100, "total_tokens": 600,
+        "model_calls": 4, "cost_usd": 0.03})
+    mw = UsageMeterMiddleware(meter, max_tool_calls=80,
+                              max_total_tokens=2_000_000, recursion_limit=4500)
+    state = {
+        "messages": [
+            HumanMessage("q", id="anchor-1"),
+            AIMessage("a", usage_metadata={"input_tokens": 100, "output_tokens": 50,
+                                           "total_tokens": 150},
+                      response_metadata={"token_usage": {"total_tokens": 150,
+                                                         "cost": 0.02}}),
+        ],
+        # a compaction happened this turn (anchor id matches)
+        "compacted_tool_calls": 12, "compacted_tokens": 40_000,
+        "compaction_anchor_id": "anchor-1",
+    }
+    with capture_events_cm() as emitted:
         mw.after_agent(state, None)
-    finally:
-        metering.emit = orig
+    captured = next(e for e in emitted if e.get("type") == "usage")
 
     assert captured["total_tokens"] == 150 + 40_000        # orchestrator + compacted
     assert captured["compacted_tool_calls"] == 12
@@ -131,29 +127,62 @@ if __name__ == "__main__":
     print("OK — sub-agent usage rollup + cost accounting verified.")
 
 
-def test_subagent_middleware_marks_start_and_done_with_role_and_model() -> None:
-    from deep_research_agent import events
+def test_subagent_middleware_marks_start_and_done_with_role_and_model(capture_events) -> None:
+    m = RunMeter()
+    mw = SubagentUsageMiddleware(m, "extract-subagent", model="qwen/qwen3-30b")
+    mw.before_agent({"messages": []}, None)
+    state = {"messages": [
+        HumanMessage("read the file"),
+        AIMessage("done", usage_metadata={"input_tokens": 1000, "output_tokens": 20,
+                                          "total_tokens": 1020}),
+    ]}
+    mw.after_agent(state, None)
 
-    captured: list[dict] = []
-    orig = events._writer
-    events._writer = lambda: captured.append
-    try:
-        m = RunMeter()
-        mw = SubagentUsageMiddleware(m, "extract-subagent", model="qwen/qwen3-30b")
-        mw.before_agent({"messages": []}, None)
-        state = {"messages": [
-            HumanMessage("read the file"),
-            AIMessage("done", usage_metadata={"input_tokens": 1000, "output_tokens": 20,
-                                              "total_tokens": 1020}),
-        ]}
-        mw.after_agent(state, None)
-    finally:
-        events._writer = orig
-
-    assert [e["state"] for e in captured] == ["subagent_start", "subagent_done"]
-    assert all(e["type"] == "status" for e in captured)
-    assert captured[0]["role"] == "extract-subagent" and captured[0]["model"] == "qwen/qwen3-30b"
-    assert captured[1]["model_calls"] == 1 and captured[1]["total_tokens"] == 1020
+    assert [e["state"] for e in capture_events] == ["subagent_start", "subagent_done"]
+    assert all(e["type"] == "status" for e in capture_events)
+    assert capture_events[0]["role"] == "extract-subagent" and capture_events[0]["model"] == "qwen/qwen3-30b"
+    assert capture_events[1]["model_calls"] == 1 and capture_events[1]["total_tokens"] == 1020
     assert m.subagent_usage["extract-subagent"]["runs"] == 1
     # Old two-arg construction still works (model optional).
     SubagentUsageMiddleware(m, "research-subagent").before_agent({"messages": []}, None)
+
+
+def test_model_call_ping_before_every_model_step(capture_events):
+    from langchain_core.messages import AIMessage, HumanMessage
+    from deep_research_agent.metering import RunMeter, SubagentUsageMiddleware, UsageMeterMiddleware
+
+    sub = SubagentUsageMiddleware(RunMeter(), "research-subagent", model="deepseek/deepseek-v4-flash")
+    assert sub.before_model({"messages": [HumanMessage("unit")]}, None) is None
+    assert sub.before_model({"messages": [HumanMessage("unit"), AIMessage("a"), AIMessage("b")]}, None) is None
+
+    top = UsageMeterMiddleware(RunMeter(), max_tool_calls=1, max_total_tokens=1, recursion_limit=1,
+                              model="google/gemini-3.7-flash")
+    top.before_model({"messages": [HumanMessage("q")]}, None)
+
+    pings = [e for e in capture_events if e.get("state") == "model_call"]
+    assert [(p["role"], p["model"], p["step"], p["unit"]) for p in pings] == [
+        ("research-subagent", "deepseek/deepseek-v4-flash", 1, "unit"),
+        ("research-subagent", "deepseek/deepseek-v4-flash", 3, "unit"),
+        ("orchestrator", "google/gemini-3.7-flash", 1, "q"),
+    ]
+    assert all("after" not in p for p in pings)
+
+
+def test_model_call_ping_names_the_tool_results_it_follows(capture_events):
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    from deep_research_agent.metering import RunMeter, SubagentUsageMiddleware
+
+    sub = SubagentUsageMiddleware(RunMeter(), "research-subagent", model="m")
+    msgs = [HumanMessage("Research BTC price for the last 90 days"),
+            AIMessage("", tool_calls=[{"name": "get_metric", "args": {}, "id": "1"},
+                                      {"name": "get_metric", "args": {}, "id": "2"},
+                                      {"name": "web_search", "args": {}, "id": "3"}]),
+            ToolMessage("x" * 1000, tool_call_id="1", name="get_metric"),
+            ToolMessage("y" * 500, tool_call_id="2", name="get_metric"),
+            ToolMessage("z" * 20, tool_call_id="3", name="web_search")]
+    sub.before_model({"messages": msgs}, None)
+    ping = next(e for e in capture_events if e.get("state") == "model_call")
+    assert ping["step"] == 2
+    assert ping["unit"] == "Research BTC price for the last 90 days"
+    assert ping["after"] == "get_metric ×2, web_search" and ping["after_chars"] == 1520
+

@@ -62,13 +62,14 @@ class ResearchOutputMiddleware(AgentMiddleware):
     state_schema = ResearchState
 
     def __init__(self, *, max_tool_calls: int, max_total_tokens: int, tool_names=(),
-                 meter=None) -> None:
+                 meter=None, max_run_seconds: int = 0) -> None:
         super().__init__()
         self.meter = meter  # RunMeter; its clock puts the run time on the end status
         # Ceilings are needed to distinguish "ran out of budget" from "just gave up" when
         # classifying WHY a run ended without a report.
         self.max_tool_calls = max_tool_calls
         self.max_total_tokens = max_total_tokens
+        self.max_run_seconds = max_run_seconds
         self.tool_names = tuple(tool_names or ())
 
     def after_agent(self, state: dict, runtime) -> dict[str, Any] | None:
@@ -127,7 +128,7 @@ class ResearchOutputMiddleware(AgentMiddleware):
         # an error and is logged + emitted as one. NOTE: this only runs on a clean end — its
         # ABSENCE in the logs means the run died via an exception (e.g. GraphRecursionError)
         # before after_agent, which the host streams as a stream error.
-        calls, tokens = turn_spend(state)  # includes compacted-away spend
+        calls, tokens = turn_spend(state, messages)  # includes compacted-away spend
         nudges = count_nudges(messages, NUDGE_NAME)
         last_ai = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
         end_state, reason, detail = self._classify(
@@ -136,6 +137,11 @@ class ResearchOutputMiddleware(AgentMiddleware):
             calls=calls, tokens=tokens, nudges=nudges)
 
         elapsed = self.meter.elapsed_s() if self.meter is not None else None
+        if (end_state == "error" and reason == "ended_without_report" and self.max_run_seconds
+                and elapsed is not None and elapsed >= self.max_run_seconds):
+            reason = "budget_exhausted"
+            detail = (f"Hit the run time ceiling ({fmt_elapsed(elapsed)} of "
+                      f"{fmt_elapsed(self.max_run_seconds)}) before delivering a report.")
         if elapsed is not None:
             detail = f"{detail} Run time {fmt_elapsed(elapsed)}."
 
@@ -148,7 +154,8 @@ class ResearchOutputMiddleware(AgentMiddleware):
             "last_ai_had_tool_calls": bool(getattr(last_ai, "tool_calls", None)),
             "citations": cite,
             "limits": {"max_tool_calls": self.max_tool_calls,
-                       "max_total_tokens": self.max_total_tokens},
+                       "max_total_tokens": self.max_total_tokens,
+                       "max_run_seconds": self.max_run_seconds},
         }
         if end_state == "error":
             log.error("RUN ENDED WITHOUT REPORT after %s: %s", fmt_elapsed(elapsed), summary)

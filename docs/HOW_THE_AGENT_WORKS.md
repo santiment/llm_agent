@@ -275,6 +275,7 @@ the context blew past the model's limit. Two mechanisms prevent that:
   then loads the full data with pandas in the sandbox and computes aggregates/joins/filters
   *there*. This is exactly how a large cross-entity sweep is handled: the raw rows never enter the
   model's context at all. Without a sandbox, the same thresholds become hard **truncation** caps.
+- **MCP results are unwrapped first.** langchain-mcp-adapters hands back every MCP result as LangChain content blocks (`[{type: text, text: <the JSON>}]`), so the series/size checks would otherwise inspect the envelope, not the data — a metric series buried in a text block stayed inline and the model hand-transcribed it into a file. `events.unwrap_tool_result` flattens a text-only result to its JSON before the offload decision, so an MCP series offloads exactly like a string-returning custom tool. Results carrying an image/file block are left intact.
 - **Time series are offloaded whatever their size.** `series.py` recognizes a metric series in any
   tool result (the metric server's `{data: {slug: [{datetime, value}]}}`, a bare list of points,
   `[ts, value]` pairs — 8+ points). A series result is written to a file even when it is small, and
@@ -345,7 +346,7 @@ The orchestrator's stack (assembled in `agent.py`, in this order):
 |------------|------|-----|
 | **BudgetMiddleware** | `before_model` | Hard backstop against runaway runs. Two ceilings (cumulative tool calls, cumulative tokens). At **75%** it injects one "wrap up and deliver now" nudge; at **100%** it jumps straight to `end`. |
 | **ForceCompletionMiddleware** | `after_model` | Prevents premature termination. If the model stops with a bare *"Now I will compare…"* intent message and no tool call mid-research, it nudges the model to act (capped). If the model wrote the whole report as a plain message, one mechanical "resubmit via `submit_report` verbatim" nudge; a raw JSON blob gets a "rewrite as a real report" nudge instead. |
-| **ReportQualityGateMiddleware** | `awrap_tool_call` | Intercepts `submit_report` **before** delivery. If the (scrubbed) report still violates the contract — uncited sources, an internal source split across many Sources lines, raw field names — it bounces it back **once** with specific fixes. Then delivers as-is. |
+| **ReportQualityGateMiddleware** | `awrap_tool_call` | Intercepts `submit_report` **before** delivery. If the (scrubbed) report still violates the contract — uncited sources, an internal source split across many Sources lines, raw field names, file paths / file names / "offloaded files" / code calls — it bounces it back **once** with specific fixes. Then delivers as-is. |
 | **ResearchOutputMiddleware** | `after_agent` | Harvests sources, persists the final report into state, and authoritatively classifies *why the run ended* (see §13). Also the salvage path: if the model researched but never called `submit_report`, it recovers genuine report-looking prose (never a JSON blob, never a bare intent stub). |
 | **SkillUsageMiddleware** | `after_model` | Emits a `skill` event the first time each skill is read in a turn. |
 | **ClarificationGuardMiddleware** | `awrap_tool_call` | Blocks `request_clarification` *after* research has begun — so a weak model can't pop a nonsensical question card after minutes of work. Tells it to finish instead. |
@@ -421,8 +422,15 @@ Two deterministic last-mile helpers (`report_hygiene.py`) guarantee what prompt 
   passes the loaded search/MCP/custom list, so any deployment's naming scheme is covered, with the
   legacy `get_*` family always matched as a fallback; only snake_case names are scrubbed, since a
   plain-word name like "screener" is real English and stripping it would damage prose), "server-side", a
-  trailing `(get_x, get_y)` tool list) — prose-safe and idempotent. It runs both inside
-  `submit_report` and again when persisting, so the user never sees plumbing in the report.
+  trailing `(get_x, get_y)` tool list, and **sandbox file paths** (`/workspace/…`, `/skills/…`)
+  left in prose) — prose-safe and idempotent. It runs both inside `submit_report` and again when
+  persisting, so the user never sees plumbing in the report.
+- **`report_problems`** (the gate's detector) additionally flags what a regex cannot rewrite
+  safely: file names (`…json`), "offloaded files", function/recipe calls (`R.card(d)`), sub-agent
+  mentions — seen live as a "Source: R.price_levels(d) on /workspace/data/…" line and a whole
+  "Offloaded Files" section. The gate bounces the report once so the model deletes the machinery
+  sentence itself. `findings_gate.py` applies the same test to a sub-agent finding's `source`, so a
+  path or recipe name is caught at the handoff, before the orchestrator can copy it.
 - **`lint_citations`** reports inline-vs-Sources mismatches (orphans: listed but never cited;
   danglers: cited but not listed) for observability — detection only, it warns rather than silently
   deleting a real source.

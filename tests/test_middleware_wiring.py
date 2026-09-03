@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 
 from langchain.agents.middleware.types import ToolCallRequest
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 
 from deep_research_agent.clarify_fallback import ClarificationGuardMiddleware
 from deep_research_agent.report_gate import ReportQualityGateMiddleware

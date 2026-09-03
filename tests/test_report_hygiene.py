@@ -264,3 +264,41 @@ def test_collapse_note_keeps_the_statistics_the_rows_carried():
     assert "Raw series of 7 timestamped rows, 2026-06-04 to 2026-06-10" in out
     assert "first 19.19, last 11.77, min 11.49 at 2026-06-09, max 19.19 at 2026-06-04, mean 14.28" in out
     assert collapse_series(out) == out and series_runs(out) == []
+
+
+# --- machinery in the body: paths, file names, code calls, "offloaded files" ---
+
+def test_scrub_replaces_sandbox_paths_but_leaves_urls():
+    out = scrub_report("Source: R.price_levels(d) on /workspace/data/social_messages-6debc408.json.")
+    assert "/workspace" not in out and "6debc408" not in out
+    assert out == "Source: R.price_levels(d) on the underlying data."
+    url = "- [1] [Doc](https://example.com/workspace/data/x.json)"
+    assert scrub_report(url) == url                      # a URL path is not a sandbox path
+    assert scrub_report(scrub_report("see /skills/crowd-positioning/recipes.py")) == "see the underlying data"
+
+
+def test_report_problems_flags_paths_calls_and_offloaded_files_sections():
+    md = (
+        "# R\n\nCrowd is long[1].\n\n"
+        "Source: R.price_levels(d) on the underlying data.\n\n"
+        "## Offloaded Files\n"
+        "- social_messages-6debc408.json: full dataset, still needs text extraction.\n"
+        "- /workspace/price_usd_90d.json: trailing 90d price. Used for R.extreme.\n\n"
+        "## Sources\n- [1] Santiment social messages\n"
+    )
+    probs = report_problems(md)
+    joined = " | ".join(probs)
+    assert "mentions files, paths, code or agents" in joined
+    assert "R.price_levels(d)" in joined and "social_messages-6debc408.json" in joined
+    # the gate evaluates the SCRUBBED report — the surviving machinery still trips it
+    assert any("files, paths, code" in p for p in report_problems(scrub_report(md)))
+
+
+def test_report_problems_machinery_detector_is_prose_safe():
+    md = (
+        "# R\n\nWhales offloaded 12k BTC to Coinbase (Nasdaq: COIN)[1]; the U.S. ETF (IBIT) "
+        "absorbed it, i.e. net flows were flat. See coinbase.com (investor relations) and the "
+        "2.5% move vs. the prior week.[2]\n\n"
+        "## Sources\n- [1] Santiment social messages\n- [2] [Doc](https://example.com/data.json)\n"
+    )
+    assert not any("files, paths, code" in p for p in report_problems(md))

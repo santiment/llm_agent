@@ -30,11 +30,12 @@ BUDGET_NUDGE_NAME = "dra_budget_nudge"
 FINDINGS_NUDGE_NAME = "dra_findings_format_nudge"
 RESUBMIT_NUDGE_NAME = "dra_resubmit_nudge"
 LOOP_NUDGE_NAME = "dra_loop_nudge"
+RUNAWAY_NUDGE_NAME = "dra_runaway_nudge"
 COMPACTION_SUMMARY_NAME = "dra_compaction_summary"
 # Synthetic HumanMessages — never a turn boundary.
 _SYNTHETIC_HUMAN_NAMES = {
     NUDGE_NAME, BUDGET_NUDGE_NAME, FINDINGS_NUDGE_NAME, RESUBMIT_NUDGE_NAME,
-    LOOP_NUDGE_NAME, COMPACTION_SUMMARY_NAME,
+    LOOP_NUDGE_NAME, RUNAWAY_NUDGE_NAME, COMPACTION_SUMMARY_NAME,
 }
 
 # Terminal/control tools — invoking these is how a turn *ends*, not "research work".

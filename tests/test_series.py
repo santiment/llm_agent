@@ -25,7 +25,8 @@ def test_find_series_reads_the_metric_servers_shape():
 
 
 def test_find_series_multi_slug_and_bare_shapes():
-    two = json.loads(santiment()); two["data"]["ethereum"] = two["data"]["bitcoin"][:]
+    two = json.loads(santiment())
+    two["data"]["ethereum"] = two["data"]["bitcoin"][:]
     assert set(find_series(json.dumps(two))) == {"bitcoin", "ethereum"}
     bare = [{"dt": f"2026-08-{d:02d}", "v": d} for d in range(1, 11)]
     assert len(find_series(bare)[""]) == 10                       # list, not JSON text

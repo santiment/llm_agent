@@ -30,8 +30,8 @@ _REVISE = (
     "again with the COMPLETE corrected report. Change ONLY the presentation — do NOT alter any "
     "finding, number, or figure:\n{problems}\n"
     "Then resubmit the full report. (Cite claims inline with [n] matching the Sources list; "
-    "list each internal data source on ONE line grouping its [n]; keep tool and field names "
-    "out of the report body.)"
+    "list each internal data source on ONE line grouping its [n]; keep tool, field and file "
+    "names, paths, code and 'offloaded' mentions out of the report body.)"
 )
 
 

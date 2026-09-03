@@ -38,11 +38,19 @@ def build_chat_model(model_id: str, cfg: ResearchConfig) -> ChatOpenAI:
     # read by metering.sum_usage). Non-streamed calls only — see the stream_usage note below.
     if not streaming and cfg.is_openrouter:
         extra_body["usage"] = {"include": True}
+    # ChatOpenAI sends the output cap as `max_completion_tokens` (OpenAI's current name);
+    # OpenRouter documents `max_tokens`, so on that stack send it under both names — same
+    # value, whichever the gateway reads wins.
+    if cfg.max_output_tokens and cfg.is_openrouter:
+        extra_body["max_tokens"] = cfg.max_output_tokens
     return ChatOpenAI(
         model=model_id,
         api_key=cfg.openai_api_key or "missing-key",
         base_url=cfg.base_url,
         temperature=cfg.temperature,
+        # Per-call output cap (DRA_MAX_OUTPUT_TOKENS): the bound on a runaway response —
+        # see ResearchConfig.max_output_tokens. None = no cap.
+        max_tokens=cfg.max_output_tokens or None,
         # Always set both explicitly. A proxied provider can stall a single request far
         # past any sane bound; without a timeout that one call pins its research unit —
         # and its concurrency slot — for the rest of the run. max_retries covers the

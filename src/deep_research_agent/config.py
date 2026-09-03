@@ -49,6 +49,7 @@ def _read_prompt_file(path: str) -> str:
         log.warning("cannot read prompt file %s: %s", path, exc)
         return ""
 
+
 # Cloud-metadata hostnames — never a legitimate outbound target.
 _BLOCKED_HOSTNAMES = {"metadata", "metadata.google.internal"}
 # Dotted/decimal/hex numeric hosts that ipaddress rejects but the resolver accepts
@@ -61,32 +62,53 @@ _DEFAULT_STREAMING_DENYLIST = ["deepseek-v4-flash"]
 
 # Named model packages ("price tiers") — the ONLY place models are chosen; callers pick a
 # package by name (``model_tier`` / ``DRA_MODEL_TIER``), never a model. See README for what
-# each tier is for. Inline $in/$out per 1M tokens, verified 2026-07-30 (they drift);
+# each tier is for and which benchmark picked each slot. Inline $in/$out per 1M tokens,
+# verified against the OpenRouter model index 2026-09-03 (they drift);
 # tests/test_model_tiering.py parses them and fails if a fleet outprices its planner, if a
 # tier undercuts the one below it, or if a slug carries no price.
+#
+# Slot → job class → what picked it (OpenRouter benchmarks + task-spend rankings, 2026-09-03):
+#   research_model    plans/delegates/synthesizes  τ²-bench airline + multi_step_planning/research_report
+#   subagent_model    long tool loops, ≥1M context τ²-bench + web_search/tool_dispatch, cheapest credible
+#   utility_model     map/extract over files       data:extraction, context length over depth
+#   compaction_model  summarize a transcript       summarization category, input-heavy so $in rules
+#   coding_model      write/fix ONE script         code:shell_execution / code:debugging
+# coding_model and compaction_model sit outside the fleet-price invariant: both get a SMALL or
+# rare input, so their per-token price barely shows in a run — pick them for quality.
 MODEL_TIERS: dict[str, dict[str, str]] = {
-    # mimo-v2.5 is absent from _DEFAULT_STREAMING_DENYLIST, so this default tier's planner
-    # streams — add it there if tool_calls come back doubled or dropped.
+    # Rock bottom: one model family end to end, so delegation pays off only via context
+    # isolation. deepseek-v4-flash is on _DEFAULT_STREAMING_DENYLIST, so nothing here streams.
     "extra-low": {
-        "research_model": "xiaomi/mimo-v2.5",                      # $0.14 / $0.28
-        "subagent_model": "deepseek/deepseek-v4-flash",            # $0.14 / $0.28
-        "utility_model": "qwen/qwen3-30b-a3b-instruct-2507",       # $0.05 / $0.19
+        "research_model": "deepseek/deepseek-v4-flash",  # $0.09 / $0.18
+        "subagent_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
+        "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
+        "compaction_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
+        "coding_model": "z-ai/glm-5.3-flash",  # $0.07 / $0.25
     },
+    # qwen3.8-27b: τ² 78.7% at fleet-adjacent prices, but slow (~5 min/task median).
     "low": {
-        "research_model": "deepseek/deepseek-v4-pro",              # $0.43 / $0.87
-        "subagent_model": "deepseek/deepseek-v4-flash",            # $0.14 / $0.28
-        "utility_model": "deepseek/deepseek-v4-flash",             # $0.14 / $0.28
+        "research_model": "qwen/qwen3.8-27b",  # $0.42 / $2.55
+        "subagent_model": "deepseek/deepseek-v4-flash",  # $0.09 / $0.18
+        "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
+        "compaction_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
+        "coding_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
     },
+    # gemini-3.7-flash: τ² #2 overall (80.6%) and GPQA #2 (94.3%) at a flash price.
     "mid": {
-        "research_model": "google/gemini-3.6-flash",               # $1.50 / $7.50
-        "subagent_model": "xiaomi/mimo-v2.5",                      # $0.14 / $0.28
-        "utility_model": "deepseek/deepseek-v4-flash",             # $0.14 / $0.28
+        "research_model": "google/gemini-3.7-flash",  # $0.75 / $3.75
+        "subagent_model": "deepseek/deepseek-v4-flash",  # $0.09 / $0.18
+        "utility_model": "google/gemini-3.5-flash-lite",  # $0.30 / $2.50
+        "compaction_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
+        "coding_model": "google/gemini-3.6-flash",  # $0.75 / $3.75
     },
-    # Utility is long-context by design: that slot maps/extracts, so context binds, not depth.
+    # gpt-5.6-sol over claude-sonnet-5: same price and τ², +8.7pp GPQA, half the latency.
+    # The fleet here is a stronger agent than the planner on τ² — intended: it makes the calls.
     "high": {
-        "research_model": "anthropic/claude-sonnet-5",             # $2.00 / $10.00
-        "subagent_model": "moonshotai/kimi-k2.6",                  # $0.65 / $2.72
-        "utility_model": "google/gemini-3.5-flash-lite",           # $0.30 / $2.50
+        "research_model": "openai/gpt-5.6-sol",  # $2.00 / $10.00
+        "subagent_model": "google/gemini-3.7-flash",  # $0.75 / $3.75
+        "utility_model": "google/gemini-3.5-flash-lite",  # $0.30 / $2.50
+        "compaction_model": "google/gemini-3-flash-preview",  # $0.50 / $3.00
+        "coding_model": "deepseek/deepseek-v4-pro",  # $1.04 / $2.08
     },
 }
 
@@ -140,8 +162,12 @@ def _flag(c: dict, *keys: str, env: str = "", default: bool) -> bool:
             return True
         if s in _FLAG_OFF:
             return False
-        log.warning("unrecognized boolean %r for %s — keeping default %s",
-                    v, keys[0] if keys else env, default)
+        log.warning(
+            "unrecognized boolean %r for %s — keeping default %s",
+            v,
+            keys[0] if keys else env,
+            default,
+        )
         return default
     return bool(v)
 
@@ -149,7 +175,9 @@ def _flag(c: dict, *keys: str, env: str = "", default: bool) -> bool:
 def _allowed_base_urls() -> set[str]:
     """Trusted OpenAI-compatible endpoints. The server-side env/default is always
     allowed; operators may add more via ``DRA_ALLOWED_BASE_URLS`` (comma-separated)."""
-    allowed = {_env("OPENAI_BASE_URL", default="https://openrouter.ai/api/v1").rstrip("/")}
+    allowed = {
+        _env("OPENAI_BASE_URL", default="https://openrouter.ai/api/v1").rstrip("/")
+    }
     for u in _env("DRA_ALLOWED_BASE_URLS").split(","):
         u = u.strip().rstrip("/")
         if u:
@@ -182,8 +210,13 @@ def url_blocked(url: str, *, allow_private: bool) -> str | None:
         return None  # a DNS name — not an IP literal to vet
     if ip.is_link_local:
         return f"link-local address {host} blocked"
-    if not allow_private and (ip.is_private or ip.is_loopback or ip.is_reserved
-                              or ip.is_multicast or ip.is_unspecified):
+    if not allow_private and (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    ):
         return f"non-public address {host} blocked"
     return None
 
@@ -237,7 +270,27 @@ class ResearchConfig:
     # offloaded result files. Future verifier / compaction features share this key.
     subagent_model: str
     utility_model: str
-    temperature: float = 0.0
+    # coding_model writes or fixes ONE Python script per task for the orchestrator and the
+    # research-subagents (the coding-subagent in agent.py) — a dedicated coder on a small
+    # input, so a failed `execute` is fixed by a model good at it instead of by narrated
+    # shell-quoting retries. Falls back to subagent_model when a tier omits it.
+    coding_model: str
+    # compaction_model summarizes an over-long transcript (compaction.py) — a rare,
+    # input-heavy call where summary quality matters more than depth. Falls back to
+    # utility_model when a tier omits it.
+    compaction_model: str
+    # Sampling temperature for every model call. Not 0: greedy decoding is what sends a
+    # small model into endless repetition (Qwen's model cards say so outright; the runaway
+    # guard in loop_guard.py exists for exactly that), and research prose gains nothing
+    # from bit-exact determinism. DRA_TEMPERATURE.
+    temperature: float = 0.3
+    # Output cap (tokens) on every model call — bounds how far ONE degenerate response can
+    # run; without it, until the provider's own ceiling, at full price. Well above any
+    # legitimate single message: a tool call is small and a long report is a few thousand
+    # tokens. A response that hits the cap is trimmed and the model is nudged to continue
+    # (loop_guard.py), so a real overrun loses its tail, never the run. 0 sends no cap.
+    # DRA_MAX_OUTPUT_TOKENS.
+    max_output_tokens: int = 16_000
     # OpenRouter unified `reasoning` effort sent with every model call: none/minimal/
     # low/medium/high, or "" for the provider default. Thinking bills as OUTPUT tokens
     # and provider defaults run medium/dynamic, so capped to "low" by default; "none"
@@ -265,6 +318,12 @@ class ResearchConfig:
     # permanently-throttled server can't hang a run forever. Same altitude as
     # mcp_max_concurrency so both throttle knobs are operator-tunable.
     mcp_rate_limit_max_wait: float = 120.0
+    # How long (seconds) a server's tool LISTING is reused across graph builds. make_graph
+    # runs per research run, and listing tools is a network round-trip per server (the
+    # single biggest cost of a graph build — 0.4–0.7 s measured, what the dev server
+    # flags as "Slow graph load"). Tool schemas change on deploys, not per run, so a
+    # short TTL keeps every run from paying it. 0 = list on every build. DRA_MCP_TOOLS_TTL.
+    mcp_tools_ttl: float = 600.0
     # Each server dict carries a human-friendly ``label`` (e.g. "Data Provider
     # MCP") used in the report's Sources, plus the connection ``name``
     # (tool-name prefix), ``url``, ``headers`` and optional ``tools`` allow-list.
@@ -297,7 +356,8 @@ class ResearchConfig:
     # dropped, stalling the loop. Streaming is force-disabled for matches (models.py).
     # Override via DRA_STREAMING_DENYLIST (comma-separated substrings).
     streaming_denylist: list[str] = field(
-        default_factory=lambda: list(_DEFAULT_STREAMING_DENYLIST))
+        default_factory=lambda: list(_DEFAULT_STREAMING_DENYLIST)
+    )
     # LangGraph super-step ceiling for the orchestrator (agent.py clamps deepagents' 9_999).
     # ~7 super-steps per ReAct loop here, so this caps loops, not tool calls. Must stay ABOVE
     # max_tool_calls × steps-per-loop so BudgetMiddleware — the real runaway guard — binds
@@ -309,8 +369,13 @@ class ResearchConfig:
     # call ceiling can be generous. Without a sandbox these still backstop runaway runs.
     max_tool_calls: int = 200
     max_total_tokens: int = 4_000_000
+    # Wall-clock ceiling per run (seconds). Calls and tokens do not bound TIME: a fleet of
+    # slow sub-agents retrying against a dead sandbox ran 90 minutes under both ceilings.
+    # Same two stages (wrap-up nudge at 75%, hard stop at 100%). 0 = no cap.
+    # DRA_MAX_RUN_SECONDS.
+    max_run_seconds: int = 2_700
     # In-flight context compaction (compaction.py): an estimated context above this many
-    # tokens summarizes older messages on utility_model. Absolute, since an OpenRouter slug
+    # tokens summarizes older messages on compaction_model. Absolute, since an OpenRouter slug
     # does not expose its window; 0 disables. DRA_COMPACTION_TOKENS.
     compaction_tokens: int = 100_000
     # cache_control breakpoints on every model request (caching.py); OpenRouter only.
@@ -337,7 +402,11 @@ class ResearchConfig:
     sandbox_url: str = ""
     sandbox_token: str = ""
     sandbox_network: bool = False
-    sandbox_session_timeout: int = 900
+    # The sandbox container self-terminates after this many seconds — taking every file the
+    # run offloaded or wrote with it. It MUST outlive the run (max_run_seconds plus slack):
+    # at the service default of 900 s, every run past 15 minutes lost its data files and
+    # ground on with failing `execute` calls. LLM_SANDBOX_SESSION_TIMEOUT.
+    sandbox_session_timeout: int = 5_400
 
     @property
     def is_openrouter(self) -> bool:
@@ -349,10 +418,16 @@ class ResearchConfig:
         c = (config or {}).get("configurable", {}) or {}
         keys = c.get("apiKeys") or {}
 
-        openai_key = (keys.get("OPENAI_API_KEY") or c.get("openai_api_key")
-                      or _env("OPENAI_API_KEY", "OPENROUTER_API_KEY"))
-        tavily_key = (keys.get("TAVILY_API_KEY") or c.get("tavily_api_key")
-                      or _env("TAVILY_API_KEY"))
+        openai_key = (
+            keys.get("OPENAI_API_KEY")
+            or c.get("openai_api_key")
+            or _env("OPENAI_API_KEY", "OPENROUTER_API_KEY")
+        )
+        tavily_key = (
+            keys.get("TAVILY_API_KEY")
+            or c.get("tavily_api_key")
+            or _env("TAVILY_API_KEY")
+        )
         # base_url allowlist: a hostile `configurable.base_url` would receive the server's
         # API key as a Bearer token (key exfiltration). Honor an override only if it is on
         # the allowlist; otherwise fall back to the trusted env/default.
@@ -362,17 +437,26 @@ class ResearchConfig:
             base_url = requested_base
         else:
             if requested_base:
-                log.warning("ignoring non-allowlisted base_url override: %s", requested_base)
+                log.warning(
+                    "ignoring non-allowlisted base_url override: %s", requested_base
+                )
             base_url = trusted_base
 
         # Named package (see MODEL_TIERS); the cheapest one when nothing is configured.
         # A name is the ONLY model input there is — see the note below on legacy keys.
-        tier_name = (c.get("model_tier")
-                     or _env("DRA_MODEL_TIER", default=DEFAULT_MODEL_TIER)).strip().lower()
+        tier_name = (
+            (c.get("model_tier") or _env("DRA_MODEL_TIER", default=DEFAULT_MODEL_TIER))
+            .strip()
+            .lower()
+        )
         tier = MODEL_TIERS.get(tier_name)
         if tier is None:
-            log.warning("unknown model_tier %r — using %r (known tiers: %s)",
-                        tier_name, DEFAULT_MODEL_TIER, ", ".join(sorted(MODEL_TIERS)))
+            log.warning(
+                "unknown model_tier %r — using %r (known tiers: %s)",
+                tier_name,
+                DEFAULT_MODEL_TIER,
+                ", ".join(sorted(MODEL_TIERS)),
+            )
             tier = MODEL_TIERS[DEFAULT_MODEL_TIER]
 
         # Models come ONLY from the tier package — deliberately no per-model env vars
@@ -380,16 +464,32 @@ class ResearchConfig:
         # (DRA_MODEL_TIER / configurable.model_tier); which models that name means is
         # decided in code (MODEL_TIERS), in one reviewed place. Callers still sending
         # the legacy per-model keys get a warning, not silent ignoring.
-        _ignored = [k for k in ("research_model", "subagent_model", "utility_model",
-                                "final_report_model", "report_model", "compression_model")
-                    if c.get(k)]
+        _ignored = [
+            k
+            for k in (
+                "research_model",
+                "subagent_model",
+                "utility_model",
+                "coding_model",
+                "compaction_model",
+                "final_report_model",
+                "report_model",
+                "compression_model",
+            )
+            if c.get(k)
+        ]
         if _ignored:
-            log.warning("per-run model selection is disabled — ignoring %s; "
-                        "pick a package via configurable.model_tier instead", _ignored)
+            log.warning(
+                "per-run model selection is disabled — ignoring %s; "
+                "pick a package via configurable.model_tier instead",
+                _ignored,
+            )
         research_model = _strip_provider(tier["research_model"])
         report_model = research_model  # reserved for a future dedicated synthesis step
         subagent_model = _strip_provider(tier.get("subagent_model") or research_model)
         utility_model = _strip_provider(tier.get("utility_model") or subagent_model)
+        coding_model = _strip_provider(tier.get("coding_model") or subagent_model)
+        compaction_model = _strip_provider(tier.get("compaction_model") or utility_model)
 
         # MCP servers, in precedence order: native `mcp_servers`, compat single
         # `mcp_config`, `DRA_MCP_SERVERS` (JSON list of {label,url,...}), or a single
@@ -401,13 +501,15 @@ class ResearchConfig:
             # (the URL may already carry a path like /threads/<id>, so we append
             # explicitly here rather than relying on the bare-host rule below).
             base = (mc.get("url") or "").rstrip("/")
-            mcp_servers = [{
-                "name": mc.get("name", "mcp"),
-                "label": mc.get("label", ""),
-                "url": (base + "/mcp") if base else "",
-                "tools": mc.get("tools") or [],
-                "headers": mc.get("headers") or {},
-            }]
+            mcp_servers = [
+                {
+                    "name": mc.get("name", "mcp"),
+                    "label": mc.get("label", ""),
+                    "url": (base + "/mcp") if base else "",
+                    "tools": mc.get("tools") or [],
+                    "headers": mc.get("headers") or {},
+                }
+            ]
         if not mcp_servers and _env("DRA_MCP_SERVERS"):
             try:
                 parsed = json.loads(_env("DRA_MCP_SERVERS"))
@@ -424,9 +526,13 @@ class ResearchConfig:
         for s in mcp_servers:
             if s.get("url"):
                 s["url"] = _normalize_mcp_url(s["url"])
-            blocked = _mcp_url_blocked(s.get("url", "")) if s.get("url") else "missing url"
+            blocked = (
+                _mcp_url_blocked(s.get("url", "")) if s.get("url") else "missing url"
+            )
             if blocked:
-                log.warning("refusing MCP server %s: %s", s.get("url") or "(none)", blocked)
+                log.warning(
+                    "refusing MCP server %s: %s", s.get("url") or "(none)", blocked
+                )
                 continue
             if not s.get("name"):
                 s["name"] = _slug_from_url(s.get("url", "")) or "mcp"
@@ -442,18 +548,34 @@ class ResearchConfig:
         # Every remaining field resolves through _pick / _flag: configurable key(s) ->
         # env var -> the dataclass default (`cls.<field>`, so no default is written twice).
         # A denylist supplied by the caller is a list; from the env it is comma-separated.
-        denylist = _pick(c, "streaming_denylist", env="DRA_STREAMING_DENYLIST",
-                         default=_DEFAULT_STREAMING_DENYLIST)
+        denylist = _pick(
+            c,
+            "streaming_denylist",
+            env="DRA_STREAMING_DENYLIST",
+            default=_DEFAULT_STREAMING_DENYLIST,
+        )
         if isinstance(denylist, str):
             denylist = denylist.split(",")
 
-        reasoning_effort = str(_pick(
-            c, "reasoning_effort", env="DRA_REASONING_EFFORT",
-            default=cls.reasoning_effort)).strip().lower()
+        reasoning_effort = (
+            str(
+                _pick(
+                    c,
+                    "reasoning_effort",
+                    env="DRA_REASONING_EFFORT",
+                    default=cls.reasoning_effort,
+                )
+            )
+            .strip()
+            .lower()
+        )
         if reasoning_effort not in _REASONING_EFFORTS:
-            log.warning("unknown reasoning_effort %r — using %r (allowed: %s)",
-                        reasoning_effort, cls.reasoning_effort,
-                        ", ".join(sorted(v or "\"\"" for v in _REASONING_EFFORTS)))
+            log.warning(
+                "unknown reasoning_effort %r — using %r (allowed: %s)",
+                reasoning_effort,
+                cls.reasoning_effort,
+                ", ".join(sorted(v or '""' for v in _REASONING_EFFORTS)),
+            )
             reasoning_effort = cls.reasoning_effort
 
         return cls(
@@ -464,64 +586,156 @@ class ResearchConfig:
             report_model=report_model,
             subagent_model=subagent_model,
             utility_model=utility_model,
-            temperature=float(_pick(c, "temperature", default=cls.temperature)),
+            coding_model=coding_model,
+            compaction_model=compaction_model,
+            temperature=float(_pick(
+                c, "temperature", env="DRA_TEMPERATURE", default=cls.temperature)),
+            max_output_tokens=max(0, int(_pick(
+                c, "max_output_tokens", env="DRA_MAX_OUTPUT_TOKENS",
+                default=cls.max_output_tokens))),
             reasoning_effort=reasoning_effort,
-            request_timeout=float(_pick(
-                c, "request_timeout", env="DRA_REQUEST_TIMEOUT",
-                default=cls.request_timeout)),
-            max_retries=max(0, int(_pick(
-                c, "max_retries", env="DRA_MAX_RETRIES", default=cls.max_retries))),
-            search_max_results=int(_pick(
-                c, "search_max_results", default=cls.search_max_results)),
-            mcp_max_concurrency=max(1, int(_pick(
-                c, "mcp_max_concurrency", env="DRA_MCP_MAX_CONCURRENCY",
-                default=cls.mcp_max_concurrency))),
-            mcp_rate_limit_max_wait=float(_pick(
-                c, "mcp_rate_limit_max_wait", env="DRA_MCP_RATE_LIMIT_MAX_WAIT",
-                default=cls.mcp_rate_limit_max_wait)),
+            request_timeout=float(
+                _pick(
+                    c,
+                    "request_timeout",
+                    env="DRA_REQUEST_TIMEOUT",
+                    default=cls.request_timeout,
+                )
+            ),
+            max_retries=max(
+                0,
+                int(
+                    _pick(
+                        c, "max_retries", env="DRA_MAX_RETRIES", default=cls.max_retries
+                    )
+                ),
+            ),
+            search_max_results=int(
+                _pick(c, "search_max_results", default=cls.search_max_results)
+            ),
+            mcp_max_concurrency=max(
+                1,
+                int(
+                    _pick(
+                        c,
+                        "mcp_max_concurrency",
+                        env="DRA_MCP_MAX_CONCURRENCY",
+                        default=cls.mcp_max_concurrency,
+                    )
+                ),
+            ),
+            mcp_rate_limit_max_wait=float(
+                _pick(
+                    c,
+                    "mcp_rate_limit_max_wait",
+                    env="DRA_MCP_RATE_LIMIT_MAX_WAIT",
+                    default=cls.mcp_rate_limit_max_wait,
+                )
+            ),
+            max_run_seconds=max(0, int(_pick(
+                c, "max_run_seconds", env="DRA_MAX_RUN_SECONDS", default=cls.max_run_seconds))),
+            mcp_tools_ttl=max(0.0, float(_pick(
+                c, "mcp_tools_ttl", env="DRA_MCP_TOOLS_TTL", default=cls.mcp_tools_ttl))),
             mcp_servers=mcp_servers,
             mcp_prompt=c.get("mcp_prompt") or "",
-            domain_prompt=(_pick(c, "domain_prompt", env="DRA_DOMAIN_PROMPT", default="")
-                           or _read_prompt_file(_env("DRA_DOMAIN_PROMPT_FILE"))),
-            custom_tools_dir=_pick(c, "custom_tools_dir", env="DRA_CUSTOM_TOOLS_DIR",
-                                   default=_repo_dir("custom_tools")),
-            skills_dir=_pick(c, "skills_dir", env="DRA_SKILLS_DIR",
-                             default=_repo_dir("skills")),
+            domain_prompt=(
+                _pick(c, "domain_prompt", env="DRA_DOMAIN_PROMPT", default="")
+                or _read_prompt_file(_env("DRA_DOMAIN_PROMPT_FILE"))
+            ),
+            custom_tools_dir=_pick(
+                c,
+                "custom_tools_dir",
+                env="DRA_CUSTOM_TOOLS_DIR",
+                default=_repo_dir("custom_tools"),
+            ),
+            skills_dir=_pick(
+                c, "skills_dir", env="DRA_SKILLS_DIR", default=_repo_dir("skills")
+            ),
             streaming=_flag(c, "streaming", env="DRA_STREAMING", default=cls.streaming),
             streaming_denylist=[s.strip().lower() for s in denylist if str(s).strip()],
-            recursion_limit=int(_pick(
-                c, "recursion_limit", env="DRA_RECURSION_LIMIT",
-                default=cls.recursion_limit)),
-            max_tool_calls=int(_pick(
-                c, "max_react_tool_calls", "max_tool_calls", env="DRA_MAX_TOOL_CALLS",
-                default=cls.max_tool_calls)),
-            max_total_tokens=int(_pick(
-                c, "max_total_tokens", env="DRA_MAX_TOTAL_TOKENS",
-                default=cls.max_total_tokens)),
-            compaction_tokens=int(_pick(
-                c, "compaction_tokens", env="DRA_COMPACTION_TOKENS",
-                default=cls.compaction_tokens)),
-            prompt_caching=_flag(c, "prompt_caching", env="DRA_PROMPT_CACHING",
-                                 default=cls.prompt_caching),
-            web_fetch=_flag(c, "web_fetch", env="DRA_WEB_FETCH",
-                            default=cls.web_fetch),
-            max_result_chars=int(_pick(
-                c, "max_result_chars", env="DRA_MAX_RESULT_CHARS",
-                default=cls.max_result_chars)),
-            max_result_rows=int(_pick(
-                c, "max_result_rows", env="DRA_MAX_RESULT_ROWS",
-                default=cls.max_result_rows)),
-            offload_results=_flag(c, "offload_results", env="DRA_OFFLOAD_RESULTS",
-                                  default=cls.offload_results),
-            offload_dir=_pick(c, "offload_dir", env="DRA_OFFLOAD_DIR",
-                              default=cls.offload_dir),
-            sandbox_url=str(_pick(c, "sandbox_url", env="LLM_SANDBOX_URL",
-                                  default=cls.sandbox_url)).rstrip("/"),
-            sandbox_token=_pick(c, "sandbox_token", env="LLM_SANDBOX_TOKEN",
-                                default=cls.sandbox_token),
-            sandbox_network=_flag(c, "sandbox_network", env="LLM_SANDBOX_NETWORK",
-                                  default=cls.sandbox_network),
-            sandbox_session_timeout=int(_pick(
-                c, "sandbox_session_timeout", env="LLM_SANDBOX_SESSION_TIMEOUT",
-                default=cls.sandbox_session_timeout)),
+            recursion_limit=int(
+                _pick(
+                    c,
+                    "recursion_limit",
+                    env="DRA_RECURSION_LIMIT",
+                    default=cls.recursion_limit,
+                )
+            ),
+            max_tool_calls=int(
+                _pick(
+                    c,
+                    "max_react_tool_calls",
+                    "max_tool_calls",
+                    env="DRA_MAX_TOOL_CALLS",
+                    default=cls.max_tool_calls,
+                )
+            ),
+            max_total_tokens=int(
+                _pick(
+                    c,
+                    "max_total_tokens",
+                    env="DRA_MAX_TOTAL_TOKENS",
+                    default=cls.max_total_tokens,
+                )
+            ),
+            compaction_tokens=int(
+                _pick(
+                    c,
+                    "compaction_tokens",
+                    env="DRA_COMPACTION_TOKENS",
+                    default=cls.compaction_tokens,
+                )
+            ),
+            prompt_caching=_flag(
+                c,
+                "prompt_caching",
+                env="DRA_PROMPT_CACHING",
+                default=cls.prompt_caching,
+            ),
+            web_fetch=_flag(c, "web_fetch", env="DRA_WEB_FETCH", default=cls.web_fetch),
+            max_result_chars=int(
+                _pick(
+                    c,
+                    "max_result_chars",
+                    env="DRA_MAX_RESULT_CHARS",
+                    default=cls.max_result_chars,
+                )
+            ),
+            max_result_rows=int(
+                _pick(
+                    c,
+                    "max_result_rows",
+                    env="DRA_MAX_RESULT_ROWS",
+                    default=cls.max_result_rows,
+                )
+            ),
+            offload_results=_flag(
+                c,
+                "offload_results",
+                env="DRA_OFFLOAD_RESULTS",
+                default=cls.offload_results,
+            ),
+            offload_dir=_pick(
+                c, "offload_dir", env="DRA_OFFLOAD_DIR", default=cls.offload_dir
+            ),
+            sandbox_url=str(
+                _pick(c, "sandbox_url", env="LLM_SANDBOX_URL", default=cls.sandbox_url)
+            ).rstrip("/"),
+            sandbox_token=_pick(
+                c, "sandbox_token", env="LLM_SANDBOX_TOKEN", default=cls.sandbox_token
+            ),
+            sandbox_network=_flag(
+                c,
+                "sandbox_network",
+                env="LLM_SANDBOX_NETWORK",
+                default=cls.sandbox_network,
+            ),
+            sandbox_session_timeout=int(
+                _pick(
+                    c,
+                    "sandbox_session_timeout",
+                    env="LLM_SANDBOX_SESSION_TIMEOUT",
+                    default=cls.sandbox_session_timeout,
+                )
+            ),
         )
