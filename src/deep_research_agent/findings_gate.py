@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from itertools import islice
 from typing import Any
 
@@ -34,6 +35,7 @@ from langchain.agents.middleware import AgentMiddleware, hook_config
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from .events import emit
+from .report_hygiene import series_runs
 from .turn import FINDINGS_NUDGE_NAME, count_nudges, text_of
 
 log = logging.getLogger("deep_research_agent.findings_gate")
@@ -54,6 +56,18 @@ _BOUNCE = (
     "Fix ONLY these problems and resend your COMPLETE findings as one JSON object in "
     "the RETURN FORMAT from your instructions. Do not alter any finding, number, or "
     "source you already gathered."
+)
+
+
+# A "source" that names WHERE a number came from instead of WHOSE data it is: a sandbox
+# path, a result-file name, or a function call ("R.price_levels(d) on /workspace/data/…").
+# Copied verbatim into the report by the orchestrator, so it is caught at the handoff.
+_BAD_SOURCE = re.compile(
+    r"/workspace|/skills|/large_tool_results"
+    r"|(?<![\w/.:])[\w\-]+\.(?:json|py|csv|parquet)\b"
+    r"|\b[A-Za-z_]\w*\.[a-z_]+\([^()\n]*\)"
+    r"|\boffloaded?\b|\bexecute\b",
+    re.IGNORECASE,
 )
 
 
@@ -125,9 +139,23 @@ def _problems(obj: dict | None) -> list[str]:
                 continue
             if not str(f.get("finding") or "").strip():
                 problems.append(f'findings[{i}] is missing "finding"')
-            if not str(f.get("source") or "").strip():
+            src = str(f.get("source") or "").strip()
+            if not src:
                 problems.append(
                     f'findings[{i}] is missing "source" — every finding must be attributed')
+            elif not src.lower().startswith(("http://", "https://")) and _BAD_SOURCE.search(src):
+                problems.append(
+                    f'findings[{i}] "source" names a file, path or function ({src[:60]!r}) — the '
+                    "source is the LABEL of the data source the file came from (as listed under "
+                    "DATA SOURCES, or the label in your task) or a URL; never a path, tool, "
+                    "recipe or file name")
+            if series_runs(str(f.get("evidence") or "")):
+                problems.append(
+                    f'findings[{i}] "evidence" transcribes a raw time series — summarize it '
+                    "(first/last value, peak/trough with when, average, direction) instead of "
+                    "listing buckets")
+    if isinstance(summary, str) and series_runs(summary):
+        problems.append('"summary" transcribes a raw time series — summarize it, never list buckets')
     gaps = obj.get("gaps")
     if gaps is not None and not isinstance(gaps, list):
         problems.append('"gaps", when present, must be a list')

@@ -142,3 +142,16 @@ if __name__ == "__main__":
             fn()
             print(f"ok  {name}")
     print("all domain-prompt tests passed")
+
+
+def test_every_prompt_carries_the_current_date():
+    from datetime import date
+    from deep_research_agent.prompts import (coding_prompt, current_date_line, extract_prompt,
+                                             orchestrator_prompt, subagent_prompt)
+    today = date.today().isoformat()
+    for prompt in (orchestrator_prompt(""), subagent_prompt(""), extract_prompt()):
+        assert f"CURRENT DATE: {today} (UTC)" in prompt
+        assert "never against the year your training data suggests" in prompt
+    assert "CURRENT DATE" not in coding_prompt()   # code has no calendar
+    assert "2026-01-31" in current_date_line(date(2026, 1, 31))
+

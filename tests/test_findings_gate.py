@@ -23,6 +23,7 @@ from deep_research_agent.findings_gate import (
     findings_problems,
 )
 from deep_research_agent.turn import FINDINGS_NUDGE_NAME, current_turn
+from conftest import capture_events_cm, make_state
 
 VALID = (
     '{"summary": "BTC unit done: 3 figures gathered.",'
@@ -87,16 +88,12 @@ def test_evidence_is_optional_in_validator() -> None:
 
 # --- middleware -------------------------------------------------------------
 
-def _state(*messages) -> dict:
-    return {"messages": list(messages)}
-
-
 def test_bounces_prose_once_then_accepts() -> None:
     mw = SubagentFindingsMiddleware()
     work = [HumanMessage("unit: BTC"), ToolMessage("rows", tool_call_id="1")]
     bad = AIMessage("I looked at BTC and it seems fine.")
 
-    update = mw.after_model(_state(*work, bad), None)
+    update = mw.after_model(make_state(*work, bad), None)
     assert update and update.get("jump_to") == "model", update
     nudge = update["messages"][0]
     assert getattr(nudge, "name", None) == FINDINGS_NUDGE_NAME
@@ -104,31 +101,31 @@ def test_bounces_prose_once_then_accepts() -> None:
 
     # Same instance, nudge now present in state -> accepted as-is (cap is in state,
     # not on the instance).
-    again = mw.after_model(_state(*work, nudge, bad), None)
+    again = mw.after_model(make_state(*work, nudge, bad), None)
     assert again is None
 
 
 def test_valid_json_and_tool_calls_pass_through() -> None:
     mw = SubagentFindingsMiddleware()
     did_work = ToolMessage("rows", tool_call_id="1")
-    assert mw.after_model(_state(did_work, AIMessage(VALID)), None) is None
+    assert mw.after_model(make_state(did_work, AIMessage(VALID)), None) is None
     working = AIMessage("", tool_calls=[
         {"name": "web_search", "args": {"query": "x"}, "id": "1"}])
-    assert mw.after_model(_state(working), None) is None
-    assert mw.after_model(_state(AIMessage("")), None) is None        # empty content
-    assert mw.after_model(_state(HumanMessage("hi")), None) is None   # not an AIMessage
-    assert mw.after_model(_state(), None) is None                     # no messages
+    assert mw.after_model(make_state(working), None) is None
+    assert mw.after_model(make_state(AIMessage("")), None) is None        # empty content
+    assert mw.after_model(make_state(HumanMessage("hi")), None) is None   # not an AIMessage
+    assert mw.after_model(make_state(), None) is None                     # no messages
 
 
 def test_provenance_findings_without_tools_bounce() -> None:
     mw = SubagentFindingsMiddleware()
     # Non-empty findings with ZERO tool calls in state -> fabricated from memory -> bounce.
-    update = mw.after_model(_state(HumanMessage("unit: BTC"), AIMessage(VALID)), None)
+    update = mw.after_model(make_state(HumanMessage("unit: BTC"), AIMessage(VALID)), None)
     assert update and update.get("jump_to") == "model", update
     assert "tool" in update["messages"][0].content
     # Honest empty findings with no tool calls is legitimate -> accepted.
     empty = '{"summary": "no data available for this unit", "findings": []}'
-    assert mw.after_model(_state(HumanMessage("unit: X"), AIMessage(empty)), None) is None
+    assert mw.after_model(make_state(HumanMessage("unit: X"), AIMessage(empty)), None) is None
 
 
 def test_findings_nudge_is_not_a_turn_boundary() -> None:
@@ -138,21 +135,14 @@ def test_findings_nudge_is_not_a_turn_boundary() -> None:
     assert turn[0] is msgs[0], "findings nudge must not start a new turn"
 
 
-def test_accepted_findings_emit_structured_event(monkeypatch=None) -> None:
+def test_accepted_findings_emit_structured_event() -> None:
     # On clean accept, a `subagent_findings` event fires carrying the parsed object +
     # a unit label (the sub-agent's task assignment) — that's what the UI renders.
-    import deep_research_agent.findings_gate as fg
-
-    captured = []
-    orig = fg.emit
-    fg.emit = lambda ev: captured.append(ev)
-    try:
+    with capture_events_cm() as captured:
         mw = SubagentFindingsMiddleware()
-        state = _state(HumanMessage("Research BTC on-chain activity"),
-                       ToolMessage("rows", tool_call_id="1"), AIMessage(VALID))
+        state = make_state(HumanMessage("Research BTC on-chain activity"),
+                           ToolMessage("rows", tool_call_id="1"), AIMessage(VALID))
         assert mw.after_model(state, None) is None  # accepted
-    finally:
-        fg.emit = orig
 
     ev = next((e for e in captured if e.get("type") == "subagent_findings"), None)
     assert ev, captured
@@ -174,3 +164,32 @@ if __name__ == "__main__":
     test_findings_nudge_is_not_a_turn_boundary()
     test_accepted_findings_emit_structured_event()
     print("OK — structured-findings gate verified.")
+
+
+def test_findings_evidence_with_raw_series_is_bounced() -> None:
+    import json
+
+    rows = "\n".join(f"2026-09-01T{h:02d}:00:00Z: bearish=0.05, bullish=0.38, neutral=0.57"
+                     for h in range(9, 16))
+    obj = {"summary": "Mood stayed bullish.",
+           "findings": [{"finding": "Bullish share held near 38%.", "evidence": rows,
+                         "source": "Santiment social messages"}]}
+    probs = findings_problems(json.dumps(obj))
+    assert any("raw time series" in p for p in probs)
+    obj["findings"][0]["evidence"] = "bullish share 0.36–0.41 across 7 hours, flat, peak 11:00"
+    assert findings_problems(json.dumps(obj)) == []
+
+
+def test_source_that_names_a_file_path_or_recipe_call_is_bounced() -> None:
+    import json
+    bad = json.dumps({"summary": "s", "findings": [
+        {"finding": "support at 77k (11 voices)", "source": "R.price_levels(d) on /workspace/data/social_messages-6debc408.json"},
+        {"finding": "94th pct", "source": "price_usd_90d.json"},
+        {"finding": "organic 62%", "source": "computed via execute over the offloaded file"},
+        {"finding": "fine", "source": "Santiment social messages"},
+        {"finding": "fine too", "source": "https://example.com/execute-order/data.json"},
+    ]})
+    probs = findings_problems(bad)
+    assert len(probs) == 3, probs
+    assert all("names a file, path or function" in p for p in probs)
+    assert "findings[0]" in probs[0] and "findings[1]" in probs[1] and "findings[2]" in probs[2]

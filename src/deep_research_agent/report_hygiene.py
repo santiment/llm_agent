@@ -8,14 +8,20 @@ Two pure helpers applied to the final report markdown:
   - ``lint_citations``: report inline-``[n]`` vs ``## Sources`` ``[n]`` mismatches (orphans /
     danglers) for observability. DETECTION only — auto-pruning a source the model merely
     forgot to cite would lose a real source, so this warns rather than edits.
+  - ``series_runs`` / ``collapse_series``: runs of timestamped data rows (a raw time series).
+    ``report_problems`` flags them so the quality gate bounces the report; ``collapse_series``
+    drops any that still ship, leaving a one-line note with the statistics.
 """
 
 from __future__ import annotations
 
 import re
+import statistics
 from collections import Counter
 from functools import lru_cache
 from typing import NamedTuple
+
+from .series import _num, fmt_num
 
 # Tool names leak into reports in several shapes; handle each, since the model varies
 # the delimiter (parentheses one run, an em-dash list the next). Which names to scrub
@@ -65,6 +71,11 @@ def _patterns(tool_names) -> _Patterns:
 
 # Stray implementation adjective.
 _SERVER_SIDE = re.compile(r"\s*\bserver-side\b")
+# A sandbox file path ("/workspace/data/social_messages-6debc408.json"): where a result was
+# stored is machinery the reader never needs. Scrubbed to the same neutral phrase as a tool
+# name; the gate then flags whatever machinery sentence was built around it.
+_SANDBOX_PATH = re.compile(
+    r"(?<![\w/])(?:/workspace|/skills|/large_tool_results)(?:/[\w\-]+(?:\.[\w\-]+)*)*")
 # Artifacts left by the removals above.
 _EMPTY_PAREN = re.compile(r"\(\s*\)")
 _DANGLING_SEP = re.compile(r"(?m)[ \t]*[—–:]+[ \t]*$")
@@ -76,12 +87,142 @@ _SOURCES_HEADING = re.compile(r"(?im)^\s{0,3}#{1,6}\s*sources\b.*$")
 # A backticked field/identifier (snake_case) — machinery that must not appear in the
 # report body. (Bare tool names are matched by the per-run ``_patterns().bare``.)
 _BACKTICK_FIELD = re.compile(r"`[^`\n]*[a-z]+_[a-z]+[^`\n]*`")
+# Data-layer machinery in prose that no regex can rewrite safely, so the gate bounces it:
+# the reader must never learn that files exist, where they live, or what code produced a
+# number. Seen live: "Source: R.price_levels(d) on /workspace/data/…json" and a whole
+# "Offloaded Files" section listing paths with "still needs text extraction".
+_MACHINERY = re.compile(
+    r"(?<![\w/])(?:/workspace|/skills|/large_tool_results)(?:/[\w\-]+(?:\.[\w\-]+)*)*"  # a sandbox path
+    r"|(?<![\w/.:])[\w\-]+\.(?:json|py|csv|parquet|pkl)\b"                  # a data/script file name
+    r"|\boffloaded?\s+(?:result\s+)?files?\b|\bresult\s+files?\b"          # "offloaded files"
+    r"|\b[A-Za-z_]\w*\.(?!(?:com|org|net|io|co|ai|xyz)\()[a-z_]+\([^()\n]*\)"  # a call: R.card(d), json.load(f)
+    r"|\b(?:research|extract|coding)-subagents?\b|\bsub-?agents?\b",
+    re.IGNORECASE,
+)
 # A Sources bullet: "- [1] Label" / "- [1][2] Label" → captures the label after the numbers.
 _SRC_LABEL = re.compile(r"^\s*-?\s*(?:\[\d+\])+\s*(.+?)\s*$")
 # An EMPTY Sources bullet: numbers with nothing after them ("- [1]") — a citation that
 # points nowhere. Seen live from a mid-tier writer: ten bare [n] bullets shipped because
 # every other check only counts numbers, not whether an entry names its source.
 _SRC_EMPTY = re.compile(r"^\s*-\s*(?:\s*\[\d+\])+\s*$")
+# ---- Raw time series in the report body ------------------------------------------------
+# A line opening with a timestamp followed by numbers and little prose is a data row; only
+# a run of >= MIN_SERIES_ROWS such lines counts (blank lines inside a run don't end it).
+_MONTHS = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
+_TS = (
+    r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?"  # ISO
+    r"|\d{4}/\d{2}/\d{2}"                        # 2026/06/04
+    r"|\d{1,2}[./]\d{1,2}[./]\d{4}"              # 04.06.2026, 6/4/2026
+    rf"|{_MONTHS} \d{{1,2}},? \d{{4}}"           # Jun 4, 2026
+    rf"|\d{{1,2}} {_MONTHS} \d{{4}}"             # 4 Jun 2026
+)
+_SERIES_ROW = re.compile(
+    r"^\s*(?:[-*+]\s*|\d+[.)]\s*|\|\s*)?"  # optional bullet / list number / table cell
+    rf"\**`?({_TS})`?\**"                  # the timestamp
+    r"(?P<rest>.*)$",
+    re.IGNORECASE,
+)
+_WORD = re.compile(r"[A-Za-z]{2,}")
+_NUM = re.compile(r"\d+(?:\.\d+)?")
+_VALUE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")   # the first value column, for the collapse note
+# Fewer consecutive timestamped rows than this is a dated list, not a series.
+MIN_SERIES_ROWS = 5
+
+
+def _series_row_ts(line: str) -> str | None:
+    """The timestamp if ``line`` is a data row of a series (timestamp + numbers, little
+    prose), else None."""
+    m = _SERIES_ROW.match(line)
+    if not m:
+        return None
+    rest = m.group("rest")
+    nums, words = len(_NUM.findall(rest)), len(_WORD.findall(rest))
+    # `bearish=0.05, bullish=0.38` → 2 numbers, 2 words; `| 0.05 |` → 1 number, 0 words. A
+    # dated headline ("2026-08-01: ETF inflows hit $1.2B, 3rd largest day") is prose.
+    if nums >= 1 and words <= max(3, nums + 1):
+        return m.group(1)
+    return None
+
+
+def _row_value(line: str) -> float | None:
+    """The first numeric column of a series row (``$79,038`` → 79038.0), else None."""
+    m = _SERIES_ROW.match(line)
+    v = _VALUE.search(m.group("rest")) if m else None
+    return _num(v.group(0)) if v else None
+
+
+def series_runs(md: str, min_rows: int = MIN_SERIES_ROWS) -> list[tuple[int, int, str, str]]:
+    """Runs of >= ``min_rows`` timestamped data rows in ``md`` (blank lines between rows
+    allowed), as ``(first_line, end_line_exclusive, first_timestamp, last_timestamp)`` over
+    ``md.splitlines()`` indices. Empty when the text transcribes no series."""
+    if not md:
+        return []
+    lines = md.splitlines()
+    runs: list[tuple[int, int, str, str]] = []
+    i = 0
+    while i < len(lines):
+        ts = _series_row_ts(lines[i])
+        if ts is None:
+            i += 1
+            continue
+        j, first, last, rows = i, ts, ts, 0
+        while j < len(lines):
+            t = _series_row_ts(lines[j])
+            if t is not None:
+                last, rows, j = t, rows + 1, j + 1
+                continue
+            if not lines[j].strip():             # blank lines inside a run don't end it
+                k = j
+                while k < len(lines) and not lines[k].strip():
+                    k += 1
+                if k < len(lines) and _series_row_ts(lines[k]) is not None:
+                    j = k
+                    continue
+            break
+        if rows >= min_rows:
+            runs.append((i, j, first, last))
+        i = j
+    return runs
+
+
+def series_row_count(md: str, start: int, end: int) -> int:
+    """Data rows inside a run (blank lines excluded)."""
+    return sum(1 for ln in md.splitlines()[start:end] if _series_row_ts(ln) is not None)
+
+
+def _run_summary(rows: list[str]) -> str:
+    """Statistics over a run's first value column; '' when fewer than 2 rows carry one."""
+    data = [(t, v) for t, v in ((_series_row_ts(ln), _row_value(ln)) for ln in rows)
+            if t is not None and v is not None]
+    if len(data) < 2:
+        return ""
+    vals = [v for _, v in data]
+    imin = min(range(len(vals)), key=vals.__getitem__)
+    imax = max(range(len(vals)), key=vals.__getitem__)
+    multi = any(len(_NUM.findall(_SERIES_ROW.match(ln).group("rest"))) > 1
+                for ln in rows if _series_row_ts(ln) is not None)
+    col = "first value column" if multi else "values"
+    return (f" Summary of the {col}: first {fmt_num(vals[0])}, last {fmt_num(vals[-1])}, "
+            f"min {fmt_num(vals[imin])} at {data[imin][0]}, max {fmt_num(vals[imax])} at "
+            f"{data[imax][0]}, mean {fmt_num(statistics.fmean(vals))}.")
+
+
+def collapse_series(md: str) -> str:
+    """Replace every raw series run with one line saying what was dropped plus its
+    statistics. Idempotent."""
+    runs = series_runs(md or "")
+    if not runs:
+        return md
+    lines = md.splitlines(keepends=True)
+    for start, end, first, last in reversed(runs):
+        rows = [ln.rstrip("\n") for ln in lines[start:end]]
+        n = sum(1 for ln in rows if _series_row_ts(ln) is not None)
+        note = (f"*(Raw series of {n} timestamped rows, {first} to {last}, omitted — a report "
+                f"describes a series, it never lists it.{_run_summary(rows)})*\n")
+        lines[start:end] = [note]
+    return "".join(lines)
+
+
 # A fully-bolded Sources bullet ("- **[12] Santiment Quantitative Data**") — renders as a
 # shouting pseudo-heading in the report card; de-bold it (scrub), content unchanged.
 _SRC_BOLD = re.compile(r"(?m)^(\s*-\s*)\*\*((?:\[\d+\])+[^*\n]*)\*\*\s*$")
@@ -100,6 +241,7 @@ def scrub_report(md: str, tool_names=()) -> str:
         "the underlying data", out
     )  # bare get_a(args) / `get_a` left in prose
     out = _SERVER_SIDE.sub("", out)
+    out = _SANDBOX_PATH.sub("the underlying data", out)  # "/workspace/data/x.json" left in prose
     out = _SRC_BOLD.sub(r"\1\2", out)  # de-bold "- **[12] Label**" source bullets
     out = _EMPTY_PAREN.sub("", out)
     out = _DANGLING_SEP.sub("", out)
@@ -203,11 +345,32 @@ def report_problems(md: str, tool_names=()) -> list[str]:
     if _patterns(tool_names).bare.search(body):
         probs.append("remove tool/function names from the report body")
 
+    runs = series_runs(body)
+    if runs:
+        start, end, first, last = runs[0]
+        probs.append(
+            f"the body transcribes a raw time series ({series_row_count(body, start, end)} "
+            "consecutive timestamped "
+            f"rows, {first} to {last}"
+            + (f"; {len(runs)} such blocks" if len(runs) > 1 else "")
+            + ") — a report never lists buckets. Replace each such block with a summary: "
+            "first and last value, peak and trough (with when), average, and direction"
+        )
+
     fields = list(dict.fromkeys(_BACKTICK_FIELD.findall(body)))
     if fields:
         probs.append(
             f"remove raw field names from the body (e.g. {', '.join(fields)[:120]}) — describe "
             "them in plain business terms"
+        )
+
+    machinery = list(dict.fromkeys(m.group(0) for m in _MACHINERY.finditer(body)))
+    if machinery:
+        probs.append(
+            f"the body mentions files, paths, code or agents (e.g. {', '.join(machinery)[:120]}) — "
+            "the reader never sees how a number was produced or where data was stored: delete "
+            "every file/path/'offloaded' mention and any list of files or remaining processing "
+            "steps, and state each figure with its data source only"
         )
 
     return probs

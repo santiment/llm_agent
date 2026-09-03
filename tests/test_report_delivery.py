@@ -29,6 +29,7 @@ from deep_research_agent.turn import (
     current_turn,
     is_json_object_dump,
 )
+from conftest import make_state
 
 FINDINGS_JSON = (
     '{"summary": "Bitcoin sentiment collapsed to extreme bearish in June 2026.",\n'
@@ -52,13 +53,9 @@ PROSE_REPORT = (
 _WORK = [HumanMessage("test the MCP"), ToolMessage("rows", tool_call_id="1")]
 
 
-def _state(*messages) -> dict:
-    return {"messages": list(messages)}
-
-
 def test_prose_report_gets_one_resubmit_nudge() -> None:
     mw = ForceCompletionMiddleware()
-    update = mw.after_model(_state(*_WORK, AIMessage(PROSE_REPORT)), None)
+    update = mw.after_model(make_state(*_WORK, AIMessage(PROSE_REPORT)), None)
     assert update and update.get("jump_to") == "model", update
     nudge = update["messages"][0]
     assert getattr(nudge, "name", None) == RESUBMIT_NUDGE_NAME
@@ -70,20 +67,20 @@ def test_persistent_prose_is_accepted_after_the_nudge() -> None:
     mw = ForceCompletionMiddleware()
     nudge = HumanMessage("resubmit", name=RESUBMIT_NUDGE_NAME)
     again = mw.after_model(
-        _state(*_WORK, AIMessage(PROSE_REPORT), nudge, AIMessage(PROSE_REPORT)), None)
+        make_state(*_WORK, AIMessage(PROSE_REPORT), nudge, AIMessage(PROSE_REPORT)), None)
     assert again is None  # salvage delivers; no second nag
 
 
 def test_short_intent_stub_still_gets_the_regular_nudge() -> None:
     mw = ForceCompletionMiddleware()
-    update = mw.after_model(_state(*_WORK, AIMessage("Now I will compare the data.")), None)
+    update = mw.after_model(make_state(*_WORK, AIMessage("Now I will compare the data.")), None)
     assert update and update.get("jump_to") == "model"
     assert getattr(update["messages"][0], "name", None) == NUDGE_NAME
 
 
 def test_direct_answer_without_research_is_untouched() -> None:
     mw = ForceCompletionMiddleware()
-    state = _state(HumanMessage("what is the capital of Bulgaria?"),
+    state = make_state(HumanMessage("what is the capital of Bulgaria?"),
                    AIMessage("Sofia. " * 80))  # long, but no research this turn
     assert mw.after_model(state, None) is None
 
@@ -93,7 +90,7 @@ def test_json_blob_ending_gets_a_rewrite_nudge_not_verbatim() -> None:
     # report. It must be steered to WRITE markdown, never "resubmit verbatim" (which
     # would put JSON in the report).
     mw = ForceCompletionMiddleware()
-    update = mw.after_model(_state(*_WORK, AIMessage(FINDINGS_JSON)), None)
+    update = mw.after_model(make_state(*_WORK, AIMessage(FINDINGS_JSON)), None)
     assert update and update.get("jump_to") == "model", update
     msg = update["messages"][0].content
     assert getattr(update["messages"][0], "name", None) == RESUBMIT_NUDGE_NAME
@@ -149,3 +146,36 @@ if __name__ == "__main__":
     test_resubmit_nudge_is_not_a_turn_boundary()
     test_salvage_classifies_as_done_not_error()
     print("OK — prose reports get one verbatim resubmit nudge, salvage is a recovery.")
+
+
+def test_end_status_carries_run_time_in_success_and_error(capture_events) -> None:
+    """Run time reaches the consumer in EVERY end-state: on the status event as
+    ``elapsed_s`` / ``elapsed`` and inside the human ``detail`` sentence — so a frontend
+    that only shows ``detail`` (the 'finished without producing a report' message) still
+    says how long the run took."""
+    from deep_research_agent.metering import RunMeter
+
+    meter = RunMeter()
+    meter.start()
+    meter.started_mono -= 90                        # pretend 1m 30s passed
+    mw = ResearchOutputMiddleware(max_tool_calls=80, max_total_tokens=1_000_000, meter=meter)
+    # error end: research happened, then an intent stub and no report
+    mw.after_agent(make_state(*_WORK, AIMessage("Now I will compare the metrics.")), None)
+    # success end: delivered through submit_report
+    rep = "# R\n\nText[1].\n\n## Sources\n- [1] https://x.example/a\n"
+    call = {"name": "submit_report", "args": {"report_markdown": rep}, "id": "t1"}
+    mw.after_agent(make_state(HumanMessage("q"), AIMessage("", tool_calls=[call]),
+                          ToolMessage("ok", tool_call_id="t1")), None)
+    # no meter wired (offline use): still a valid end status, just without a run time
+    ResearchOutputMiddleware(max_tool_calls=80, max_total_tokens=1_000_000).after_agent(
+        make_state(*_WORK, AIMessage("Now I will compare the metrics.")), None)
+
+    ends = [e for e in capture_events if e["type"] == "status" and e["state"] in ("done", "error")]
+    assert [(e["state"], e["reason"]) for e in ends] == [
+        ("error", "ended_without_report"), ("done", "report_delivered"),
+        ("error", "ended_without_report")]
+    for e in ends[:2]:
+        assert 90 <= e["elapsed_s"] < 91 and e["elapsed"].startswith("1m 3")
+        assert e["detail"].endswith(f"Run time {e['elapsed']}.")
+    assert ends[2]["elapsed_s"] is None and ends[2]["elapsed"] == "n/a"
+    assert "Run time" not in ends[2]["detail"]

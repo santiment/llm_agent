@@ -8,6 +8,7 @@ producer; your app is just a consumer — this is what keeps the agent portable.
 Render mapping (Claude / Gemini deep-research UIs) — one line per registered type,
 in ``EVENT_SCHEMAS`` order:
   - ``run_start``      -> protocol handshake; pin/verify before rendering anything else
+                          (``started_at``, UTC: the anchor for run time if a run dies early)
   - ``search_query``   -> the globe row ("how to analyze key metrics")
   - ``search_results`` -> the favicon + title grid ("7 results")
   - ``source``         -> registered citation (for the live source list)
@@ -18,10 +19,14 @@ in ``EVENT_SCHEMAS`` order:
   - ``skill``          -> a skill being applied ("Skill: data-provider")
   - ``report``         -> final markdown answer (also persisted in state)
   - ``status``         -> lifecycle: mcp_ready | mcp_error | budget_soft | budget_halt |
-                          revising | done | error (the last two are the run's end-state,
-                          classified in citations.py; ``reason`` carries the specific code)
+                          revising | compacting | compacted | loop_detected | loop_halt |
+                          subagent_start | subagent_done (``role`` + ``model`` of the
+                          sub-agent) | done | error (the last two are the run's end-state,
+                          classified in citations.py; ``reason`` carries the specific code,
+                          ``elapsed_s`` / ``elapsed`` the run time, also appended to ``detail``)
   - ``clarification``  -> the questions the agent needs answered before it can proceed
-  - ``usage``          -> end-of-run tool-call / token counters against their limits
+  - ``usage``          -> end-of-run tool-call / token counters against their limits,
+                          plus run time (``elapsed_s``, ``elapsed``, ``started_at``, ``finished_at``)
   - ``subagent_findings`` -> one research unit's summary, findings and gaps
 
 Assistant *reasoning* prose (the italic narration between steps) is NOT a custom
@@ -51,6 +56,8 @@ from urllib.parse import urlparse
 
 from langchain_core.tools import BaseTool, StructuredTool
 
+from .series import MAX_SCAN_BYTES, SERIES_RULE, find_series, summary_block
+
 log = logging.getLogger("deep_research_agent.events")
 
 # Bump ONLY on a breaking change to a shipped event's shape (removed/renamed key or
@@ -74,7 +81,7 @@ def engine_version() -> str:
 # against this registry and WARNS on violation; it never raises (observability must not
 # break a run). Adding an event type without registering it here is itself a warning.
 EVENT_SCHEMAS: dict[str, frozenset[str]] = {
-    "run_start": frozenset({"protocol_version", "engine_version"}),
+    "run_start": frozenset({"protocol_version", "engine_version", "started_at"}),
     "search_query": frozenset({"id", "query"}),
     "search_results": frozenset({"id", "query", "ok", "results"}),
     "source": frozenset({"title", "url", "domain"}),
@@ -87,9 +94,16 @@ EVENT_SCHEMAS: dict[str, frozenset[str]] = {
     "status": frozenset({"state"}),
     "clarification": frozenset({"questions"}),
     "usage": frozenset({"tool_calls", "input_tokens", "output_tokens",
-                        "total_tokens", "limits"}),
+                        "total_tokens", "limits", "elapsed_s"}),
     "subagent_findings": frozenset({"unit", "summary", "findings", "gaps"}),
 }
+
+# Every ``state`` a status event may carry; ``_check_shape`` warns on an unregistered one.
+STATUS_STATES = frozenset({
+    "mcp_ready", "mcp_error", "budget_soft", "budget_halt", "revising",
+    "compacting", "compacted", "loop_detected", "loop_halt", "done", "error",
+    "subagent_start", "subagent_done",  # carry ``role`` + ``model``
+})
 
 
 def _check_shape(event: dict[str, Any]) -> None:
@@ -103,6 +117,9 @@ def _check_shape(event: dict[str, Any]) -> None:
     if missing:
         log.warning("EVENT PROTOCOL: %r event missing required keys %s",
                     etype, sorted(missing))
+    if etype == "status" and event.get("state") not in STATUS_STATES:
+        log.warning("EVENT PROTOCOL: unregistered status state %r — register it in "
+                    "STATUS_STATES", event.get("state"))
 
 
 def new_id() -> str:
@@ -170,6 +187,48 @@ _TRANSIENT_MARKERS = (
     "timeout", "timed out", "connection", "temporarily", "unavailable",
     "internal server error", "500", "502", "503", "504",
 )
+# The data source refused the CREDENTIALS, not the arguments: no retry and no argument
+# change can fix it. Classified permanent (so identical retries are answered locally)
+# with its own guidance, since "fix the arguments" would send the model down a dead end.
+_AUTH_MARKERS = ("401", "403", "unauthorized", "forbidden", "authorization header",
+                 "invalid credentials", "authentication")
+
+
+def _is_auth_error(low: str) -> bool:
+    return any(m in low for m in _AUTH_MARKERS)
+
+
+def exception_message(exc: BaseException, limit: int = 6) -> str:
+    """Model-readable text for a tool exception. The MCP client runs each request inside
+    an anyio task group, so an HTTP failure surfaces as ``ExceptionGroup("unhandled errors
+    in a TaskGroup (1 sub-exception)")`` — ``str()`` of that says nothing. Flatten to the
+    leaf exceptions, and for an HTTP status error include the status and the response
+    body (the server's own explanation, e.g. "Authorization header required")."""
+    leaves: list[BaseException] = []
+
+    def walk(e: BaseException) -> None:
+        if isinstance(e, BaseExceptionGroup):
+            for sub in e.exceptions:
+                walk(sub)
+        elif len(leaves) < limit:
+            leaves.append(e)
+
+    walk(exc)
+    parts: list[str] = []
+    for leaf in leaves:
+        text = str(leaf).strip() or type(leaf).__name__
+        resp = getattr(leaf, "response", None)
+        status = getattr(resp, "status_code", None)
+        if status is not None:
+            body = ""
+            try:
+                body = (resp.text or "").strip()
+            except Exception:  # a streamed/closed body; the status alone still helps
+                body = ""
+            text = f"HTTP {status}" + (f": {_summarize(body, 300)}" if body else "") \
+                + f" ({text.splitlines()[0]})"
+        parts.append(text)
+    return "; ".join(parts) if parts else (str(exc) or type(exc).__name__)
 
 
 # The explicit server-side tags, written once: classify_tool_error reads them and
@@ -190,7 +249,7 @@ def classify_tool_error(msg: str) -> str:
     if explicit:
         return explicit
     low = msg.strip().lower()
-    if any(m in low for m in _PERMANENT_MARKERS):
+    if _is_auth_error(low) or any(m in low for m in _PERMANENT_MARKERS):
         return "permanent"
     if any(m in low for m in _TRANSIENT_MARKERS):
         return "transient"
@@ -219,11 +278,19 @@ _ERROR_GUIDANCE = {
 }
 
 
+_AUTH_GUIDANCE = (
+    "The data source REJECTED THE CREDENTIALS (not your arguments): the server requires "
+    "authentication and none was accepted — a deployment configuration problem. Do NOT "
+    "retry any call to this source; proceed without its data and state the gap plainly."
+)
+
+
 def tool_error_text(tool_name: str, msg: str, classification: str) -> str:
     """The model-facing tool result for a failed call: the error + how to proceed."""
-    return (f"TOOL ERROR ({tool_name}, {classification}): "
-            f"{_summarize(_strip_class_tag(msg), 1000)}\n"
-            + _ERROR_GUIDANCE[classification])
+    body = _strip_class_tag(msg)
+    guidance = (_AUTH_GUIDANCE if classification == "permanent" and _is_auth_error(body.lower())
+                else _ERROR_GUIDANCE[classification])
+    return f"TOOL ERROR ({tool_name}, {classification}): {_summarize(body, 1000)}\n" + guidance
 
 
 def _retry_after_seconds(msg: str) -> float | None:
@@ -267,9 +334,14 @@ def _offload_result(
     tool_name: str,
     call_id: str,
     head_rows: int = 5,
+    series: dict | None = None,
 ) -> tuple[str | None, str | None]:
     """Persist a large tool result to a file in the sandbox and return a compact stub
     the model can act on, INSTEAD of truncating and discarding rows.
+
+    ``series`` — the result's time series (``series.find_series``) if the caller already
+    detected them; computed here otherwise. A series result gets a stub with the file path
+    and a computed summary instead of any rows.
 
     The full result lands at ``{offload_dir}/{tool}-{call_id}.json`` inside the
     container's persistent /workspace; the stub carries the path, row count, column
@@ -305,6 +377,25 @@ def _offload_result(
         log.warning("offload failed (%s): %s", tool_name, exc)
         return None, None
 
+    if series is None:
+        series = find_series(result) if len(payload) <= MAX_SCAN_BYTES else {}
+    if series:
+        counts = ", ".join(f"{label or 'series'}: {len(pts)} points" for label, pts in series.items())
+        note = f"time series offloaded to {path} ({counts}, {len(payload)} bytes)"
+        stub = (
+            f"[Time series saved to a file — NOT shown inline. {SERIES_RULE}]\n"
+            f"file: {path}\n"
+            f"format: JSON exactly as the tool returned it ({len(payload)} bytes)\n"
+            f"series: {counts}\n"
+            "summary:\n" + summary_block(series) + "\n"
+            "\nNumeric work over the points (percentile or z-score of a window, correlation with "
+            "another series, sums, custom windows): `json.load(open(path))` in `execute` and "
+            "compute; the points are where the tool put them (e.g. `data.<slug>`, a list of "
+            "{datetime, value}). Report the computed numbers only — never print the points. "
+            "Do NOT re-call this tool to page the same rows."
+        )
+        return stub, note
+
     n = len(rows) if isinstance(rows, list) else None
     columns = ""
     head = ""
@@ -328,6 +419,35 @@ def _offload_result(
         "page the same rows."
     )
     return stub, note
+
+
+def unwrap_tool_result(result: Any) -> Any:
+    """Flatten an MCP tool's return to the payload underneath it.
+
+    langchain-mcp-adapters returns every MCP result as LangChain content blocks —
+    a ``[{"type": "text", "text": "<the JSON>"}]`` list (or a ``(content, artifact)``
+    tuple), with the tool's real JSON buried in a text block's ``text``. Left wrapped,
+    the size check, ``find_series`` and the offload all look at the block envelope, not
+    the data: a metric series inside it is invisible, so it is never offloaded and lands
+    in the model's context as rows — which the model then hand-transcribes into a file to
+    run the recipes over. Unwrapping here means a text result is seen (and offloaded) as
+    its own JSON, exactly like a string-returning custom tool.
+
+    Text-only results collapse to the joined text; a result carrying a non-text block
+    (image / file) is left untouched so nothing is lost. Non-MCP results (plain str /
+    list / dict) pass through unchanged."""
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], (list, str, dict)):
+        result = result[0]  # (content, artifact) from a content_and_artifact tool
+    if isinstance(result, dict) and result.get("type") == "text" and isinstance(result.get("text"), str):
+        return result["text"]
+    if (isinstance(result, list) and result
+            and all(isinstance(b, dict) and "type" in b for b in result)):
+        if any(b.get("type") != "text" for b in result):
+            return result  # a non-text block present — keep the blocks intact
+        texts = [b["text"] for b in result if isinstance(b.get("text"), str)]
+        if texts:
+            return texts[0] if len(texts) == 1 else "\n".join(texts)
+    return result
 
 
 def instrument_tool(
@@ -404,7 +524,10 @@ def instrument_tool(
                 # A failed call is a RESULT, not a run-ending event: the error text is
                 # returned to the model (with retry guidance) so it can self-correct —
                 # raising here would abort the whole research over one bad argument.
-                msg = str(exc)
+                # exception_message unwraps the MCP client's ExceptionGroup to the real
+                # cause (an HTTP 401 was reaching the model as "unhandled errors in a
+                # TaskGroup (1 sub-exception)").
+                msg = exception_message(exc)
                 low = msg.lower()
                 # Wait out a rate-limit signal rather than failing — but only within
                 # the budget. Compute the delay only on this (rate-limited) path.
@@ -426,6 +549,10 @@ def instrument_tool(
                 log.warning("TOOL ERROR (%s, %s): %s", tool.name, classification,
                             _summarize(msg, 500))
                 return tool_error_text(tool.name, msg, classification)
+            # Flatten MCP content-block envelopes to their JSON so the size check,
+            # series detection and offload act on the DATA, not the wrapper (see
+            # unwrap_tool_result). Without this a metric series slips into context.
+            result = unwrap_tool_result(result)
             # Observability + source-level cap: record the RAW size (before capping) so the
             # run log shows what the tool actually returned, then bound it for the context.
             raw_rows = len(result) if isinstance(result, (list, tuple)) else None
@@ -436,20 +563,31 @@ def instrument_tool(
                 or (max_result_chars and raw_bytes > max_result_chars)
             )
             capped: str | None = None
+            # A time series leaves the context whatever its size (shown the rows, the model
+            # transcribes them into a table). A too-big result is offloaded regardless and
+            # `_offload_result` detects the series itself.
+            series: dict = {}
+            if not too_big:
+                series = await asyncio.to_thread(find_series, result)
             # Prefer OFFLOAD to a sandbox file over truncation: keeps the full data
             # available (the model reads it back with `execute`) instead of dropping rows.
-            if too_big and offload_sink is not None:
+            if (too_big or series) and offload_sink is not None:
                 # to_thread: the offload serializes megabytes and uploads them over a
                 # SYNC HTTP client. Called inline it would freeze the event loop — and
                 # with it every other tool call in flight — for the whole upload.
                 stub, note = await asyncio.to_thread(
                     _offload_result,
                     result, sink=offload_sink, offload_dir=offload_dir,
-                    tool_name=tool.name, call_id=call_id)
+                    tool_name=tool.name, call_id=call_id, series=series or None)
                 if stub is not None:
                     result, capped = stub, note
                     log.info("RESULT OFFLOADED (%s): %s [raw: %d bytes, rows=%s]",
                              tool.name, note, raw_bytes, raw_rows)
+            elif series:
+                # No sandbox: the rows stay (as text), but the summary and the rule lead.
+                text = result if isinstance(result, str) else json.dumps(result, default=str)
+                result = (f"[Time series. {SERIES_RULE}]\nsummary:\n{summary_block(series)}"
+                          f"\n\n{text}")
             if capped is None:
                 # No sandbox (or offload failed) → fall back to the truncation caps.
                 result, capped = cap_result(

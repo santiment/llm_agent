@@ -131,3 +131,39 @@ if __name__ == "__main__":
     test_repeated_permanent_call_short_circuits()
     test_success_path_unchanged()
     print("OK — tool failures return guidance, never kill the run.")
+
+
+def test_exception_group_is_unwrapped_to_the_http_cause() -> None:
+    """The MCP client wraps request failures in an anyio TaskGroup; the model used to see
+    only "unhandled errors in a TaskGroup (1 sub-exception)" — here for an HTTP 401."""
+    import httpx
+
+    from deep_research_agent.events import exception_message
+
+    req = httpx.Request("POST", "http://mcp.local/mcp")
+    resp = httpx.Response(401, request=req,
+                          text='{"error":"unauthorized","error_description":"Authorization header required"}')
+    leaf = httpx.HTTPStatusError("Client error '401 Unauthorized' for url 'http://mcp.local/mcp'\n"
+                                 "For more information check: https://developer.mozilla.org/...",
+                                 request=req, response=resp)
+    group = ExceptionGroup("unhandled errors in a TaskGroup (1 sub-exception)", [leaf])
+
+    msg = exception_message(group)
+    assert "TaskGroup" not in msg
+    assert msg.startswith("HTTP 401") and "Authorization header required" in msg
+    assert classify_tool_error(msg) == "permanent"
+
+    async def boom():
+        raise group
+
+    tool = _FakeTool(boom)
+    meter = _FakeMeter()
+    wrapped = instrument_tool(tool, kind="mcp", meter=meter)
+    out = _invoke(wrapped)
+    assert "TOOL ERROR (fake_mcp_tool, permanent)" in out and "HTTP 401" in out
+    assert "REJECTED THE CREDENTIALS" in out and "Do NOT retry" in out
+    # an identical retry is answered locally — the server is not hit again
+    out2 = _invoke(wrapped)
+    assert "REPEATED CALL" in out2 and tool.calls == 1
+    # a plain exception still reads as before
+    assert exception_message(ValueError("Metric 'nvt' is not supported")) == "Metric 'nvt' is not supported"

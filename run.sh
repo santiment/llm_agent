@@ -24,6 +24,13 @@ HOST="${DRA_HOST:-127.0.0.1}"
 # DRA_PORT is the native knob; bare PORT still honoured for compatibility, but it's a
 # name every other tool also uses, so don't rely on it.
 PORT="${DRA_PORT:-${PORT:-2024}}"
+# Concurrent runs the dev server executes at once. `langgraph dev` falls back to ONE when
+# the flag is omitted (its --help claims 10), so a single slow or hung run parks every
+# later run in `pending` forever and the host UI reports "finished without a report".
+JOBS="${DRA_JOBS:-10}"
+# Auto-reload restarts the server on EVERY source save, killing in-flight runs (the UI then
+# shows "finished without producing a report"). Off by default; DRA_RELOAD=1 turns it on.
+RELOAD_FLAG="--no-reload"; [ "${DRA_RELOAD:-0}" = "1" ] && RELOAD_FLAG=""
 BASE="http://${HOST}:${PORT}"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -89,7 +96,7 @@ case "${1:-up}" in
     [ -n "${OPENAI_API_KEY:-}" ] || echo "warning: OPENAI_API_KEY unset in .env — runs will fail"
     [ -n "${TAVILY_API_KEY:-}" ] || echo "warning: TAVILY_API_KEY unset in .env — web search disabled"
     echo "▶ starting LangGraph dev server on ${BASE} (docs: ${BASE}/docs)…"
-    exec uv run langgraph dev --host "$HOST" --port "$PORT"
+    exec uv run langgraph dev --host "$HOST" --port "$PORT" --n-jobs-per-worker "$JOBS" $RELOAD_FLAG
     ;;
   *)
     die 'usage: ./run.sh [ask "<question>"|smoke|doctor|test|--sync]'

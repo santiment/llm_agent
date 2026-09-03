@@ -275,12 +275,31 @@ the context blew past the model's limit. Two mechanisms prevent that:
   then loads the full data with pandas in the sandbox and computes aggregates/joins/filters
   *there*. This is exactly how a large cross-entity sweep is handled: the raw rows never enter the
   model's context at all. Without a sandbox, the same thresholds become hard **truncation** caps.
+- **MCP results are unwrapped first.** langchain-mcp-adapters hands back every MCP result as LangChain content blocks (`[{type: text, text: <the JSON>}]`), so the series/size checks would otherwise inspect the envelope, not the data — a metric series buried in a text block stayed inline and the model hand-transcribed it into a file. `events.unwrap_tool_result` flattens a text-only result to its JSON before the offload decision, so an MCP series offloads exactly like a string-returning custom tool. Results carrying an image/file block are left intact.
+- **Time series are offloaded whatever their size.** `series.py` recognizes a metric series in any
+  tool result (the metric server's `{data: {slug: [{datetime, value}]}}`, a bare list of points,
+  `[ts, value]` pairs — 8+ points). A series result is written to a file even when it is small, and
+  the stub carries a **computed summary** — points, span, first/last value with change, min/max with
+  when, mean, median, direction — plus the rule that a series is never listed row by row. Without a
+  sandbox the summary and the rule are prepended and the rows stay. This is the source-side half of
+  the "never paste a metric table" rule; the delivery-side half is in §9: `report_hygiene.py`
+  detects runs of timestamped rows (any date format, blank lines tolerated), the quality gate
+  bounces them once, and `collapse_series` deletes any that remain on every emit path, leaving a
+  one-line note with the same statistics. The skill (`R.describe`) gives the same numbers in the
+  sandbox.
 
 The sandbox itself (`sandbox.py`) is an HTTP client to an `llm-sandbox` sidecar service. Wiring it in
 makes it the agent's **default filesystem backend**, which is what flips deepagents' `execute` tool
 on. A session is created lazily, reused for the run, and destroyed at the end by
 `SandboxCleanupMiddleware`. The skills directory is routed separately (read-only) so the agent's own
 file ops never touch real disk.
+
+Skill helper modules are **seeded** into every session: right after the session is created, the
+backend uploads each `skills/<skill>/*.py` (public names only; first skill wins a basename clash) to
+`/workspace/<file>`, before any `execute` can run. A skill's markdown then says `import recipes as R`
+instead of carrying code the model would have to retype — the computation is tested Python, the
+skill text is only about how to read its output. A failed seed is logged, not fatal; the skill's
+fallback is to `read_file` the module from `/skills/` and `write_file` it into `/workspace`.
 
 The prompt is strict here: **run code for real or not at all.** The model must never invent or
 simulate program output — only show an "output" block when it is the verbatim result of a real
@@ -295,12 +314,15 @@ markdown instructions) and optional supporting files. On each run the agent moun
 read-only at the virtual path `/skills/` and injects each skill's **name + description** into the
 system prompt. The model reads a skill's *full* instructions (via `read_file` on
 `/skills/<name>/SKILL.md`) **only when a task matches its description** — that's progressive
-disclosure: cheap to advertise, loaded on demand.
+disclosure: cheap to advertise, loaded on demand. A skill may also ship Python helpers next to its
+`SKILL.md`; those are seeded into the sandbox as `/workspace/<file>` (section 8) so the instructions
+call them rather than embed them.
 
 The shipped example, **`crowd-positioning`**, turns raw `social_messages` data into a positioning
 verdict (extremeness percentiles, organic-vs-manufactured, narrative-vs-chain divergence, crowd price
 levels). Its `SKILL.md` is a worked example of the pattern: a tight "when to use" trigger, a precise
-workflow that names exact tools and computations, and a strict output format.
+workflow that names exact tools and computations, and a strict output format. Its numeric
+recipes ship as `recipes.py` beside the `SKILL.md`, seeded into the sandbox so the model calls them.
 
 When the model reads a skill file, `SkillUsageMiddleware` emits a `skill` event so the UI can show a
 "Skill applied: …" indicator.
@@ -324,12 +346,12 @@ The orchestrator's stack (assembled in `agent.py`, in this order):
 |------------|------|-----|
 | **BudgetMiddleware** | `before_model` | Hard backstop against runaway runs. Two ceilings (cumulative tool calls, cumulative tokens). At **75%** it injects one "wrap up and deliver now" nudge; at **100%** it jumps straight to `end`. |
 | **ForceCompletionMiddleware** | `after_model` | Prevents premature termination. If the model stops with a bare *"Now I will compare…"* intent message and no tool call mid-research, it nudges the model to act (capped). If the model wrote the whole report as a plain message, one mechanical "resubmit via `submit_report` verbatim" nudge; a raw JSON blob gets a "rewrite as a real report" nudge instead. |
-| **ReportQualityGateMiddleware** | `awrap_tool_call` | Intercepts `submit_report` **before** delivery. If the (scrubbed) report still violates the contract — uncited sources, an internal source split across many Sources lines, raw field names — it bounces it back **once** with specific fixes. Then delivers as-is. |
+| **ReportQualityGateMiddleware** | `awrap_tool_call` | Intercepts `submit_report` **before** delivery. If the (scrubbed) report still violates the contract — uncited sources, an internal source split across many Sources lines, raw field names, file paths / file names / "offloaded files" / code calls — it bounces it back **once** with specific fixes. Then delivers as-is. |
 | **ResearchOutputMiddleware** | `after_agent` | Harvests sources, persists the final report into state, and authoritatively classifies *why the run ended* (see §13). Also the salvage path: if the model researched but never called `submit_report`, it recovers genuine report-looking prose (never a JSON blob, never a bare intent stub). |
 | **SkillUsageMiddleware** | `after_model` | Emits a `skill` event the first time each skill is read in a turn. |
 | **ClarificationGuardMiddleware** | `awrap_tool_call` | Blocks `request_clarification` *after* research has begun — so a weak model can't pop a nonsensical question card after minutes of work. Tells it to finish instead. |
 | **ClarificationFallbackMiddleware** | `after_model` | If the model *narrates* clarifying questions as plain text (pre-research) instead of calling the tool, this emits the `clarification` card anyway — so the UI behaves the same regardless of model. |
-| **UsageMeterMiddleware** | `after_agent` | Emits the per-run `usage` event and the `RESEARCH USAGE` log line (tool calls, errors, rows/bytes, tokens, model calls). |
+| **UsageMeterMiddleware** | `before_agent` / `after_agent` | Starts the run clock and emits `run_start` (`started_at`); at the end emits the per-run `usage` event and the `RESEARCH USAGE` log line (tool calls, errors, rows/bytes, tokens, model calls, run time). `ResearchOutputMiddleware` reads the same clock, so the end `status` carries the run time in the success and the no-report case alike. |
 | **SandboxCleanupMiddleware** | `after_agent` | Destroys the run's sandbox session (only present when a sandbox is configured). |
 
 **Turn-scoping** underpins all of this (`turn.py`). A LangGraph thread accumulates *every* message
@@ -351,7 +373,7 @@ That's what keeps the agent portable.
 
 | Event | Renders as |
 |-------|-----------|
-| `run_start` | nothing visible — the protocol handshake (`protocol_version`, `engine_version`) a frontend pins against before rendering the rest |
+| `run_start` | nothing visible — the protocol handshake (`protocol_version`, `engine_version`) a frontend pins against before rendering the rest; `started_at` (UTC) is the anchor for run time when a run dies before its end events |
 | `search_query` | the globe row ("how to analyze key metrics") |
 | `search_results` | the favicon + title grid ("7 results") |
 | `tool_call` / `tool_result` (and `mcp_call` / `mcp_result`) | tool/MCP call rows |
@@ -359,8 +381,8 @@ That's what keeps the agent portable.
 | `skill` | "Skill applied: …" |
 | `subagent_findings` | a folded findings table from a worker |
 | `clarification` | the question card (re-enables input) |
-| `status` | lifecycle: `mcp_ready` / `mcp_error` (tool loading), `budget_soft` / `budget_halt` (ceilings), `revising` (a gate bounced a deliverable back), then exactly one end-state — `done` or `error`, with a `reason` code |
-| `usage` | the per-run usage summary |
+| `status` | lifecycle: `mcp_ready` / `mcp_error` (tool loading), `budget_soft` / `budget_halt` (ceilings), `revising` (a gate bounced a deliverable back), `compacting` / `compacted` (context compaction), `loop_detected` / `loop_halt` (repeated-identical-call guard), `subagent_start` / `subagent_done` (a sub-agent run, with `role` + `model`), then exactly one end-state — `done` or `error`, with a `reason` code and the run time (`elapsed_s` / `elapsed`, also appended to `detail`: "… Run time 4m 12s.") |
+| `usage` | the per-run usage summary, incl. run time (`elapsed_s`, `elapsed`, `started_at`, `finished_at`) |
 | `report` | the final markdown answer (also persisted in state) |
 
 The protocol is **pinned in code, not just documented**: `events.EVENT_SCHEMAS` registers every type's
@@ -400,8 +422,15 @@ Two deterministic last-mile helpers (`report_hygiene.py`) guarantee what prompt 
   passes the loaded search/MCP/custom list, so any deployment's naming scheme is covered, with the
   legacy `get_*` family always matched as a fallback; only snake_case names are scrubbed, since a
   plain-word name like "screener" is real English and stripping it would damage prose), "server-side", a
-  trailing `(get_x, get_y)` tool list) — prose-safe and idempotent. It runs both inside
-  `submit_report` and again when persisting, so the user never sees plumbing in the report.
+  trailing `(get_x, get_y)` tool list, and **sandbox file paths** (`/workspace/…`, `/skills/…`)
+  left in prose) — prose-safe and idempotent. It runs both inside `submit_report` and again when
+  persisting, so the user never sees plumbing in the report.
+- **`report_problems`** (the gate's detector) additionally flags what a regex cannot rewrite
+  safely: file names (`…json`), "offloaded files", function/recipe calls (`R.card(d)`), sub-agent
+  mentions — seen live as a "Source: R.price_levels(d) on /workspace/data/…" line and a whole
+  "Offloaded Files" section. The gate bounces the report once so the model deletes the machinery
+  sentence itself. `findings_gate.py` applies the same test to a sub-agent finding's `source`, so a
+  path or recipe name is caught at the handoff, before the orchestrator can copy it.
 - **`lint_citations`** reports inline-vs-Sources mismatches (orphans: listed but never cited;
   danglers: cited but not listed) for observability — detection only, it warns rather than silently
   deleting a real source.
@@ -473,6 +502,9 @@ All overridable per-run (`configurable`) or via env var; defaults shown.
 | MCP servers | `DRA_MCP_SERVERS` / `DRA_MCP_URL` | none | data sources |
 | `max_tool_calls` | `DRA_MAX_TOOL_CALLS` | 200 | runaway-run ceiling |
 | `max_total_tokens` | `DRA_MAX_TOTAL_TOKENS` | 4,000,000 | runaway-run ceiling |
+| `compaction_tokens` | `DRA_COMPACTION_TOKENS` | 100,000 | in-flight context compaction trigger (est. tokens); older messages summarized on the utility model, budget counters carry over; 0 = off |
+| `prompt_caching` | `DRA_PROMPT_CACHING` | true | `cache_control` breakpoints on system prompt + newest messages (OpenRouter only) |
+| `web_fetch` | `DRA_WEB_FETCH` | true | full-page reader tool for sub-agents (big pages offload to the sandbox) |
 | `mcp_max_concurrency` | `DRA_MCP_MAX_CONCURRENCY` | 10 | simultaneous MCP calls cap |
 | `mcp_rate_limit_max_wait` | `DRA_MCP_RATE_LIMIT_MAX_WAIT` | 120 | seconds a rate-limited MCP call may back off before giving up |
 | `max_result_chars` / `max_result_rows` | `DRA_MAX_RESULT_*` | 60k / 1000 | offload/truncate threshold |

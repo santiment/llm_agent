@@ -17,21 +17,10 @@ import re
 from pathlib import Path
 
 import deep_research_agent.events as events
-from deep_research_agent.events import EVENT_SCHEMAS, PROTOCOL_VERSION, emit, engine_version
+from deep_research_agent.events import (EVENT_SCHEMAS, PROTOCOL_VERSION, STATUS_STATES,
+                                        emit, engine_version)
 from deep_research_agent.metering import RunMeter, UsageMeterMiddleware
-
-
-class _CaptureEvents:
-    """Route ``emit`` into a list (offline there is no stream writer, so events vanish)."""
-
-    def __enter__(self) -> list[dict]:
-        self.captured: list[dict] = []
-        self._orig = events._writer
-        events._writer = lambda: self.captured.append
-        return self.captured
-
-    def __exit__(self, *exc) -> None:
-        events._writer = self._orig
+from conftest import capture_events_cm
 
 
 class _CaptureWarnings(logging.Handler):
@@ -69,27 +58,47 @@ def test_every_emit_call_site_uses_a_registered_type():
         found.update(re.findall(r'"type":\s*"([a-z_]+)"', text))
         for suffix in re.findall(r'"type":\s*f"\{kind\}_(call|result)"', text):
             found.update({f"mcp_{suffix}", f"tool_{suffix}"})
+    # Message CONTENT blocks (caching.py's cache_control markers), not stream events.
+    found -= {"text", "ephemeral"}
     assert found, "no emit sites found — scan regex broke?"
     unregistered = found - set(EVENT_SCHEMAS)
     assert not unregistered, f"emit sites with unregistered types: {unregistered}"
 
 
+def test_status_states_pinned():
+    # Golden set, same contract as EVENT_SCHEMAS: a consumer switches on these, so
+    # removing/renaming one is a BREAKING change; adding one must land here too
+    # (emit warns on any state not in STATUS_STATES).
+    assert STATUS_STATES == {
+        "mcp_ready", "mcp_error", "budget_soft", "budget_halt", "revising",
+        "compacting", "compacted", "loop_detected", "loop_halt", "done", "error",
+        "subagent_start", "subagent_done",
+    }
+
+
+def test_unregistered_status_state_warns():
+    with _CaptureWarnings() as warns, capture_events_cm() as captured:
+        emit({"type": "status", "state": "made_up_state"})
+    assert len(captured) == 1  # still emitted — observability never breaks a run
+    assert any("unregistered status state" in m for m in warns.messages)
+
+
 def test_valid_event_passes_without_warning():
-    with _CaptureWarnings() as warns, _CaptureEvents() as captured:
+    with _CaptureWarnings() as warns, capture_events_cm() as captured:
         emit({"type": "report", "markdown": "# Hi"})
     assert captured == [{"type": "report", "markdown": "# Hi"}]
     assert warns.messages == []
 
 
 def test_missing_required_key_warns_but_still_emits():
-    with _CaptureWarnings() as warns, _CaptureEvents() as captured:
+    with _CaptureWarnings() as warns, capture_events_cm() as captured:
         emit({"type": "report"})  # missing "markdown"
     assert len(captured) == 1  # observability must never break a run
     assert any("missing required keys" in m and "markdown" in m for m in warns.messages)
 
 
 def test_unregistered_type_warns_but_still_emits():
-    with _CaptureWarnings() as warns, _CaptureEvents() as captured:
+    with _CaptureWarnings() as warns, capture_events_cm() as captured:
         emit({"type": "brand_new_thing"})
     assert len(captured) == 1
     assert any("unregistered event type" in m for m in warns.messages)
@@ -98,13 +107,14 @@ def test_unregistered_type_warns_but_still_emits():
 def test_run_start_handshake():
     mw = UsageMeterMiddleware(RunMeter(), max_tool_calls=1, max_total_tokens=1,
                               recursion_limit=1)
-    with _CaptureWarnings() as warns, _CaptureEvents() as captured:
+    with _CaptureWarnings() as warns, capture_events_cm() as captured:
         mw.before_agent({}, None)
     assert warns.messages == []
     (ev,) = captured
     assert ev["type"] == "run_start"
     assert ev["protocol_version"] == PROTOCOL_VERSION
     assert isinstance(ev["engine_version"], str) and ev["engine_version"]
+    assert ev["started_at"].endswith("Z")        # UTC anchor for run time if the run dies early
 
 
 def test_engine_version_never_raises():

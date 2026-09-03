@@ -26,19 +26,29 @@ from langchain_core.tools import StructuredTool
 
 _TIMEOUT = 60
 _SLUG_RE = re.compile(r"^[a-z0-9-]+$")
+# Source ids metrics-hub accepts; anything else is a server 400, so reject up front.
+VALID_SOURCES = ("telegram", "reddit", "twitter_crypto", "4chan", "bitcointalk", "farcaster")
 
 _DESCRIPTION = (
-    "What the crowd is saying about a coin: a stratified sample of raw social posts "
-    "(telegram, reddit, twitter, 4chan, bitcointalk, farcaster) plus a FULL-POPULATION "
-    "stats block (total vs sampled, volume curve, sentiment balance, trend words, top "
-    "channels) — internal Santiment social data; cite it as 'Santiment social messages'. "
-    "Returns JSON {stats, messages}; each message is tagged with a `stratum`: `head` (top "
-    "by engagement), `random` (unbiased base), `poles` (oversampled bull/bear extremes). "
-    "Judge prevalence and mood ONLY from the `random` stratum and the stats block; use "
-    "head/poles for what spread and where the disagreement is. Large results are saved to "
-    "a file: compute NUMBERS with `execute` (pandas over messages; cite from stats), but "
-    "READ the message text (topics, narratives, claims) by handing the file to "
-    "`extract-subagent` via the `task` tool — never by printing it into your own context."
+    "What the crowd is saying about a coin: a stratified sample of raw social posts plus a "
+    "FULL-POPULATION stats block (total vs sampled, volume curve, sentiment balance, trend "
+    "words, top channels) — internal Santiment social data; cite it as 'Santiment social "
+    "messages'. `sources` accepts ONLY these ids: " + ", ".join(VALID_SOURCES) + " (default: "
+    "all of them). Returns JSON {stats, messages}; each message is tagged with a `stratum`: "
+    "`head` (top by engagement), `random` (unbiased base), `poles` (oversampled bull/bear "
+    "extremes). Judge prevalence and mood ONLY from the `random` stratum and the stats "
+    "block; use head/poles for what spread and where the disagreement is. If the stats say "
+    "zero messages, there is NO crowd data for that asset and window: report that plainly "
+    "and do NOT substitute web search results for it. Large results are saved to a file: "
+    "compute NUMBERS with `execute` (pandas over messages; cite from stats), but READ the "
+    "message text (topics, narratives, claims) by handing the file to `extract-subagent` "
+    "via the `task` tool — never by printing it into your own context."
+)
+
+_NO_DATA_NOTE = (
+    "No social messages matched this asset in this window (checked as project slug and as "
+    "free text). This is the answer: report 'no crowd data', do not fill the gap with web "
+    "search results."
 )
 
 
@@ -65,15 +75,15 @@ def build_tools(cfg) -> list:
             asset: coin slug (e.g. 'bitcoin') or a free search word.
             from_timestamp: window start, ISO-8601 or ES date math ('now-24h'); default 24h ago.
             to_timestamp: window end, ISO-8601 or ES date math ('now'); default now.
-            sources: comma-separated sources; default all crowd sources.
+            sources: comma-separated source ids from: telegram, reddit, twitter_crypto, 4chan,
+                bitcointalk, farcaster (exact ids); default all of them.
             max_words: max total words across the sampled message texts (default 100k; the
                 server clamps to its own ceiling). Bigger = more raw posts, more cost/latency.
         """
         body: dict = {"max_words": int(max_words)}
-        if asset and _SLUG_RE.match(asset):
-            body["slug"] = asset
-        else:
-            body["search_text"] = asset
+        asset = (asset or "").strip()
+        by_slug = bool(asset) and _SLUG_RE.match(asset) is not None
+        body["slug" if by_slug else "search_text"] = asset
         # The model often emits Santiment-style date math (`utc_now-24h`); ES wants
         # `now-24h`. Normalize so either form (and ISO) works.
         if from_timestamp:
@@ -81,25 +91,59 @@ def build_tools(cfg) -> list:
         if to_timestamp:
             body["to_timestamp"] = to_timestamp.replace("utc_now", "now")
         if sources:
-            body["sources"] = sources
+            wanted = [s.strip().lower() for s in sources.split(",") if s.strip()]
+            bad = [s for s in wanted if s not in VALID_SOURCES]
+            if bad:
+                return (f"social_messages: unknown source(s) {', '.join(bad)}. Valid sources: "
+                        f"{', '.join(VALID_SOURCES)}. Retry with valid ids or omit `sources`.")
+            body["sources"] = ",".join(wanted)
 
-        try:
-            payload = await asyncio.to_thread(_post_json, url, body)
-        except Exception as exc:
-            return f"social_messages request failed: {exc}"
-
-        if not isinstance(payload, dict):
-            return f"social_messages: unexpected response: {str(payload)[:300]}"
-        if payload.get("error"):
-            return f"social_messages service error: {payload.get('error')}"
-        data = payload.get("data")
-        if not isinstance(data, dict):
-            return f"social_messages: unexpected response shape: {str(payload)[:300]}"
-        return json.dumps({"stats": data.get("stats", {}), "messages": data.get("messages", [])},
-                          default=str)
+        data = await _call(url, body)
+        if isinstance(data, str):
+            return data
+        # A slug's curated query can match nothing while the name itself is discussed;
+        # fall back to a free-text search before declaring the crowd silent.
+        if by_slug and _total(data) == 0:
+            text_body = {k: v for k, v in body.items() if k != "slug"}
+            text_body["search_text"] = asset
+            text_data = await _call(url, text_body)
+            if isinstance(text_data, dict) and _total(text_data) > 0:
+                data = text_data
+                data.setdefault("stats", {})["query_mode"] = "search_text"
+                data["stats"]["note"] = (
+                    f"The project query for slug {asset!r} matched no messages; these results "
+                    f"are a free-text search for {asset!r} instead.")
+        out = {"stats": data.get("stats", {}), "messages": data.get("messages", [])}
+        if _total(data) == 0 and not out["messages"]:
+            out["note"] = _NO_DATA_NOTE
+        return json.dumps(out, default=str)
 
     return [StructuredTool.from_function(
         coroutine=social_messages, name="social_messages", description=_DESCRIPTION)]
+
+
+def _total(data: dict) -> int:
+    """Full-population match count from the stats block (0 when absent/unparseable)."""
+    try:
+        return int((data.get("stats") or {}).get("total_matching") or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 0
+
+
+async def _call(url: str, body: dict) -> dict | str:
+    """One POST; the ``data`` dict on success, else a plain error string for the model."""
+    try:
+        payload = await asyncio.to_thread(_post_json, url, body)
+    except Exception as exc:
+        return f"social_messages request failed: {exc}"
+    if not isinstance(payload, dict):
+        return f"social_messages: unexpected response: {str(payload)[:300]}"
+    if payload.get("error"):
+        return f"social_messages service error: {payload.get('error')}"
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return f"social_messages: unexpected response shape: {str(payload)[:300]}"
+    return data
 
 
 def _post_json(url: str, body: dict) -> dict:

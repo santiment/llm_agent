@@ -40,16 +40,34 @@ from deepagents.backends.protocol import (
 )
 from deepagents.backends.sandbox import BaseSandbox
 
+from .events import emit
+
 log = logging.getLogger("deep_research_agent.sandbox")
 
 _DEFAULT_EXEC_TIMEOUT = 60
+
+
+# The service reaps a session after its timeout (and Docker can lose a container on its
+# own); after that every call on the old session id fails like this. Detected on both the
+# HTTP error and the exec OUTPUT — the daemon error comes back as command output, exit
+# code and all, so a plain exec never raises.
+_DEAD_SESSION_MARKERS = ("no such container", "session not found", "-> http 404")
+_RESET_NOTE = ("[sandbox note: the previous sandbox session was gone (timed out or removed), "
+               "so a fresh one was opened. Files written or offloaded earlier in this run no "
+               "longer exist — recreate what you need before using it.]\n")
+
+
+def _looks_dead(text: str) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in _DEAD_SESSION_MARKERS)
 
 
 class HttpSandboxBackend(BaseSandbox):
     """SandboxBackendProtocol backed by the llm-sandbox HTTP API (provider-agnostic)."""
 
     def __init__(self, base_url: str, token: str = "", *, network: bool = False,
-                 session_timeout: int = 900, http_timeout: float = 120.0) -> None:
+                 session_timeout: int = 900, http_timeout: float = 120.0,
+                 seed_files: list[tuple[str, bytes]] | None = None) -> None:
         self._base = base_url.rstrip("/")
         self._headers = {"Content-Type": "application/json"}
         if token:
@@ -57,6 +75,8 @@ class HttpSandboxBackend(BaseSandbox):
         self._network = network
         self._session_timeout = int(session_timeout)
         self._http_timeout = http_timeout
+        # (container_path, bytes) uploaded into every new session (agent.skill_seed_files).
+        self._seed_files = list(seed_files or [])
         # `id` must not create a session (deepagents may read it eagerly), so it's a stable
         # instance id; the actual sandbox session is created lazily on first execute/file op.
         import uuid
@@ -87,15 +107,35 @@ class HttpSandboxBackend(BaseSandbox):
                         "network": self._network, "timeout_seconds": self._session_timeout})
                     self._session_id = data["session_id"]
                     log.info("sandbox session %s opened (%s)", self._session_id, self._base)
+                    self._seed(self._session_id)
         return self._session_id
+
+    def _seed(self, sid: str) -> None:
+        """Upload seed files into the just-created session. Failures are logged, not raised.
+        ``_session_id`` is already set, so ``upload_files`` does not reopen a session."""
+        if not self._seed_files:
+            return
+        for r in self.upload_files(self._seed_files):
+            if r.error:
+                log.warning("sandbox seed %s failed: %s", r.path, r.error)
+        log.info("sandbox session %s seeded with %d file(s): %s", sid, len(self._seed_files),
+                 ", ".join(p for p, _ in self._seed_files))
 
     @property
     def id(self) -> str:
         return self._id
 
-    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
-        sid = self._ensure_session()
-        secs = int(timeout) if timeout is not None else _DEFAULT_EXEC_TIMEOUT
+    def _reset_session(self, why: str) -> str:
+        """Forget a dead session and open (and re-seed) a fresh one. Files are lost; the
+        caller tells the model so via ``_RESET_NOTE``."""
+        with self._lock:
+            old, self._session_id = self._session_id, None
+        log.warning("sandbox session %s is gone (%s) — opening a fresh one; files written "
+                    "earlier in this run are lost", old, why[:200])
+        emit({"type": "status", "state": "sandbox_reset", "detail": why[:200]})
+        return self._ensure_session()
+
+    def _exec_once(self, sid: str, command: str, secs: int) -> ExecuteResponse:
         data = self._http("POST", f"/sessions/{sid}/exec",
                           {"command": command, "timeout_seconds": secs}, timeout=secs + 30)
         return ExecuteResponse(
@@ -103,6 +143,24 @@ class HttpSandboxBackend(BaseSandbox):
             exit_code=data.get("exit_code"),
             truncated=bool(data.get("truncated")),
         )
+
+    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        sid = self._ensure_session()
+        secs = int(timeout) if timeout is not None else _DEFAULT_EXEC_TIMEOUT
+        try:
+            res = self._exec_once(sid, command, secs)
+            if not _looks_dead(res.output):
+                return res
+            why = res.output.strip()[:200]
+        except RuntimeError as exc:
+            if not _looks_dead(str(exc)):
+                raise
+            why = str(exc)
+        # Dead session: one fresh session, one retry, and the model is told what happened.
+        sid = self._reset_session(why)
+        res = self._exec_once(sid, command, secs)
+        return ExecuteResponse(output=_RESET_NOTE + res.output, exit_code=res.exit_code,
+                               truncated=res.truncated)
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         sid = self._ensure_session()

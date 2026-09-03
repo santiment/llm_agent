@@ -93,6 +93,36 @@ def test_hard_calls_jumps_to_end() -> None:
     assert update == {"jump_to": "end"}, update
 
 
+class _Clock:
+    def __init__(self, elapsed):
+        self.elapsed = elapsed
+
+    def elapsed_s(self):
+        return self.elapsed
+
+
+def test_time_ceiling_soft_then_hard(capture_events) -> None:
+    # Calls and tokens far under budget; only the clock is binding.
+    mw = BudgetMiddleware(max_tool_calls=1_000, max_total_tokens=10**9,
+                          max_run_seconds=1_000, meter=_Clock(800))
+    update = mw.before_model({"messages": [HumanMessage("q")]}, None)
+    assert _is_budget_nudge(update) and "jump_to" not in update
+    assert "13/17 minutes" in update["messages"][0].content
+    soft = [e for e in capture_events if e.get("state") == "budget_soft"]
+    assert soft and soft[0]["reason"] == "time" and soft[0]["elapsed_s"] == 800
+
+    mw.meter.elapsed = 1_000
+    assert mw.before_model({"messages": [HumanMessage("q")]}, None) == {"jump_to": "end"}
+    assert [e["reason"] for e in capture_events if e.get("state") == "budget_halt"] == ["time"]
+
+
+def test_no_time_ceiling_without_cap_or_meter() -> None:
+    assert BudgetMiddleware(max_tool_calls=10, max_total_tokens=10_000, max_run_seconds=0,
+                            meter=_Clock(10**9)).before_model({"messages": [HumanMessage("q")]}, None) is None
+    assert BudgetMiddleware(max_tool_calls=10, max_total_tokens=10_000, max_run_seconds=60,
+                            meter=None).before_model({"messages": [HumanMessage("q")]}, None) is None
+
+
 def test_hard_tokens_jumps_to_end() -> None:
     mw = BudgetMiddleware(max_tool_calls=1_000, max_total_tokens=1_000)
     msgs = [HumanMessage("q"),
