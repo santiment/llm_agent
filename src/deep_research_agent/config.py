@@ -77,9 +77,12 @@ _DEFAULT_STREAMING_DENYLIST = ["deepseek-v4-flash"]
 # rare input, so their per-token price barely shows in a run — pick them for quality.
 MODEL_TIERS: dict[str, dict[str, str]] = {
     # Rock bottom: one model family end to end, so delegation pays off only via context
-    # isolation. deepseek-v4-flash is on _DEFAULT_STREAMING_DENYLIST, so nothing here streams.
+    # isolation. `deepseek-v4-flash` is a _DEFAULT_STREAMING_DENYLIST substring and matches the
+    # -0731 slug too, so nothing here streams. 0731 is the current V4 Flash build: the bare
+    # `deepseek/deepseek-v4-flash` slug is the older 0423 one — pricier in, 1.0M ctx vs 1.31M,
+    # no parallel_tool_calls — so no slot should use it.
     "extra-low": {
-        "research_model": "deepseek/deepseek-v4-flash",  # $0.09 / $0.18
+        "research_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "subagent_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "compaction_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
@@ -88,7 +91,7 @@ MODEL_TIERS: dict[str, dict[str, str]] = {
     # qwen3.8-27b: τ² 78.7% at fleet-adjacent prices, but slow (~5 min/task median).
     "low": {
         "research_model": "qwen/qwen3.8-27b",  # $0.42 / $2.55
-        "subagent_model": "deepseek/deepseek-v4-flash",  # $0.09 / $0.18
+        "subagent_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "compaction_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
         "coding_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
@@ -96,7 +99,7 @@ MODEL_TIERS: dict[str, dict[str, str]] = {
     # gemini-3.7-flash: τ² #2 overall (80.6%) and GPQA #2 (94.3%) at a flash price.
     "mid": {
         "research_model": "google/gemini-3.7-flash",  # $0.75 / $3.75
-        "subagent_model": "deepseek/deepseek-v4-flash",  # $0.09 / $0.18
+        "subagent_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "utility_model": "google/gemini-3.5-flash-lite",  # $0.30 / $2.50
         "compaction_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
         "coding_model": "google/gemini-3.6-flash",  # $0.75 / $3.75

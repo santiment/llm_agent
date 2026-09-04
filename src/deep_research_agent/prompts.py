@@ -34,8 +34,20 @@ may be omitted; "summary", "findings" and each finding's "source" may not). \
 Findings are the READER's material, distilled: the few figures that answer the unit \
 (top-N with counts and denominators), never every value you saw — and never an \
 inventory of files, paths, or "what still needs processing" (a gap is a plain sentence \
-about what is unknown). \
-Findings must come from THIS run's tool results, never from memory. \
+about what is unknown).
+- FINDINGS CARRY CONCLUSIONS, NOT DATA — the single rule most often broken. A finding is \
+what the data SHOWS, in words plus the few numbers that prove it; it is NEVER the data \
+the conclusion came from. In "summary", "finding" and "evidence" alike, these are \
+FORBIDDEN: a time series or any date-to-value list beyond about three points (on one line \
+or many, whatever the separator: `2026-06-05,-0.20; 2026-06-06,-0.20; …` is exactly the \
+mistake), a list of messages/posts/quotes beyond the one or two that make the point, a \
+table, a row dump, a column of values, raw JSON. Write the SHAPE instead: first and last \
+value, peak and trough with their dates, mean, direction, and counts with their \
+denominators; quote at most a couple of representative lines. When the reader would want \
+the numbers themselves, NAME the /workspace file that holds them and say what it shows — \
+the path travels, the rows do not. A finding that carries a series or a dump is rejected \
+and handed back to you to distill.
+- Findings must come from THIS run's tool results, never from memory. \
 If the unit yielded nothing, say so in "summary" and return an empty findings list; \
 NEVER pad with invented findings.\
 """
@@ -284,8 +296,9 @@ back; return aggregates (counts, totals, top-N) and only the specific rows that 
 unit. The same holds for TIME SERIES (hourly/daily buckets, volume curves, per-bucket \
 sentiment): never bucket by bucket, whatever the date format — give first and last value, \
 peak/trough with when, average and direction, in one sentence. A metric series arrives as a \
-saved file plus that summary already computed: use it, or `execute` over the file for more; \
-findings that list rows are rejected.
+saved file plus that summary already computed: use it, or `execute` over the file for more. \
+Your findings are a CONCLUSION, never the data behind it (see RETURN FORMAT): a series, a \
+message list or a table pasted into a field is rejected and bounced back.
 - Run code for real or not at all: only report output you ACTUALLY got from executing it (the \
 `execute` tool). If you can't run it, say so and show the code unrun — never invent results.
 - `execute` runs a SHELL command: put any script longer than a one-liner in a FILE \
