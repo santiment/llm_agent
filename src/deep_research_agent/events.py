@@ -103,6 +103,10 @@ STATUS_STATES = frozenset({
     "mcp_ready", "mcp_error", "budget_soft", "budget_halt", "revising",
     "compacting", "compacted", "loop_detected", "loop_halt", "done", "error",
     "subagent_start", "subagent_done",  # carry ``role`` + ``model``
+    "triage",                           # carries ``detail``: simple | research
+    "model_call",                       # ``role`` + ``model`` + ``step`` (+ ``unit``/``after``)
+    "runaway_output", "runaway_halt",   # carry ``detail`` + ``chars``
+    "sandbox_reset",                    # carries ``detail``
 })
 
 

@@ -73,6 +73,7 @@ def test_status_states_pinned():
         "mcp_ready", "mcp_error", "budget_soft", "budget_halt", "revising",
         "compacting", "compacted", "loop_detected", "loop_halt", "done", "error",
         "subagent_start", "subagent_done",
+        "triage", "model_call", "runaway_output", "runaway_halt", "sandbox_reset",
     }
 
 
