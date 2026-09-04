@@ -28,6 +28,10 @@ in ``EVENT_SCHEMAS`` order:
   - ``usage``          -> end-of-run tool-call / token counters against their limits,
                           plus run time (``elapsed_s``, ``elapsed``, ``started_at``, ``finished_at``)
   - ``subagent_findings`` -> one research unit's summary, findings and gaps
+  - ``script``         -> a script the agent wrote, as CODE (``language`` + basename
+                          ``name``): render it as a COLLAPSED "view script" tab. This
+                          event is the only place a script surfaces — no path is ever
+                          put in the agent's prose, so there is nothing to render inline
 
 Assistant *reasoning* prose (the italic narration between steps) is NOT a custom
 event — it streams on the ``messages`` channel as normal AI tokens, so the UI
@@ -96,6 +100,7 @@ EVENT_SCHEMAS: dict[str, frozenset[str]] = {
     "usage": frozenset({"tool_calls", "input_tokens", "output_tokens",
                         "total_tokens", "limits", "elapsed_s"}),
     "subagent_findings": frozenset({"unit", "summary", "findings", "gaps"}),
+    "script": frozenset({"id", "agent", "name", "language", "code"}),
 }
 
 # Every ``state`` a status event may carry; ``_check_shape`` warns on an unregistered one.

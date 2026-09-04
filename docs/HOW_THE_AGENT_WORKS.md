@@ -380,6 +380,7 @@ That's what keeps the agent portable.
 | `source` | a registered citation for the live source list |
 | `skill` | "Skill applied: …" |
 | `subagent_findings` | a folded findings table from a worker |
+| `script` | a collapsed "view script" tab holding the code a worker wrote (basename + `language` + final source). The only place a script surfaces: no role names a script path in prose, and the coder's handoff is scrubbed of paths before the orchestrator reads it (`script_artifacts.py`) |
 | `clarification` | the question card (re-enables input) |
 | `status` | lifecycle: `mcp_ready` / `mcp_error` (tool loading), `budget_soft` / `budget_halt` (ceilings), `revising` (a gate bounced a deliverable back), `compacting` / `compacted` (context compaction), `loop_detected` / `loop_halt` (repeated-identical-call guard), `subagent_start` / `subagent_done` (a sub-agent run, with `role` + `model`), then exactly one end-state — `done` or `error`, with a `reason` code and the run time (`elapsed_s` / `elapsed`, also appended to `detail`: "… Run time 4m 12s.") |
 | `usage` | the per-run usage summary, incl. run time (`elapsed_s`, `elapsed`, `started_at`, `finished_at`) |

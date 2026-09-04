@@ -46,6 +46,7 @@ def test_registry_pins_the_full_event_vocabulary():
         "run_start", "search_query", "search_results", "source",
         "mcp_call", "mcp_result", "tool_call", "tool_result",
         "skill", "report", "status", "clarification", "usage", "subagent_findings",
+        "script",
     }
 
 
