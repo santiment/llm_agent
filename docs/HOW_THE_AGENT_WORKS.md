@@ -160,6 +160,11 @@ The model classifies the incoming message:
   knowledge (*"what's the capital of Bulgaria?"*, *"what does MVRV mean?"*). → answer in one or two
   sentences as plain text and **stop**. No tools, no report. This re-runs on **every** message, so a
   definitional follow-up after a big report is still answered as a quick plain reply.
+- **COMPUTE** — the answer is a number that has to be calculated (*"compute the square root of
+  9238123123123123123123123"*, a percentage change, a unit conversion). → run it in Python with
+  **`execute`** and reply with the printed value as plain text. Never mental arithmetic, never an
+  approximation when the sandbox is up. A calculation is not research: no todos, no sub-agents, no
+  report — `turn.did_research_work` treats an `execute`-only turn as a direct answer.
 - **AMBIGUOUS** — unclear scope, timeframe, entity, or goal. → call `request_clarification` with 1–3
   short questions, then **stop and wait**. This is allowed **only here, before any research**, at
   most twice. (See §9 on how the UI renders this and how the user's reply flows back.)
@@ -380,7 +385,7 @@ That's what keeps the agent portable.
 | `source` | a registered citation for the live source list |
 | `skill` | "Skill applied: …" |
 | `subagent_findings` | a folded findings table from a worker |
-| `script` | a collapsed "view script" tab holding the code a worker wrote (basename + `language` + final source). The only place a script surfaces: no role names a script path in prose, and the coder's handoff is scrubbed of paths before the orchestrator reads it (`script_artifacts.py`) |
+| `script` | a collapsed "view script" tab holding code an agent ran: a FILE script (basename + `language` + final source, at the worker's handoff) or INLINE code from an `execute` heredoc / `python3 -c` (`inline.py` + its real `output`, as the call returns, for every role including the orchestrator). The only place a script surfaces: no role names a script path in prose, and the coder's handoff is scrubbed of paths before the orchestrator reads it (`script_artifacts.py`) |
 | `clarification` | the question card (re-enables input) |
 | `status` | lifecycle: `mcp_ready` / `mcp_error` (tool loading), `budget_soft` / `budget_halt` (ceilings), `revising` (a gate bounced a deliverable back), `compacting` / `compacted` (context compaction), `loop_detected` / `loop_halt` (repeated-identical-call guard), `subagent_start` / `subagent_done` (a sub-agent run, with `role` + `model`), then exactly one end-state — `done` or `error`, with a `reason` code and the run time (`elapsed_s` / `elapsed`, also appended to `detail`: "… Run time 4m 12s.") |
 | `usage` | the per-run usage summary, incl. run time (`elapsed_s`, `elapsed`, `started_at`, `finished_at`) |

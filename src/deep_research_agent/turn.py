@@ -40,6 +40,12 @@ _SYNTHETIC_HUMAN_NAMES = {
 
 # Terminal/control tools — invoking these is how a turn *ends*, not "research work".
 _TERMINAL_TOOLS = {"submit_report", "request_clarification"}
+# Calculation is not research either. The orchestrator MUST run Python for any number it
+# reports instead of approximating in its head (prompts.py: the COMPUTE triage class and
+# "PYTHON DOES THE ARITHMETIC"), so a turn whose ONLY tool was `execute` is still a direct
+# answer: it may end as plain text — no report nudge (completion.py), no "ended without
+# report" error (citations.py). Any gather/plan tool alongside it makes the turn research.
+_CALC_TOOLS = {"execute"}
 
 
 def turn_anchor_index(messages: list) -> int:
@@ -132,12 +138,14 @@ def looks_delivered(content: str) -> bool:
 
 def did_research_work(messages: list) -> bool:
     """True if the agent took any research action this turn (planning, search, MCP,
-    subagent) — i.e. anything beyond the terminal submit/clarify tools.
+    subagent) — i.e. anything beyond the terminal submit/clarify tools and a bare
+    calculation.
 
     This is the line between a *research report* (must be delivered via submit_report)
-    and a *direct conversational answer* (a simple question answered from knowledge,
-    which legitimately ends the turn as plain text — no report card, no nudging)."""
-    return any(n not in _TERMINAL_TOOLS for n in tool_names_in(messages))
+    and a *direct conversational answer* (a simple question answered from knowledge, or a
+    number computed in Python, which legitimately ends the turn as plain text — no report
+    card, no nudging)."""
+    return bool(set(tool_names_in(messages)) - _TERMINAL_TOOLS - _CALC_TOOLS)
 
 
 CHARS_PER_TOKEN = 4  # fallback ratio when usage_metadata is absent

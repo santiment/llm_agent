@@ -4,7 +4,7 @@ Every orchestrator step carries ~12k tokens of harness (our prompt, the `task` t
 three sub-agent descriptions, tool schemas, data-source list). "What's the capital of
 Bulgaria?" paid all of it for a ten-token answer. This middleware runs on the FIRST model
 step of a fresh user turn: a ~250-token call on the research model decides SIMPLE (answer
-from general knowledge, no data, no sources) or RESEARCH. SIMPLE gets a second small call
+from general knowledge, no data, no sources, no arithmetic) or RESEARCH. SIMPLE gets a second small call
 that writes the answer, and the turn ends there — the orchestrator never sees it. RESEARCH
 (and any failure here) falls through to the full agent, whose own TRIAGE still handles
 clarifications and follow-ups answerable from the report in context.
@@ -34,12 +34,15 @@ MAX_CONTEXT_CHARS = 400
 ROUTER_PROMPT = """\
 You are the triage step in front of a deep-research agent. Decide whether the user's latest \
 message can be answered reliably from general knowledge in one to three sentences — with no \
-data lookup, no current figures, no sources: greetings, thanks, small talk, definitions ("what \
-is CPI?"), unit conversions, well-known stable facts ("what's the capital of Bulgaria?"). That \
-is SIMPLE.
+data lookup, no current figures, no sources, and NO CALCULATION: greetings, thanks, small \
+talk, definitions ("what is CPI?"), well-known stable facts ("what's the capital of \
+Bulgaria?"). That is SIMPLE.
 Everything else is RESEARCH: anything asking for current or historical data, prices, volumes, \
 trends, sentiment, comparisons, analysis, recommendations, a report, or anything that refers \
 back to earlier research results or needs the previous answer's content.
+ANY COMPUTATION IS RESEARCH, however small — arithmetic, a square root, a percentage, a \
+unit conversion, a day count, a statistic. You have NO calculator on this path and must \
+never estimate a number: the full agent runs Python and returns the exact value.
 When in doubt, RESEARCH. Reply with exactly one word: SIMPLE or RESEARCH."""
 
 ANSWER_PROMPT = """\

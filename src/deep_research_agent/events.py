@@ -28,10 +28,13 @@ in ``EVENT_SCHEMAS`` order:
   - ``usage``          -> end-of-run tool-call / token counters against their limits,
                           plus run time (``elapsed_s``, ``elapsed``, ``started_at``, ``finished_at``)
   - ``subagent_findings`` -> one research unit's summary, findings and gaps
-  - ``script``         -> a script the agent wrote, as CODE (``language`` + basename
-                          ``name``): render it as a COLLAPSED "view script" tab. This
-                          event is the only place a script surfaces — no path is ever
-                          put in the agent's prose, so there is nothing to render inline
+  - ``script``         -> code an agent RAN, as CODE (``language`` + basename ``name``):
+                          render it as a COLLAPSED "view script" tab. A file script comes
+                          at the worker's handoff; code run inline through ``execute`` comes
+                          as the call returns, named ``inline.py`` and carrying ``output``
+                          (its real printed result). This event is the only place a script
+                          surfaces — no path is ever put in the agent's prose, so there is
+                          nothing to render inline
 
 Assistant *reasoning* prose (the italic narration between steps) is NOT a custom
 event — it streams on the ``messages`` channel as normal AI tokens, so the UI

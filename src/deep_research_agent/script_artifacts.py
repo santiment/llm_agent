@@ -1,6 +1,7 @@
 """Scripts reach the USER as an artifact, never as a path in prose.
 
-Two jobs, both on the coding worker (and capture-only on the research sub-agent):
+Three jobs. The first two run on the coding worker (and capture-only on the research
+sub-agent); the third runs on EVERY role that can call ``execute``, orchestrator included:
 
   - CAPTURE. A script the agent wrote with ``write_file`` (then patched with
     ``edit_file``) is replayed from the sub-agent's own messages and emitted ONCE, at
@@ -14,6 +15,15 @@ Two jobs, both on the coding worker (and capture-only on the research sub-agent)
     left in prose, and bare ``<name>.py`` mentions. A path is a dead end for the
     reader — they cannot open the sandbox, and the run's filesystem is gone when it
     ends — and once the orchestrator has read one it repeats it into the report.
+
+  - INLINE CAPTURE. Code an agent ran WITHOUT writing a file — a heredoc
+    (``python3 - <<'PY'`` … ``PY``) or ``python3 -c "…"`` — is emitted as the same
+    ``script`` event once the call returns, with its real printed output. Nothing else
+    reports it: ``execute`` is a deepagents built-in, so ``events.instrument_tool``
+    never wraps it, and inline code writes no file for the replay to find. Without this
+    the orchestrator computes a number in Python and the user is shown no evidence that
+    anything ran at all — the gap that let a hand-waved "approximately" pass for a
+    computed answer.
 
 The prompt (``CODING_PROMPT``) already forbids all of this; this module is the
 deterministic backstop for when a cheap coder ignores it. Prompt first, because
@@ -35,7 +45,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage
 
 from .events import emit, new_id
-from .turn import current_turn, text_of, tool_calls_of
+from .turn import current_turn, text_of, tool_call_of, tool_calls_of
 
 log = logging.getLogger("deep_research_agent.script_artifacts")
 
@@ -151,6 +161,104 @@ def _emit_scripts(turn: list, agent: str) -> None:
               "name": path.rsplit("/", 1)[-1],
               "language": _LANGUAGES.get(_ext(path), "text"),
               "code": body, "truncated": len(body) < len(code)})
+
+
+# ---- inline code in an `execute` command -------------------------------------------------
+# Not every script is a file. `execute` runs a SHELL command, so an agent can carry its
+# whole program inline: the sanctioned heredoc, or the forbidden-but-used `python3 -c "…"`.
+# Matching is deliberately narrow — an inline PROGRAM only. A command that RUNS a file
+# (`python /workspace/x.py`) is already covered by the replay above, and a plain shell call
+# (`ls /workspace`) is not a script; emitting either would only add empty tabs.
+_HEREDOC = re.compile(
+    r"^(?:[\w./-]*/)?(python3?|bash|sh|node|Rscript|julia)\b[^\n<]*<<-?\s*"
+    r"(['\"]?)([A-Za-z_]\w*)\2\s*\n(?P<code>.*?)\n\s*\3\s*$", re.S)
+_DASH_C = re.compile(
+    r"^(?:[\w./-]*/)?(python3?|bash|sh|node)\b\s+(?:-\w+\s+)*-c\s+"
+    r"(['\"])(?P<code>.*)\2\s*$", re.S)
+_INTERPRETERS = {"python": "python", "python3": "python", "bash": "bash", "sh": "bash",
+                 "node": "javascript", "Rscript": "r", "julia": "julia"}
+# Tab title for code that has no file name — a title is all the UI needs, the same reason
+# `_emit_scripts` sends a basename and never a path.
+_TAB_NAMES = {"python": "inline.py", "bash": "inline.sh", "javascript": "inline.js",
+              "r": "inline.r", "julia": "inline.jl"}
+# The printed output, capped to a HEAD. It is EVIDENCE that the code ran, not a data
+# channel: a script that prints a lot is already breaking the prompts' no-dumping rule,
+# and the extract worker prints row slices this must not mirror in full.
+MAX_OUTPUT_CHARS = 2_000
+
+
+def inline_code(command: str) -> tuple[str, str] | None:
+    """``(language, code)`` when a shell command carries its program INLINE, else ``None``."""
+    text = (command or "").strip()
+    for pattern in (_HEREDOC, _DASH_C):
+        m = pattern.match(text)
+        if m and m.group("code").strip():
+            return _INTERPRETERS.get(m.group(1), "text"), m.group("code").strip()
+    return None
+
+
+def _output_of(result: Any) -> str:
+    """The tool result's text for the artifact's output pane. A ToolMessage normally;
+    anything else stringifies — observability must never raise."""
+    try:
+        return text_of(getattr(result, "content", result))
+    except Exception:  # pragma: no cover - defensive
+        return ""
+
+
+def _emit_inline(agent: str, language: str, code: str, output: str) -> None:
+    body = code[:MAX_CODE_CHARS]
+    printed = (output or "")[:MAX_OUTPUT_CHARS]
+    emit({"type": "script", "id": new_id(), "agent": agent,
+          "name": _TAB_NAMES.get(language, "inline.txt"), "language": language,
+          "code": body, "truncated": len(body) < len(code),
+          "output": printed, "output_truncated": len(printed) < len(output or "")})
+
+
+class ExecuteArtifactsMiddleware(AgentMiddleware):
+    """Emit the code an ``execute`` call carried inline, for EVERY role — orchestrator
+    included, since it computes with ``execute`` and holds no file tools at all.
+
+    Mount it on any spec whose model can call ``execute``. It is a no-op on every other
+    tool, on a command that only runs a file, and with no sandbox (the tool never loads).
+    The event fires once the call RETURNS, so the tab carries the code and its real output
+    together — the evidence that a reported number was computed and not estimated. A raised
+    call still emits: "it ran and broke" is as informative as a clean run.
+    """
+
+    def __init__(self, agent: str) -> None:
+        super().__init__()
+        self.agent = agent
+
+    def _inline(self, request) -> tuple[str, str] | None:
+        name, args, _call_id = tool_call_of(request)
+        if name != "execute":
+            return None
+        return inline_code(str((args or {}).get("command") or ""))
+
+    def wrap_tool_call(self, request, handler):
+        code = self._inline(request)
+        if code is None:
+            return handler(request)
+        try:
+            result = handler(request)
+        except Exception as exc:
+            _emit_inline(self.agent, *code, f"{type(exc).__name__}: {exc}")
+            raise
+        _emit_inline(self.agent, *code, _output_of(result))
+        return result
+
+    async def awrap_tool_call(self, request, handler):
+        code = self._inline(request)
+        if code is None:
+            return await handler(request)
+        try:
+            result = await handler(request)
+        except Exception as exc:
+            _emit_inline(self.agent, *code, f"{type(exc).__name__}: {exc}")
+            raise
+        _emit_inline(self.agent, *code, _output_of(result))
+        return result
 
 
 class ScriptArtifactsMiddleware(AgentMiddleware):
