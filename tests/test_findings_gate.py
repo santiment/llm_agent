@@ -175,8 +175,59 @@ def test_findings_evidence_with_raw_series_is_bounced() -> None:
            "findings": [{"finding": "Bullish share held near 38%.", "evidence": rows,
                          "source": "Santiment social messages"}]}
     probs = findings_problems(json.dumps(obj))
-    assert any("raw time series" in p for p in probs)
+    assert any("transcribes a time series" in p for p in probs)
     obj["findings"][0]["evidence"] = "bullish share 0.36–0.41 across 7 hours, flat, peak 11:00"
+    assert findings_problems(json.dumps(obj)) == []
+
+
+def test_a_series_pasted_into_any_field_is_bounced() -> None:
+    """The case that reached a user's screen: 70 `date,value` points on ONE line, in
+    "finding" rather than "evidence" — the line-based series check saw nothing."""
+    import json
+
+    series = "; ".join(f"2026-06-{d:02d},-0.20{d}" for d in range(5, 25))
+    for field in ("finding", "evidence", "summary"):
+        obj = {"summary": "MVRV stayed negative.",
+               "findings": [{"finding": "MVRV held near -0.21.", "source": "Santiment"}]}
+        if field == "summary":
+            obj["summary"] = f"Complete daily series: {series}"
+        else:
+            obj["findings"][0][field] = f"Complete daily series: {series}"
+        probs = findings_problems(json.dumps(obj))
+        assert any("transcribes a time series" in p for p in probs), (field, probs)
+        assert any("20 dated points" in p for p in probs), (field, probs)
+        assert any("CONCLUSION" in p for p in probs), (field, probs)
+
+    # Citing a few dated values is normal prose, not a transcription.
+    fine = {"summary": "MVRV fell from -0.2026 on 2026-06-05 to -0.2120 on 2026-08-13.",
+            "findings": [{"finding": "Trough -0.2211 on 2026-07-21, mean -0.211, flat.",
+                          "source": "Santiment"}]}
+    assert findings_problems(json.dumps(fine)) == []
+
+
+def test_an_oversize_field_is_bounced_as_a_dump() -> None:
+    """A message/post list has no dates to spot, so sheer length is the backstop."""
+    import json
+
+    from deep_research_agent.findings_gate import MAX_FIELD_CHARS
+
+    dump = "; ".join(f"user{i} said the market looks strong right now" for i in range(40))
+    assert len(dump) > MAX_FIELD_CHARS
+    obj = {"summary": "Crowd is bullish.",
+           "findings": [{"finding": "62% of 480 messages are bullish.", "evidence": dump,
+                         "source": "Santiment social messages"}]}
+    probs = findings_problems(json.dumps(obj))
+    assert any("data dump, not a finding" in p for p in probs), probs
+
+    obj["findings"][0]["evidence"] = 'bullish 62% of 480; typical: "market looks strong"'
+    assert findings_problems(json.dumps(obj)) == []
+
+
+def test_a_source_field_is_never_flagged_for_length_or_dates() -> None:
+    import json
+
+    obj = {"summary": "s", "findings": [
+        {"finding": "f", "source": "https://example.com/data?from=2026-06-05,1&to=2026-06-06,2"}]}
     assert findings_problems(json.dumps(obj)) == []
 
 

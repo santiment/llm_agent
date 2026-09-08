@@ -2,10 +2,11 @@
 
 Registered whenever a sandbox is configured (it needs only `execute` + the file tools, not
 offloading), runs on cfg.coding_model, holds no data tools, keeps write/edit/read but loses
-grep + write_todos, carries no findings gate (its handoff is a script path + output), and is
-nested into the research-subagent's `task` tool next to the extract-subagent. The prompt
-work that sends failed `execute` calls to it — instead of narrated `python -c` quoting
-retries — is pinned here too.
+grep + write_todos, carries no findings gate (its handoff is output + notes), and is
+nested into the research-subagent's `task` tool next to the extract-subagent. Its scripts
+reach the user as `script` EVENTS (see test_script_artifacts.py), never as a path in prose.
+The prompt work that sends failed `execute` calls to it — instead of narrated `python -c`
+quoting retries — is pinned here too.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from deep_research_agent.findings_gate import SubagentFindingsMiddleware
 from deep_research_agent.metering import SubagentUsageMiddleware
 from deep_research_agent.prompts import (coding_prompt, extract_prompt, orchestrator_prompt,
                                          subagent_prompt)
+from deep_research_agent.script_artifacts import ScriptArtifactsMiddleware
 from deep_research_agent.tool_filter import CODING_EXCLUDED_TOOLS, ExcludeToolsMiddleware
 from conftest import make_graph_capture
 
@@ -68,7 +70,7 @@ def test_coding_subagent_keeps_file_tools_but_not_grep_or_todos(monkeypatch) -> 
     assert {"grep", "write_todos"} == set(CODING_EXCLUDED_TOOLS)
     assert not {"execute", "write_file", "edit_file", "read_file"} & CODING_EXCLUDED_TOOLS
     assert isinstance(spec["middleware"][-1], ExcludeToolsMiddleware)  # after tool injection
-    # Not a findings producer: the gate would bounce its STATUS/SCRIPT/OUTPUT handoff.
+    # Not a findings producer: the gate would bounce its STATUS/OUTPUT/NOTES handoff.
     assert not any(isinstance(m, SubagentFindingsMiddleware) for m in spec["middleware"])
 
 
@@ -89,6 +91,21 @@ def test_research_subagent_can_delegate_to_the_coder(monkeypatch) -> None:
     assert "write_file" in nested["middleware"][fs_idx]._custom_system_prompt
 
 
+def test_scripts_are_captured_and_the_handoff_is_scrubbed(monkeypatch) -> None:
+    # The coder emits its code as an artifact event AND has its handoff scrubbed (free
+    # prose the parent reads verbatim); the research sub-agent only emits (its handoff is
+    # findings JSON with its own gate).
+    monkeypatch.delenv("LLM_SANDBOX_URL", raising=False)
+    captured = make_graph_capture(monkeypatch, _sandbox_config())
+    coding = next(m for m in _coding_spec(captured)["middleware"]
+                  if isinstance(m, ScriptArtifactsMiddleware))
+    assert (coding.agent, coding.scrub) == ("coding-subagent", True)
+    research = next(s for s in captured["subagents"] if s["name"] == "research-subagent")
+    capture_only = next(m for m in research["middleware"]
+                        if isinstance(m, ScriptArtifactsMiddleware))
+    assert (capture_only.agent, capture_only.scrub) == ("research-subagent", False)
+
+
 def test_real_graph_compiles_with_both_nested_workers(monkeypatch) -> None:
     monkeypatch.delenv("LLM_SANDBOX_URL", raising=False)
     graph = asyncio.run(agent_mod.make_graph(_sandbox_config()))
@@ -102,8 +119,12 @@ def test_coding_prompt_contract() -> None:
     assert "`write_file` the script to /workspace/<name>.py" in prompt
     assert "NO data tools" in prompt
     assert "Do NOT narrate" in prompt
-    for field in ("STATUS:", "SCRIPT:", "OUTPUT:", "NOTES:"):
+    for field in ("STATUS:", "OUTPUT:", "NOTES:", "RESULT FILE:"):
         assert field in prompt
+    # No SCRIPT: field, and an explicit ban: a path is a dead end for the reader and gets
+    # copied into the report. The code goes out as a `script` event instead.
+    assert "SCRIPT:" not in prompt
+    assert "NEVER name the script anywhere in that handoff" in prompt
 
 
 def test_planner_and_fleet_are_told_to_delegate_failed_scripts() -> None:

@@ -28,6 +28,13 @@ in ``EVENT_SCHEMAS`` order:
   - ``usage``          -> end-of-run tool-call / token counters against their limits,
                           plus run time (``elapsed_s``, ``elapsed``, ``started_at``, ``finished_at``)
   - ``subagent_findings`` -> one research unit's summary, findings and gaps
+  - ``script``         -> code an agent RAN, as CODE (``language`` + basename ``name``):
+                          render it as a COLLAPSED "view script" tab. A file script comes
+                          at the worker's handoff; code run inline through ``execute`` comes
+                          as the call returns, named ``inline.py`` and carrying ``output``
+                          (its real printed result). This event is the only place a script
+                          surfaces — no path is ever put in the agent's prose, so there is
+                          nothing to render inline
 
 Assistant *reasoning* prose (the italic narration between steps) is NOT a custom
 event — it streams on the ``messages`` channel as normal AI tokens, so the UI
@@ -96,6 +103,7 @@ EVENT_SCHEMAS: dict[str, frozenset[str]] = {
     "usage": frozenset({"tool_calls", "input_tokens", "output_tokens",
                         "total_tokens", "limits", "elapsed_s"}),
     "subagent_findings": frozenset({"unit", "summary", "findings", "gaps"}),
+    "script": frozenset({"id", "agent", "name", "language", "code"}),
 }
 
 # Every ``state`` a status event may carry; ``_check_shape`` warns on an unregistered one.
@@ -103,6 +111,10 @@ STATUS_STATES = frozenset({
     "mcp_ready", "mcp_error", "budget_soft", "budget_halt", "revising",
     "compacting", "compacted", "loop_detected", "loop_halt", "done", "error",
     "subagent_start", "subagent_done",  # carry ``role`` + ``model``
+    "triage",                           # carries ``detail``: simple | research
+    "model_call",                       # ``role`` + ``model`` + ``step`` (+ ``unit``/``after``)
+    "runaway_output", "runaway_halt",   # carry ``detail`` + ``chars``
+    "sandbox_reset",                    # carries ``detail``
 })
 
 

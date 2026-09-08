@@ -151,6 +151,23 @@ def _row_value(line: str) -> float | None:
     return _num(v.group(0)) if v else None
 
 
+# A timestamped point wherever it sits — same line or its own. `series_runs` is line-based
+# (it locates runs to rewrite in a report); a model that pastes a series into ONE findings
+# field (`2026-06-05,-0.20; 2026-06-06,-0.20; …`) produces no such lines, so counting points
+# is what catches it. Deliberately requires a separator before the number, so prose like
+# "on 2026-06-05 it fell 4%" does not count.
+_DATED_POINT = re.compile(
+    r"\d{4}-\d{2}-\d{2}(?:[ T][\d:]+)?\s*[,;:|\t]\s*-?\d[\d,]*(?:\.\d+)?")
+# Three dated pairs is a sentence quoting values; more is a transcription of the series.
+MAX_QUOTED_POINTS = 3
+
+
+def dated_points(text: str) -> int:
+    """How many timestamped `date<sep>number` points ``text`` transcribes, line breaks
+    irrelevant. Above ``MAX_QUOTED_POINTS`` the text is listing a series, not citing it."""
+    return len(_DATED_POINT.findall(text or ""))
+
+
 def series_runs(md: str, min_rows: int = MIN_SERIES_ROWS) -> list[tuple[int, int, str, str]]:
     """Runs of >= ``min_rows`` timestamped data rows in ``md`` (blank lines between rows
     allowed), as ``(first_line, end_line_exclusive, first_timestamp, last_timestamp)`` over

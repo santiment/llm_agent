@@ -32,6 +32,7 @@ from .models import build_chat_model
 from .prompts import (coding_prompt, describe_mcp_sources, extract_prompt,
                       orchestrator_prompt, skills_block, subagent_prompt)
 from .report_gate import ReportQualityGateMiddleware
+from .script_artifacts import ExecuteArtifactsMiddleware, ScriptArtifactsMiddleware
 from .skill_usage import SkillUsageMiddleware
 from .tool_filter import (CODING_EXCLUDED_TOOLS, EXTRACT_EXCLUDED_TOOLS,
                           ORCHESTRATOR_EXCLUDED_TOOLS, ExcludeToolsMiddleware)
@@ -262,6 +263,9 @@ async def make_graph(config: dict | None = None):
                        SubagentUsageMiddleware(meter, "research-subagent",
                                                model=cfg.subagent_model),
                        SkillUsageMiddleware(),  # the "Skill applied" chip fires from here
+                       # Capture only: its handoff is findings JSON with its own gate.
+                       ScriptArtifactsMiddleware("research-subagent"),
+                       ExecuteArtifactsMiddleware("research-subagent"),
                        *shared_middleware],
     }
     # Skills live with the sub-agents ONLY: they hold the file tools that load a SKILL.md.
@@ -317,6 +321,9 @@ async def make_graph(config: dict | None = None):
             "middleware": [SubagentFindingsMiddleware(),
                            SubagentUsageMiddleware(meter, "extract-subagent",
                                                    model=cfg.utility_model),
+                           # Its whole job runs as `execute` heredocs — this is the
+                           # only way that code reaches the UI.
+                           ExecuteArtifactsMiddleware("extract-subagent"),
                            *shared_middleware,
                            ExcludeToolsMiddleware(EXTRACT_EXCLUDED_TOOLS)],
         }
@@ -331,15 +338,18 @@ async def make_graph(config: dict | None = None):
     # Coding worker: writes or fixes ONE script per task on a dedicated coder, so a failed
     # `execute` is repaired by a model good at it instead of by the planner narrating
     # shell-quoting retries. Small input (goal, file paths, code, error), so its price
-    # barely registers. No findings gate — its handoff is a script path + output, not
-    # findings. Keeps the file tools (it writes and edits scripts); loses grep/write_todos.
+    # barely registers. No findings gate — its handoff is output + notes, not findings;
+    # ScriptArtifactsMiddleware carries the code itself to the UI out of band. Keeps the
+    # file tools (it writes and edits scripts); loses grep/write_todos.
     if sandbox is not None:
         coding_spec = {
             "name": "coding-subagent",
             "description": (
                 "Writes or fixes a Python script for you on a dedicated coding model. Give it "
                 "the goal, the input file paths under /workspace, any existing code and the "
-                "EXACT error text; it returns the script path and the script's real output. "
+                "EXACT error text; it returns the script's real output. Do NOT ask it for "
+                "the script's path and never repeat one it mentions — the code is shown to "
+                "the user as an artifact and the path means nothing to anyone. "
                 "Use it for any script longer than a few lines and after ANY failed `execute` "
                 "— never retry shell-quoting variants of `python -c` yourself."
             ),
@@ -348,6 +358,10 @@ async def make_graph(config: dict | None = None):
             "model": coding_model,
             "middleware": [SubagentUsageMiddleware(meter, "coding-subagent",
                                                    model=cfg.coding_model),
+                           # Emits the finished code as a `script` event for the UI's
+                           # collapsed tab, and strips file paths from the handoff.
+                           ScriptArtifactsMiddleware("coding-subagent", scrub=True),
+                           ExecuteArtifactsMiddleware("coding-subagent"),
                            *shared_middleware,
                            ExcludeToolsMiddleware(CODING_EXCLUDED_TOOLS)],
         }
@@ -397,6 +411,10 @@ async def make_graph(config: dict | None = None):
         # fallback that surfaces narrated questions as the clarification card.
         ClarificationGuardMiddleware(),
         ClarificationFallbackMiddleware(),
+        # The orchestrator computes with `execute` (the COMPUTE triage class) and holds
+        # no file tools, so its code is ALWAYS inline — this middleware is the only
+        # thing that puts it on the event stream.
+        ExecuteArtifactsMiddleware("orchestrator"),
         # Per-run usage ledger → `usage` event + "RESEARCH USAGE" log line.
         UsageMeterMiddleware(
             meter,

@@ -150,6 +150,12 @@ def render_event(d: dict, pending: list[str]) -> None:
             print(f"     • {f}")
         for g in d.get("gaps", []):
             print(f"     ? gap: {g}")
+    elif t == "script":
+        # A real UI renders this COLLAPSED ("view script"); the terminal prints the header
+        # only. This event is the sole channel for a script — no role names one in prose.
+        lines = d["code"].count("\n") + 1
+        print(f"  🧾 script {d['name']} [{d['language']}, {lines} lines"
+              f"{', truncated' if d.get('truncated') else ''}] — folded")
     elif t == "report":
         print("\n===== FINAL REPORT =====\n")
         print(d["markdown"])

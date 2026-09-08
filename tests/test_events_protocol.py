@@ -46,6 +46,7 @@ def test_registry_pins_the_full_event_vocabulary():
         "run_start", "search_query", "search_results", "source",
         "mcp_call", "mcp_result", "tool_call", "tool_result",
         "skill", "report", "status", "clarification", "usage", "subagent_findings",
+        "script",
     }
 
 
@@ -73,6 +74,7 @@ def test_status_states_pinned():
         "mcp_ready", "mcp_error", "budget_soft", "budget_halt", "revising",
         "compacting", "compacted", "loop_detected", "loop_halt", "done", "error",
         "subagent_start", "subagent_done",
+        "triage", "model_call", "runaway_output", "runaway_halt", "sandbox_reset",
     }
 
 

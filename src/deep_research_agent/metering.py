@@ -24,13 +24,12 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
-from collections import Counter
-
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from .compaction import compacted_counts
@@ -139,10 +138,10 @@ def emit_model_call(role: str, model: str, state: dict) -> None:
             tail.append(m)
         else:
             break
+    tail.reverse()  # call order, so the names read as the model sees them
     event: dict[str, Any] = {"type": "status", "state": "model_call", "role": role,
                              "model": model, "step": step, "unit": unit}
     if tail:
-        tail.reverse()
         names = Counter(getattr(m, "name", None) or "tool" for m in tail)
         event["after"] = ", ".join(f"{n} ×{c}" if c > 1 else n for n, c in names.items())
         event["after_chars"] = sum(len(raw_text(m.content)) for m in tail)

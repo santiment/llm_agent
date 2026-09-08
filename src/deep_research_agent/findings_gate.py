@@ -35,7 +35,7 @@ from langchain.agents.middleware import AgentMiddleware, hook_config
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from .events import emit
-from .report_hygiene import series_runs
+from .report_hygiene import MAX_QUOTED_POINTS, dated_points, series_runs
 from .turn import FINDINGS_NUDGE_NAME, count_nudges, text_of
 
 log = logging.getLogger("deep_research_agent.findings_gate")
@@ -149,17 +149,43 @@ def _problems(obj: dict | None) -> list[str]:
                     "source is the LABEL of the data source the file came from (as listed under "
                     "DATA SOURCES, or the label in your task) or a URL; never a path, tool, "
                     "recipe or file name")
-            if series_runs(str(f.get("evidence") or "")):
-                problems.append(
-                    f'findings[{i}] "evidence" transcribes a raw time series — summarize it '
-                    "(first/last value, peak/trough with when, average, direction) instead of "
-                    "listing buckets")
-    if isinstance(summary, str) and series_runs(summary):
-        problems.append('"summary" transcribes a raw time series — summarize it, never list buckets')
+            problems.extend(_data_dump_problems(f"findings[{i}]", f))
+    if isinstance(summary, str):
+        problems.extend(_data_dump_problems("", {"summary": summary}))
     gaps = obj.get("gaps")
     if gaps is not None and not isinstance(gaps, list):
         problems.append('"gaps", when present, must be a list')
     return problems
+
+
+# One field of a findings object may hold this much before it stops being a distilled
+# claim. The MVRV case that motivated the check was ~2,000 characters of `date,value` pairs
+# in a single "finding"; a real claim with its numbers fits comfortably under this.
+MAX_FIELD_CHARS = 1_200
+
+
+def _data_dump_problems(where: str, obj: dict) -> list[str]:
+    """Findings carry CONCLUSIONS, not the data behind them. Flags any string field that
+    transcribes a time series (line runs or inline `date,value` points) or is simply too
+    long to be a distilled claim. Runs over EVERY string field, not just "evidence": the
+    series that reached a user's screen sat in "finding"."""
+    out: list[str] = []
+    for key, value in obj.items():
+        if key == "source" or not isinstance(value, str) or not value.strip():
+            continue
+        label = f'{where} "{key}"'.strip()
+        points = dated_points(value)
+        if series_runs(value) or points > MAX_QUOTED_POINTS:
+            out.append(
+                f"{label} transcribes a time series ({points} dated points) — findings carry "
+                "the CONCLUSION, not the data: give first/last value, peak/trough with when, "
+                "average and direction, or name the /workspace file that holds the rows")
+        elif len(value) > MAX_FIELD_CHARS:
+            out.append(
+                f"{label} is {len(value):,} characters — that is a data dump, not a finding. "
+                "Distill it to the claim plus the few figures that prove it (top-N with "
+                "counts and denominators); large material stays in its /workspace file")
+    return out
 
 
 def _unit_label(messages: list) -> str:
