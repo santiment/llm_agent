@@ -27,10 +27,20 @@ def build_chat_model(model_id: str, cfg: ResearchConfig) -> ChatOpenAI:
         log.warning("Streaming force-disabled for %r — off-spec streaming corrupts tool_calls "
                     "(merged/doubled chunks); override via DRA_STREAMING_DENYLIST", model_id)
         streaming = False
-    # OpenRouter's unified `reasoning` param — an OpenRouter extension, hence
-    # extra_body. Ignored by models without reasoning support.
+    # No cache pricing → every re-sent prefix is billed in full. Tiers cannot name such a
+    # model (tests), so this fires only for a stale deployment or an unlisted slug.
+    if cfg.is_openrouter and not cfg.caches_prompts(model_id):
+        log.warning("%r has no prompt-cache pricing — re-sent context is billed in full; "
+                    "see config.MODEL_CACHING", model_id)
+
+    # OpenRouter's unified `reasoning` param (extra_body), only for models flagged capable:
+    # a model that rejects it 400s on every provider with no retry and the run dies, while
+    # omitting it merely leaves the provider default.
     extra_body: dict = {}
-    if cfg.reasoning_effort == "none":
+    if cfg.reasoning_effort and not cfg.supports_reasoning(model_id):
+        log.info("reasoning (%s) not sent to %r: not in reasoning_capable — see "
+                 "config.MODEL_REASONING / DRA_REASONING_CAPABLE", cfg.reasoning_effort, model_id)
+    elif cfg.reasoning_effort == "none":
         extra_body["reasoning"] = {"enabled": False}
     elif cfg.reasoning_effort:
         extra_body["reasoning"] = {"effort": cfg.reasoning_effort}

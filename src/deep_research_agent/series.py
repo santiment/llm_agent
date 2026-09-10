@@ -128,8 +128,15 @@ def find_series(result: Any) -> dict[str, list[tuple[datetime, float]]]:
     return out
 
 
-def _iso(dt: datetime) -> str:
-    dt = dt.astimezone(timezone.utc)
+def as_utc(dt: datetime) -> datetime:
+    """``dt`` as an aware UTC datetime; a naive one is taken AS UTC, never as local time
+    (``datetime.timestamp()`` on a naive value would shift it by the machine's offset)."""
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def iso(dt: datetime) -> str:
+    """UTC date, with ``THH:MM`` when the point carries a time."""
+    dt = as_utc(dt)
     return dt.strftime("%Y-%m-%d") if (dt.hour, dt.minute, dt.second) == (0, 0, 0) \
         else dt.strftime("%Y-%m-%dT%H:%M")
 
@@ -157,10 +164,10 @@ def describe(points: list[tuple[datetime, float]]) -> dict[str, Any]:
     head, tail = statistics.fmean(vals[:third]), statistics.fmean(vals[-third:])
     rel = (tail - head) / abs(head) if head else (0.0 if tail == head else (1.0 if tail > head else -1.0))
     d: dict[str, Any] = {
-        "n": n, "start": _iso(t0), "end": _iso(t1), "first": v0, "last": v1,
+        "n": n, "start": iso(t0), "end": iso(t1), "first": v0, "last": v1,
         "change_pct": (v1 - v0) / abs(v0) * 100 if v0 else None,
-        "min": vals[imin], "min_at": _iso(points[imin][0]),
-        "max": vals[imax], "max_at": _iso(points[imax][0]),
+        "min": vals[imin], "min_at": iso(points[imin][0]),
+        "max": vals[imax], "max_at": iso(points[imax][0]),
         "mean": statistics.fmean(vals), "median": statistics.median(vals),
         "direction": "rising" if rel > 0.1 else "falling" if rel < -0.1 else "flat",
     }
@@ -187,8 +194,22 @@ def summary_block(series: dict[str, list[tuple[datetime, float]]]) -> str:
     return "\n".join("  " + describe_text(label, pts) for label, pts in series.items())
 
 
+def downsample(points: list[tuple[datetime, float]], max_points: int) -> list[tuple[datetime, float]]:
+    """At most ``max_points`` points: an even grid (first and last included) plus the min
+    and the max, in order. The input is returned as is when it fits or ``max_points`` < 4."""
+    n = len(points)
+    if max_points < 4 or n <= max_points:
+        return points
+    vals = [v for _, v in points]
+    grid = max_points - 2
+    keep = {round(i * (n - 1) / (grid - 1)) for i in range(grid)}
+    keep |= {min(range(n), key=vals.__getitem__), max(range(n), key=vals.__getitem__)}
+    return [points[i] for i in sorted(keep)]
+
+
 SERIES_RULE = (
     "A time series is NEVER listed row by row — not in the report, not in any message, "
-    "whatever the date format. Quote the summary or compute what you need and report the "
-    "computed numbers."
+    "whatever the date format. That includes a CSV: no `date,value` block, no fenced data "
+    "dump, no 'CSV 1:' section, however it is labeled or wrapped. Quote the summary or "
+    "compute what you need and report the computed numbers."
 )

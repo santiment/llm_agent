@@ -35,7 +35,7 @@ from langchain.agents.middleware import AgentMiddleware, hook_config
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from .events import emit
-from .report_hygiene import MAX_QUOTED_POINTS, dated_points, series_runs
+from .report_hygiene import MAX_QUOTED_POINTS, collapse_data_blocks, dated_points, series_runs
 from .turn import FINDINGS_NUDGE_NAME, count_nudges, text_of
 
 log = logging.getLogger("deep_research_agent.findings_gate")
@@ -173,7 +173,7 @@ def _data_dump_problems(where: str, obj: dict) -> list[str]:
     for key, value in obj.items():
         if key == "source" or not isinstance(value, str) or not value.strip():
             continue
-        label = f'{where} "{key}"'.strip()
+        label = f'{where} "{key}"'.strip() if key else where
         points = dated_points(value)
         if series_runs(value) or points > MAX_QUOTED_POINTS:
             out.append(
@@ -195,6 +195,74 @@ def _unit_label(messages: list) -> str:
         if isinstance(m, HumanMessage) and getattr(m, "name", None) != FINDINGS_NUDGE_NAME:
             return text_of(m.content).strip()[:140]
     return ""
+
+
+def _replace(last: AIMessage, obj: dict) -> dict[str, Any] | None:
+    """State update that swaps the handoff for exactly ``obj`` (same id, so it replaces in
+    place); None when the message already is that object and nothing else."""
+    if _bare_object(text_of(last.content)) == obj:
+        return None
+    content = "```json\n" + json.dumps(obj, ensure_ascii=False, indent=2) + "\n```"
+    return {"messages": [last.model_copy(update={"content": content})]}
+
+
+_FENCE_EDGE = re.compile(r"^```[a-zA-Z]*[ \t]*\n?|\n?```$")
+
+
+def _bare_object(text: str) -> dict | None:
+    """The object when ``text`` is one JSON object and nothing else (a ```json fence
+    allowed); None otherwise."""
+    body = _FENCE_EDGE.sub("", text.strip()).strip()
+    if not (body.startswith("{") and body.endswith("}")):
+        return None
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _outside_object(text: str) -> str:
+    """``text`` with its JSON object(s) blanked — what the parent would read besides the
+    findings. Whole-message minus the spans that parse, so a dump inside a field is
+    reported once, by the field check, and never a second time as 'outside'."""
+    out, depth, start = [], 0, None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                out.append((start, i + 1))
+                start = None
+    keep, pos = [], 0
+    for s, e in out:
+        keep.append(text[pos:s])
+        pos = e
+    keep.append(text[pos:])
+    return " ".join(keep)
+
+
+def _sanitize(obj: dict) -> bool:
+    """Collapse raw rows inside every string field of a findings object, in place.
+    True when anything changed."""
+    changed = False
+
+    def clean(d: dict) -> None:
+        nonlocal changed
+        for key, value in d.items():
+            if key != "source" and isinstance(value, str):
+                out = collapse_data_blocks(value)
+                if out != value:
+                    d[key], changed = out.strip(), True
+
+    clean(obj)
+    for item in obj.get("findings") or []:
+        if isinstance(item, dict):
+            clean(item)
+    return changed
 
 
 def _emit_findings_event(messages: list, obj: dict) -> None:
@@ -231,6 +299,12 @@ class SubagentFindingsMiddleware(AgentMiddleware):
 
         obj = extract_findings(content)
         problems = _problems(obj)
+        # The parent gets the WHOLE message, not the parsed object — a series pasted after
+        # the closing brace reached an orchestrator that way. Text outside the object is
+        # held to the same standard as a field.
+        if obj is not None:
+            problems.extend(_data_dump_problems("text outside the JSON object",
+                                                {"": _outside_object(content)}))
         # Provenance: a weak model returning plausible findings WITHOUT having called
         # a single tool is fabricating from memory. (Empty findings with no tools is a
         # legitimate honest "nothing".)
@@ -241,13 +315,21 @@ class SubagentFindingsMiddleware(AgentMiddleware):
                 "findings were returned without a single tool call this run — gather data "
                 "with the tools first; findings must come from tool results, not memory")
         if not problems:
-            # Accepted, valid findings — surface them as a structured event so the UI can
-            # render a folded findings table instead of the raw JSON that streams as
-            # thinking. Best-effort (no-op offline); never blocks the handoff.
+            # Accepted. Surface the findings as a structured event for the UI, and hand the
+            # parent the bare object: prose around it is never part of the contract.
             _emit_findings_event(messages, obj)
-            return None
+            return _replace(last, obj)
 
         if count_nudges(messages, FINDINGS_NUDGE_NAME) >= MAX_FINDINGS_NUDGES:
+            # Out of nudges. Prose problems degrade gracefully; a data dump does not — it
+            # is the parent's next paste. Strip rows from the fields, drop everything outside
+            # the object, and hand over the rest.
+            if obj is not None:
+                _sanitize(obj)
+                log.warning("FINDINGS GATE: nudges exhausted — accepting the sanitized object "
+                            "only: %s", problems)
+                _emit_findings_event(messages, obj)
+                return _replace(last, obj)
             log.warning(
                 "FINDINGS GATE: accepting non-conforming sub-agent output after %d nudge(s) "
                 "(prose degrades gracefully): %s", MAX_FINDINGS_NUDGES, problems)

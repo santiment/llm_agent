@@ -17,7 +17,9 @@ in ``EVENT_SCHEMAS`` order:
   - ``tool_call`` /
     ``tool_result``    -> tool call rows
   - ``skill``          -> a skill being applied ("Skill: data-provider")
-  - ``report``         -> final markdown answer (also persisted in state)
+  - ``report``         -> final markdown answer (also persisted in state). A line that is
+                          exactly ``[chart:<id>]`` places the ``chart`` event with that id
+                          there — that is how data reaches the report; rows never do
   - ``status``         -> lifecycle: mcp_ready | mcp_error | budget_soft | budget_halt |
                           revising | compacting | compacted | loop_detected | loop_halt |
                           subagent_start | subagent_done (``role`` + ``model`` of the
@@ -28,6 +30,13 @@ in ``EVENT_SCHEMAS`` order:
   - ``usage``          -> end-of-run tool-call / token counters against their limits,
                           plus run time (``elapsed_s``, ``elapsed``, ``started_at``, ``finished_at``)
   - ``subagent_findings`` -> one research unit's summary, findings and gaps
+  - ``chart``          -> a data artifact: the time series a tool returned, downsampled.
+                          ``series`` entries are render-ready for the Santiment chart widget
+                          (``{id, name, label, style: "line", pane, data: [{time, value}, …]}``,
+                          ``time`` in unix seconds) plus ``n``, ``truncated``, ``summary`` and,
+                          up to MAX_CSV_POINTS, ``csv`` (full resolution, for a download
+                          control); ``source`` is the friendly data-source label or "". Emitted
+                          straight from the tool result; the model learns only the ``id``
   - ``script``         -> code an agent RAN, as CODE (``language`` + basename ``name``):
                           render it as a COLLAPSED "view script" tab. A file script comes
                           at the worker's handoff; code run inline through ``execute`` comes
@@ -63,7 +72,8 @@ from urllib.parse import urlparse
 
 from langchain_core.tools import BaseTool, StructuredTool
 
-from .series import MAX_SCAN_BYTES, SERIES_RULE, find_series, summary_block
+from .series import (MAX_SCAN_BYTES, SERIES_RULE, as_utc, describe, downsample, find_series, iso,
+                     summary_block)
 
 log = logging.getLogger("deep_research_agent.events")
 
@@ -104,6 +114,7 @@ EVENT_SCHEMAS: dict[str, frozenset[str]] = {
                         "total_tokens", "limits", "elapsed_s"}),
     "subagent_findings": frozenset({"unit", "summary", "findings", "gaps"}),
     "script": frozenset({"id", "agent", "name", "language", "code"}),
+    "chart": frozenset({"id", "label", "source", "kind", "series"}),
 }
 
 # Every ``state`` a status event may carry; ``_check_shape`` warns on an unregistered one.
@@ -338,6 +349,75 @@ def cap_result(result: Any, *, max_chars: int = 0, max_rows: int = 0) -> tuple[A
     return result, None
 
 
+# ---- data artifacts -------------------------------------------------------------------
+# Bounds for the `chart` event: points per series (thinned by series.downsample, extremes
+# kept) and series per result.
+MAX_CHART_POINTS = 500
+MAX_CHART_SERIES = 8
+MAX_CSV_POINTS = 2_000   # above this the event carries no `csv`; the chart still renders
+
+# What the model is told about a chart, appended to the tool result the rows left.
+CHART_NOTE = (
+    "chart: {id} — this series is already displayed to the user as a chart. To put it in "
+    "the report or a finding, write [chart:{id}] on its own line where the data belongs. "
+    "Never transcribe the points."
+)
+
+
+def emit_chart(series: dict, *, source_label: str = "", metric: str = "") -> str:
+    """One ``chart`` event for the series found in a tool result — the same detection that
+    takes the rows out of the model's context. Returns the event id ("" when nothing was
+    emitted): the ONE thing about the chart a model gets to see, so it can place the chart
+    in the report instead of the rows. ``source_label`` is the deployment's friendly source
+    name (MCP ``label``), never a tool name; ``metric`` names the measure when known."""
+    if not series:
+        return ""
+    labels = list(series)[:MAX_CHART_SERIES]
+    payload = []
+    for i, label in enumerate(labels):
+        points = series[label]
+        shown = downsample(points, MAX_CHART_POINTS)
+        name = " — ".join(part for part in (metric, label) if part) or "series"
+        entry = {
+            "id": f"s{i}",
+            "name": name,
+            "label": name,
+            "style": "line",
+            "pane": 0,
+            "data": [{"time": int(as_utc(t).timestamp()), "value": v} for t, v in shown],
+            "n": len(points),
+            "truncated": len(shown) < len(points),
+            "summary": describe(points),   # over all points, not the thinned ones
+        }
+        if len(points) <= MAX_CSV_POINTS:
+            entry["csv"] = "time,value\n" + "\n".join(f"{iso(t)},{v}" for t, v in points) + "\n"
+        payload.append(entry)
+    chart_id = new_id()
+    emit({
+        "type": "chart",
+        "id": chart_id,
+        "label": ", ".join(entry["name"] for entry in payload)[:120],
+        "source": source_label,
+        "kind": "series",
+        "series": payload,
+        "series_omitted": max(0, len(series) - len(labels)),
+    })
+    return chart_id
+
+
+def _metric_of(result: Any) -> str:
+    """The ``metric`` a tool result names (Santiment-style ``{"metric": "price_usd", …}``),
+    else "" — the chart title without it is just the slug."""
+    obj = result
+    if isinstance(obj, str) and obj.lstrip().startswith("{") and len(obj) <= MAX_SCAN_BYTES:
+        try:
+            obj = json.loads(obj)
+        except ValueError:
+            return ""
+    metric = obj.get("metric") if isinstance(obj, dict) else None
+    return metric if isinstance(metric, str) else ""
+
+
 def _offload_result(
     result: Any,
     *,
@@ -347,7 +427,7 @@ def _offload_result(
     call_id: str,
     head_rows: int = 5,
     series: dict | None = None,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, dict]:
     """Persist a large tool result to a file in the sandbox and return a compact stub
     the model can act on, INSTEAD of truncating and discarding rows.
 
@@ -358,9 +438,9 @@ def _offload_result(
     The full result lands at ``{offload_dir}/{tool}-{call_id}.json`` inside the
     container's persistent /workspace; the stub carries the path, row count, column
     list and a small head, plus an instruction to process the file with ``execute``.
-    Returns ``(stub, note)`` on success, or ``(None, None)`` if anything went wrong —
-    the caller then falls back to ``cap_result`` so a flaky sandbox never loses data
-    silently or breaks the run.
+    Returns ``(stub, note, series)`` — ``series`` the one this resolved, for the caller's
+    ``chart`` event — or ``(None, None, {})`` if anything went wrong; the caller then falls
+    back to ``cap_result`` so a flaky sandbox never loses data silently or breaks the run.
 
     BLOCKING on purpose: ``sink.upload_files`` is a sync HTTP call and ``json.dumps``
     of a multi-MB result is CPU-bound. The caller runs this whole function through
@@ -384,10 +464,10 @@ def _offload_result(
         resp = sink.upload_files([(path, payload.encode("utf-8"))])
         if resp and getattr(resp[0], "error", None):
             log.warning("offload upload failed (%s): %s", tool_name, resp[0].error)
-            return None, None
+            return None, None, {}
     except Exception as exc:  # never lose data silently / break the run on offload failure
         log.warning("offload failed (%s): %s", tool_name, exc)
-        return None, None
+        return None, None, {}
 
     if series is None:
         series = find_series(result) if len(payload) <= MAX_SCAN_BYTES else {}
@@ -406,7 +486,7 @@ def _offload_result(
             "{datetime, value}). Report the computed numbers only — never print the points. "
             "Do NOT re-call this tool to page the same rows."
         )
-        return stub, note
+        return stub, note, series
 
     n = len(rows) if isinstance(rows, list) else None
     columns = ""
@@ -430,7 +510,7 @@ def _offload_result(
         "numeric computation and structure checks only. Do NOT re-call this tool to "
         "page the same rows."
     )
-    return stub, note
+    return stub, note, series
 
 
 def unwrap_tool_result(result: Any) -> Any:
@@ -475,12 +555,16 @@ def instrument_tool(
     meter: Any = None,
     offload_sink: Any = None,
     offload_dir: str = "/workspace/data",
+    source_label: str = "",
 ) -> BaseTool:
     """Wrap any tool so each invocation emits ``{kind}_call`` / ``{kind}_result``.
 
     Preserves the original name / description / args schema so the model is
     unaware of the wrapper. Used for MCP tools; the web-search tool emits its
     own richer events instead.
+
+    ``source_label``: the deployment's friendly data-source name (MCP ``label``) for the
+    ``chart`` event; never a tool name.
 
     ``semaphore`` bounds how many wrapped tools may run *at once* — a shared one
     acts as a fixed-size queue across the orchestrator and all parallel
@@ -565,6 +649,7 @@ def instrument_tool(
             # series detection and offload act on the DATA, not the wrapper (see
             # unwrap_tool_result). Without this a metric series slips into context.
             result = unwrap_tool_result(result)
+            metric = _metric_of(result)   # for the chart title; the stub below has no metric
             # Observability + source-level cap: record the RAW size (before capping) so the
             # run log shows what the tool actually returned, then bound it for the context.
             raw_rows = len(result) if isinstance(result, (list, tuple)) else None
@@ -587,7 +672,7 @@ def instrument_tool(
                 # to_thread: the offload serializes megabytes and uploads them over a
                 # SYNC HTTP client. Called inline it would freeze the event loop — and
                 # with it every other tool call in flight — for the whole upload.
-                stub, note = await asyncio.to_thread(
+                stub, note, offloaded_series = await asyncio.to_thread(
                     _offload_result,
                     result, sink=offload_sink, offload_dir=offload_dir,
                     tool_name=tool.name, call_id=call_id, series=series or None)
@@ -595,11 +680,18 @@ def instrument_tool(
                     result, capped = stub, note
                     log.info("RESULT OFFLOADED (%s): %s [raw: %d bytes, rows=%s]",
                              tool.name, note, raw_bytes, raw_rows)
+                    series = offloaded_series or series   # for the chart event below
+            # One chart per tool result, offloaded or inline; no-op without series. The
+            # model is told the id so the report can place the chart instead of the rows.
+            chart_id = emit_chart(series, source_label=source_label, metric=metric)
+            note = CHART_NOTE.format(id=chart_id) if chart_id else ""
+            if capped is not None and note:
+                result = f"{result}\n{note}"
             elif series:
                 # No sandbox: the rows stay (as text), but the summary and the rule lead.
                 text = result if isinstance(result, str) else json.dumps(result, default=str)
-                result = (f"[Time series. {SERIES_RULE}]\nsummary:\n{summary_block(series)}"
-                          f"\n\n{text}")
+                result = (f"[Time series. {SERIES_RULE}]\nsummary:\n{summary_block(series)}\n"
+                          f"{note}\n\n{text}")
             if capped is None:
                 # No sandbox (or offload failed) → fall back to the truncation caps.
                 result, capped = cap_result(

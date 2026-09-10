@@ -18,11 +18,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
+import urllib.error
 import urllib.request
 
 from langchain_core.tools import StructuredTool
+
+log = logging.getLogger("deep_research_agent.custom_tools")
 
 _TIMEOUT = 60
 _SLUG_RE = re.compile(r"^[a-z0-9-]+$")
@@ -80,10 +84,14 @@ def build_tools(cfg) -> list:
             max_words: max total words across the sampled message texts (default 100k; the
                 server clamps to its own ceiling). Bigger = more raw posts, more cost/latency.
         """
-        body: dict = {"max_words": int(max_words)}
         asset = (asset or "").strip()
-        by_slug = bool(asset) and _SLUG_RE.match(asset) is not None
-        body["slug" if by_slug else "search_text"] = asset
+        if not asset:
+            return ("social_messages: `asset` is required — a project slug (e.g. 'bitcoin') or a "
+                    "search word. Nothing was fetched.")
+        body: dict = {"max_words": int(max_words)}
+        # Slugs are lowercase; a model that writes 'Bitcoin' means the slug, not a text search.
+        by_slug = _SLUG_RE.match(asset.lower()) is not None
+        body["slug" if by_slug else "search_text"] = asset.lower() if by_slug else asset
         # The model often emits Santiment-style date math (`utc_now-24h`); ES wants
         # `now-24h`. Normalize so either form (and ISO) works.
         if from_timestamp:
@@ -101,13 +109,23 @@ def build_tools(cfg) -> list:
         data = await _call(url, body)
         if isinstance(data, str):
             return data
+        if not isinstance(data.get("stats"), dict):
+            # Without a stats block there is no population count, so "no crowd data" would
+            # be a guess — say the response was malformed instead.
+            return f"social_messages: response carries no stats block: {str(data)[:300]}"
         # A slug's curated query can match nothing while the name itself is discussed;
         # fall back to a free-text search before declaring the crowd silent.
         if by_slug and _total(data) == 0:
             text_body = {k: v for k, v in body.items() if k != "slug"}
             text_body["search_text"] = asset
             text_data = await _call(url, text_body)
-            if isinstance(text_data, dict) and _total(text_data) > 0:
+            if isinstance(text_data, str):
+                # The slug matched nothing and the retry never answered, so whether the
+                # crowd is silent is unknown — _NO_DATA_NOTE would assert it as fact.
+                return (f"social_messages: slug {asset!r} matched no messages and the free-text "
+                        f"retry failed, so it is UNKNOWN whether crowd data exists for it. Do "
+                        f"not report 'no crowd data'. {text_data}")
+            if _total(text_data) > 0:
                 data = text_data
                 data.setdefault("stats", {})["query_mode"] = "search_text"
                 data["stats"]["note"] = (
@@ -135,6 +153,7 @@ async def _call(url: str, body: dict) -> dict | str:
     try:
         payload = await asyncio.to_thread(_post_json, url, body)
     except Exception as exc:
+        log.warning("social_messages request failed: %s", exc)
         return f"social_messages request failed: {exc}"
     if not isinstance(payload, dict):
         return f"social_messages: unexpected response: {str(payload)[:300]}"
@@ -153,5 +172,40 @@ def _post_json(url: str, body: dict) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:  # noqa: S310 (trusted internal URL)
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:  # noqa: S310 (trusted internal URL)
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        # urlopen raises on 4xx/5xx and the exception IS the response: metrics-hub puts the
+        # real cause in its body, so unread it leaves only "HTTP Error 500: INTERNAL SERVER
+        # ERROR". HTTPError subclasses URLError — this clause must stay first.
+        raise RuntimeError(f"metrics-hub {url} -> HTTP {exc.code}: {_error_detail(exc)}") from exc
+    except urllib.error.URLError as exc:
+        # No response at all: DNS, refused, TLS, connect timeout (VPN down). str(exc) omits
+        # the host, and the host is the question when the tool is misconfigured.
+        raise RuntimeError(f"metrics-hub unreachable at {url}: {exc.reason}") from exc
+    except TimeoutError as exc:
+        # Timeout while reading the body arrives bare, not wrapped in URLError.
+        raise RuntimeError(f"metrics-hub timed out after {_TIMEOUT}s at {url}") from exc
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        # A proxy or a wrong port answers 200 with HTML; show what actually came back.
+        raise RuntimeError(f"metrics-hub {url} -> non-JSON response: {raw[:300]!r}") from exc
+
+
+def _error_detail(exc: urllib.error.HTTPError) -> str:
+    """Human-sized cause from an error body: metrics-hub's ``error`` field when it sends
+    JSON ({error, trace} — the trace is skipped, it belongs in metrics-hub's own logs and
+    would only burn model context), else the raw body, else the status reason."""
+    try:
+        raw = exc.read().decode("utf-8", "replace").strip()
+    except OSError:
+        return str(exc.reason or "")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw[:300] or str(exc.reason or "")
+    if isinstance(payload, dict) and (payload.get("error") or payload.get("message")):
+        return str(payload.get("error") or payload.get("message"))[:300]
+    return raw[:300] or str(exc.reason or "")

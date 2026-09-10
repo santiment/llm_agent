@@ -12,7 +12,7 @@ import logging
 from langchain_core.tools import StructuredTool
 
 from ..events import emit
-from ..report_hygiene import collapse_series, scrub_report
+from ..report_hygiene import chart_refs, collapse_data_blocks, scrub_report
 
 log = logging.getLogger("deep_research_agent.report")
 
@@ -31,10 +31,10 @@ def build_submit_report_tool(tool_names=()) -> StructuredTool:
         # Last-mile guard: strip any data-layer machinery (tool names / call syntax) that
         # leaked past the prompt rules, so the user never sees tool names in the report.
         md = scrub_report(md, tool_names)
-        # Raw series the quality gate could not get rewritten are dropped on the live emit too.
-        collapsed = collapse_series(md)
+        # Raw series / CSV blocks the quality gate could not get rewritten are dropped here too.
+        collapsed = collapse_data_blocks(md)
         if collapsed != md:
-            log.warning("REPORT: raw time series collapsed on delivery (%d -> %d chars)",
+            log.warning("REPORT: raw data block collapsed on delivery (%d -> %d chars)",
                         len(md), len(collapsed))
             md = collapsed
         # Backstop against a raw-row dump: hard-truncate past a generous ceiling so a
@@ -47,6 +47,8 @@ def build_submit_report_tool(tool_names=()) -> StructuredTool:
                 "\n\n> _[Report truncated — exceeded the length cap. Summarize and aggregate "
                 "findings (totals, counts, top-N); do not transcribe raw rows.]_\n"
             )
+        if refs := chart_refs(md):
+            log.info("REPORT: places %d chart artifact(s): %s", len(refs), ", ".join(refs))
         emit({"type": "report", "markdown": md})
         return (
             "Report delivered to the user. You are DONE — end your turn now. Do not "

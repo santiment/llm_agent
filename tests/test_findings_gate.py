@@ -244,3 +244,80 @@ def test_source_that_names_a_file_path_or_recipe_call_is_bounced() -> None:
     assert len(probs) == 3, probs
     assert all("names a file, path or function" in p for p in probs)
     assert "findings[0]" in probs[0] and "findings[1]" in probs[1] and "findings[2]" in probs[2]
+
+
+def test_exhausted_nudge_with_a_pasted_table_is_sanitized_not_accepted() -> None:
+    # The route a 31-row markdown table took to the orchestrator: bounced once, then
+    # accepted verbatim. Now the rows are collapsed and the rest of the handoff is kept.
+    import json
+
+    table = "| date | price_usd |\n|---|---|\n" + "\n".join(
+        f"| 2026-08-{d:02d} | {63000 + d * 137.5} |" for d in range(10, 22))
+    obj = {"summary": "Full contents of the file:\n" + table,
+           "findings": [{"finding": "The file has 12 rows.", "evidence": table,
+                         "source": "Santiment"}], "gaps": []}
+    bad = AIMessage("```json\n" + json.dumps(obj) + "\n```")
+    nudge = HumanMessage("fix", name=FINDINGS_NUDGE_NAME)
+    work = [HumanMessage("unit: BTC"), ToolMessage("rows", tool_call_id="1")]
+
+    mw = SubagentFindingsMiddleware()
+    with capture_events_cm() as captured:
+        update = mw.after_model(make_state(*work, nudge, bad), None)
+    assert update and "jump_to" not in update                  # accepted, but rewritten
+    cleaned = update["messages"][0]
+    assert cleaned.id == bad.id                                # same id: replaces in state
+    text = cleaned.content
+    assert "2026-08-15" not in text and "Raw series of 12 timestamped rows" in text
+    assert "The file has 12 rows." in text and '"source": "Santiment"' in text
+    ev = next(e for e in captured if e["type"] == "subagent_findings")
+    assert "2026-08-15" not in json.dumps(ev)                  # the UI card is clean too
+
+
+def test_rows_pasted_outside_the_json_object_are_caught() -> None:
+    # The parent receives the WHOLE message. A run shipped 31 rows to the orchestrator as
+    # text AFTER a clean JSON object — the object passed, the message did not get checked.
+    rows = "\n".join(f"2026-08-{d:02d}, {63000 + d * 137.5}" for d in range(10, 22))
+    msg = AIMessage("All points retrieved.\n\n" + VALID + "\n\nFULL DAILY SERIES:\n" + rows)
+    work = [HumanMessage("unit: BTC"), ToolMessage("rows", tool_call_id="1")]
+    mw = SubagentFindingsMiddleware()
+
+    update = mw.after_model(make_state(*work, msg), None)
+    assert update and update.get("jump_to") == "model"
+    assert "text outside the JSON object" in update["messages"][0].content
+
+    # Nudge spent: the handoff is normalized to the bare object — the trailing rows are gone.
+    nudge = HumanMessage("fix", name=FINDINGS_NUDGE_NAME)
+    again = mw.after_model(make_state(*work, nudge, msg), None)
+    assert again and "jump_to" not in again
+    text = again["messages"][0].content
+    assert "2026-08-15" not in text and "FULL DAILY SERIES" not in text
+    assert "Active addresses up 12% w/w" in text
+
+
+def test_prose_around_a_clean_object_is_trimmed_on_accept() -> None:
+    # Harmless preamble is not a bounce, but the parent still gets only the object.
+    work = [HumanMessage("unit: BTC"), ToolMessage("rows", tool_call_id="1")]
+    update = SubagentFindingsMiddleware().after_model(
+        make_state(*work, AIMessage("Here are my findings:\n\n" + VALID)), None)
+    assert update and "jump_to" not in update
+    assert update["messages"][0].content.startswith("```json\n{")
+    assert "Here are my findings" not in update["messages"][0].content
+
+
+def test_a_dump_inside_a_field_is_reported_once_not_also_as_outside_text() -> None:
+    import json
+
+    rows = "\n".join(f"2026-08-{d:02d}, {63000 + d}" for d in range(10, 22))
+    obj = {"summary": "ok", "findings": [{"finding": "x", "evidence": rows, "source": "S"}]}
+    work = [HumanMessage("u"), ToolMessage("r", tool_call_id="1")]
+    update = SubagentFindingsMiddleware().after_model(
+        make_state(*work, AIMessage("```json\n" + json.dumps(obj) + "\n```")), None)
+    text = update["messages"][0].content
+    assert text.count("transcribes a time series") == 1
+    assert "outside the JSON object" not in text
+
+
+def test_a_fence_without_a_newline_still_counts_as_the_bare_object() -> None:
+    work = [HumanMessage("u"), ToolMessage("r", tool_call_id="1")]
+    assert SubagentFindingsMiddleware().after_model(
+        make_state(*work, AIMessage("```json" + VALID + "```")), None) is None

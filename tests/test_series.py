@@ -78,3 +78,44 @@ def test_describe_direction_and_formatting():
     assert "first 79,038" in describe_text("", flat)              # thousands, no label prefix
     assert describe(find_series(santiment())["bitcoin"])["direction"] == "flat"      # -2.7% is noise
     assert describe(find_series(santiment(step=-3000.0))["bitcoin"])["direction"] == "falling"
+
+
+# ---- downsample: what a chart may drop -------------------------------------------------
+
+def test_downsample_keeps_the_shape_a_reader_would_check():
+    from datetime import datetime, timedelta, timezone
+
+    from deep_research_agent.series import downsample
+
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    vals = [float(i % 50) for i in range(1000)]
+    vals[137], vals[642] = -999.0, 9999.0            # the trough and the peak
+    pts = [(t0 + timedelta(hours=i), v) for i, v in enumerate(vals)]
+
+    out = downsample(pts, 100)
+    assert len(out) <= 100
+    assert out[0] == pts[0] and out[-1] == pts[-1]    # ends anchor the line
+    assert pts[137] in out and pts[642] in out        # min and max always survive
+    assert out == sorted(out, key=lambda p: p[0])     # chronological: a stride never reorders
+
+
+def test_downsample_is_a_noop_when_the_series_already_fits():
+    from datetime import datetime, timedelta, timezone
+
+    from deep_research_agent.series import downsample
+
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    pts = [(t0 + timedelta(days=i), float(i)) for i in range(90)]
+    assert downsample(pts, 500) is pts
+    assert downsample(pts, 90) is pts
+    assert len(downsample(pts, 89)) <= 89
+
+
+def test_naive_datetimes_are_read_as_utc_not_local_time():
+    from datetime import datetime, timezone
+
+    from deep_research_agent.series import as_utc, iso
+
+    naive, aware = datetime(2026, 1, 1, 12, 0), datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    assert as_utc(naive) == aware and as_utc(naive).timestamp() == 1767268800
+    assert iso(naive) == iso(aware) == "2026-01-01T12:00"

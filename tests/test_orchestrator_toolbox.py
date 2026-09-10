@@ -7,6 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from deep_research_agent.agent import describe_skills
+from deep_research_agent.execute_guard import ExecuteResultGuardMiddleware
 from deep_research_agent.skill_usage import SkillUsageMiddleware
 from deep_research_agent.tool_filter import ORCHESTRATOR_EXCLUDED_TOOLS, ExcludeToolsMiddleware
 from deep_research_agent.triage import TriageRouterMiddleware
@@ -33,6 +34,11 @@ def test_orchestrator_hides_file_tools_but_keeps_execute(monkeypatch):
     assert {"ls", "read_file", "write_file", "edit_file", "glob", "grep"} == set(ORCHESTRATOR_EXCLUDED_TOOLS)
     assert "execute" not in ORCHESTRATOR_EXCLUDED_TOOLS and "task" not in ORCHESTRATOR_EXCLUDED_TOOLS
     assert isinstance(captured["middleware"][-1], ExcludeToolsMiddleware)
+    # Its `execute` results are scrubbed of raw rows before they reach its context — the
+    # one remaining route for a data dump once the file tools are refused.
+    guards = [m for m in captured["middleware"] if isinstance(m, ExecuteResultGuardMiddleware)]
+    assert len(guards) == 1 and guards[0].role == "orchestrator"
+    assert captured["middleware"].index(guards[0]) < captured["middleware"].index(filters[0])
 
 
 def test_skills_live_with_the_research_subagent_only(monkeypatch):
