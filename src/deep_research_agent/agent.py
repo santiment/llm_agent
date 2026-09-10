@@ -38,6 +38,7 @@ from .tool_filter import (CODING_EXCLUDED_TOOLS, EXTRACT_EXCLUDED_TOOLS,
                           ORCHESTRATOR_EXCLUDED_TOOLS, ExcludeToolsMiddleware)
 from .triage import TriageRouterMiddleware
 from .events import instrument_tool, result_handling
+from .execute_guard import ExecuteResultGuardMiddleware
 from .tools.clarify import build_clarify_tool
 from .tools.custom import load_custom_tools
 from .tools.fetch import build_fetch_tool
@@ -423,9 +424,11 @@ async def make_graph(config: dict | None = None):
             recursion_limit=cfg.recursion_limit,
             model=cfg.research_model,
         ),
-        # The orchestrator never touches files: no ls/read/write/edit/glob/grep in its
-        # toolbox (nor their descriptions and schemas on every step). `execute` stays for
-        # the odd one-line aggregate; `task` is how files get read or written.
+        # `execute` stays for one-line arithmetic, so its result is the one route left for
+        # raw rows into this context: collapse them as the report does.
+        ExecuteResultGuardMiddleware("orchestrator"),
+        # No file tools for the orchestrator (nor their schemas on every step); a hidden tool
+        # it calls by name is refused, not run. `task` is how files get read or written.
         ExcludeToolsMiddleware(ORCHESTRATOR_EXCLUDED_TOOLS),
     ]
     if sandbox is not None:
