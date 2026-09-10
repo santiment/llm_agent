@@ -101,14 +101,15 @@ refused; `0.0.0.0` is rewritten to loopback).
 
 Models are **not** individually settable per run or per env var. You pick a **named package** via
 `model_tier` / `DRA_MODEL_TIER`; the models behind each name live in code (`MODEL_TIERS`), in one
-reviewed place. Every tier defines three roles:
+reviewed place. Every tier fills five slots — research, subagent, utility, compaction, coding; the
+three that shape a run:
 
-| Tier        | research (orchestrator) | subagent (workers)    | utility (extract)  | Use for |
-|-------------|-------------------------|-----------------------|--------------------|---------|
-| `extra-low` | mimo-v2.5               | deepseek-v4-flash     | qwen3-30b          | demos, smoke tests, high-volume low-stakes |
-| `low`       | deepseek-v4-pro         | deepseek-v4-flash     | deepseek-v4-flash  | cheapest sane agent |
-| `mid`       | gemini-3.6-flash        | mimo-v2.5             | deepseek-v4-flash  | the value sweet spot |
-| `high`      | claude-sonnet-5         | kimi-k2.6             | gemini-3.5-flash-lite | best quality per dollar |
+| Tier        | research (orchestrator) | subagent (workers)      | utility (extract)       | Use for |
+|-------------|-------------------------|-------------------------|-------------------------|---------|
+| `extra-low` | deepseek-v4-flash-0731  | deepseek-v4-flash-0731  | deepseek-v4-flash-0731  | demos, smoke tests, high-volume low-stakes |
+| `low`       | qwen3.8-27b             | deepseek-v4-flash-0731  | deepseek-v4-flash-0731  | cheapest sane agent |
+| `mid`       | gemini-3.7-flash        | deepseek-v4-flash-0731  | gemini-3.5-flash-lite   | the value sweet spot |
+| `high`      | gpt-5.6-sol             | gemini-3.7-flash        | gemini-3.5-flash-lite   | best quality per dollar |
 
 The default is `extra-low` so a bare checkout can't silently burn money — production callers opt
 **up** explicitly. The core idea of **model tiering**: a strong orchestrator *plans and
