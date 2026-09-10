@@ -286,3 +286,14 @@ if __name__ == "__main__":
     test_a_failing_call_still_shows_what_ran()
     test_output_is_capped_to_a_head()
     print("OK — scripts ship as artifacts, not paths.")
+
+
+def test_output_kind_marks_a_printed_data_dump() -> None:
+    csv = "date,price_usd\n" + "\n".join(f"2026-08-{d:02d},{63000 + d}" for d in range(10, 22))
+    mw = ExecuteArtifactsMiddleware("extract-subagent")
+    with capture_events_cm() as captured:
+        _run_exec(mw, _exec_req("python3 -c 'print(open(\"x.csv\").read())'"), csv)
+    assert captured[0]["output_kind"] == "data"                # a UI collapses this by default
+    with capture_events_cm() as captured:
+        _run_exec(mw, _exec_req(_LIVE_COMMAND), _LIVE_OUTPUT)
+    assert captured[0]["output_kind"] == "text"

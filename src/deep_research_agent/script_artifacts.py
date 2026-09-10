@@ -45,6 +45,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage
 
 from .events import emit, new_id
+from .report_hygiene import delimited_runs, series_runs
 from .turn import current_turn, text_of, tool_call_of, tool_calls_of
 
 log = logging.getLogger("deep_research_agent.script_artifacts")
@@ -209,10 +210,13 @@ def _output_of(result: Any) -> str:
 def _emit_inline(agent: str, language: str, code: str, output: str) -> None:
     body = code[:MAX_CODE_CHARS]
     printed = (output or "")[:MAX_OUTPUT_CHARS]
+    # `output_kind` lets a UI collapse a printed data dump by default and show prose open.
+    kind = "data" if series_runs(printed) or delimited_runs(printed) else "text"
     emit({"type": "script", "id": new_id(), "agent": agent,
           "name": _TAB_NAMES.get(language, "inline.txt"), "language": language,
           "code": body, "truncated": len(body) < len(code),
-          "output": printed, "output_truncated": len(printed) < len(output or "")})
+          "output": printed, "output_truncated": len(printed) < len(output or ""),
+          "output_kind": kind})
 
 
 class ExecuteArtifactsMiddleware(AgentMiddleware):

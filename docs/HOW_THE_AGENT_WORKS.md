@@ -228,9 +228,16 @@ A few important behaviors:
   single shared semaphore (`mcp_max_concurrency`, default 10) bounds simultaneous MCP calls across
   the orchestrator *and* all parallel sub-agents. Rate-limit (429) responses trigger bounded backoff
   rather than failure.
-- **No chart event (yet).** A chart-shaped MCP result (e.g. the connector's `show_chart`) streams
-  as an ordinary `tool_result` like any other; there is no structural detection and no `chart`
-  event in `EVENT_SCHEMAS`. A frontend that wants to draw one reads the tool result itself.
+- **Series ship as `chart` artifacts.** When `find_series` detects a time series in a tool result,
+  the rows leave the model's context (offloaded to a file) and the same call emits a `chart` event:
+  `series[{label, points: [[iso, value], …], n, truncated, summary}]`, downsampled to
+  `MAX_CHART_POINTS` per series (min/max kept), at most `MAX_CHART_SERIES` series, plus a
+  full-resolution `csv` per series up to `MAX_CSV_POINTS` for a download control. The model learns
+  only the event id: the tool result gains a `chart: <id>` line, findings carry `[chart:<id>]`, and
+  the report places the chart by writing `[chart:<id>]` on its own line — the UI renders the card
+  there. That is how data reaches the report; rows never do. `source` is the deployment's
+  data-source label (MCP `label`), never a tool name. A chart-shaped MCP result that is not a detectable series (e.g.
+  the connector's `show_chart`) still streams as an ordinary `tool_result`.
 
 ---
 

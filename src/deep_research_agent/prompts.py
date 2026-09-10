@@ -45,8 +45,9 @@ table, a row dump, a column of values, raw JSON. Write the SHAPE instead: first 
 value, peak and trough with their dates, mean, direction, and counts with their \
 denominators; quote at most a couple of representative lines. When the reader would want \
 the numbers themselves, NAME the /workspace file that holds them and say what it shows — \
-the path travels, the rows do not. A finding that carries a series or a dump is rejected \
-and handed back to you to distill.
+the path travels, the rows do not. When the tool result named a chart (`chart: <id>`), put \
+`[chart:<id>]` in the finding that discusses it — the reader gets the chart, never the rows. \
+A finding that carries a series or a dump is rejected and handed back to you to distill.
 - Findings must come from THIS run's tool results, never from memory. \
 If the unit yielded nothing, say so in "summary" and return an empty findings list; \
 NEVER pad with invented findings.\
@@ -264,7 +265,10 @@ reaches you as a saved file plus a computed summary (first/last value, min/max w
 mean, median, direction): quote the summary, or compute more in `execute` (percentile, \
 z-score of the spike window, correlation, sums) and report the computed numbers. A report \
 containing a raw series is bounced back, and any rows still present are deleted before \
-delivery — the reader gets nothing for them.
+delivery — the reader gets nothing for them. When the reader should SEE the data, place the \
+chart: a tool result or finding that carries `[chart:<id>]` names a chart already rendered \
+for the user — write that token on its own line in the report where the data belongs and \
+the chart appears there, with a CSV download. That is how data reaches the report.
 - SIZE the finding in context: give magnitude as a SHARE of the relevant universe, not just \
 an absolute (e.g. "1,200 records flagged — about 1.5% of the 80,000 tracked", not just \
 "1,200"). When the user asks "is there a lot of X", that question MUST be answerable from \
@@ -286,6 +290,11 @@ Restate ALL findings in full; never say "see above".
 - Call `submit_report` EXACTLY ONCE, only after gathering data with tools. After it \
 returns, STOP — do not repeat or rewrite the report. (If the user wants changes, they \
 will ask in a follow-up.)
+- When the user asks for the DATA ITSELF — "give me the CSV", "show all the rows", "the \
+full file", "verbatim" — the answer is the chart, never the rows: deliver a short report \
+that places `[chart:<id>]` (the chart card carries a CSV download) and says so in one \
+sentence. Rows you remember from earlier in the run are not an exception; typing them out \
+is transcription and is removed before delivery, so the reader would get nothing for it.
 """
 )
 
@@ -316,7 +325,9 @@ sentiment): never bucket by bucket, whatever the date format — give first and 
 peak/trough with when, average and direction, in one sentence. A metric series arrives as a \
 saved file plus that summary already computed: use it, or `execute` over the file for more. \
 Your findings are a CONCLUSION, never the data behind it (see RETURN FORMAT): a series, a \
-message list or a table pasted into a field is rejected and bounced back.
+message list or a table pasted into a field is rejected and bounced back. A series result \
+also names its chart (`chart: <id>`): carry `[chart:<id>]` in the finding that discusses \
+it, so the orchestrator can place the chart in the report.
 - Run code for real or not at all: only report output you ACTUALLY got from executing it (the \
 `execute` tool). If you can't run it, say so and show the code unrun — never invent results.
 - `execute` runs a SHELL command: put any script longer than a one-liner in a FILE \

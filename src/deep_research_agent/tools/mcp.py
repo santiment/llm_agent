@@ -125,6 +125,7 @@ async def load_mcp_tools(
             instrument_tool(
                 t, kind="mcp", semaphore=gate,
                 rate_limit_max_wait=cfg.mcp_rate_limit_max_wait,
+                source_label=s.get("label") or "",
                 **result_handling(cfg, meter, offload_sink),
             )
             for t in tools

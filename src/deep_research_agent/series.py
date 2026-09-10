@@ -194,6 +194,19 @@ def summary_block(series: dict[str, list[tuple[datetime, float]]]) -> str:
     return "\n".join("  " + describe_text(label, pts) for label, pts in series.items())
 
 
+def downsample(points: list[tuple[datetime, float]], max_points: int) -> list[tuple[datetime, float]]:
+    """At most ``max_points`` points: an even grid (first and last included) plus the min
+    and the max, in order. The input is returned as is when it fits or ``max_points`` < 4."""
+    n = len(points)
+    if max_points < 4 or n <= max_points:
+        return points
+    vals = [v for _, v in points]
+    grid = max_points - 2
+    keep = {round(i * (n - 1) / (grid - 1)) for i in range(grid)}
+    keep |= {min(range(n), key=vals.__getitem__), max(range(n), key=vals.__getitem__)}
+    return [points[i] for i in sorted(keep)]
+
+
 SERIES_RULE = (
     "A time series is NEVER listed row by row — not in the report, not in any message, "
     "whatever the date format. That includes a CSV: no `date,value` block, no fenced data "

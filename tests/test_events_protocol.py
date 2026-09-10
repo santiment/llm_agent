@@ -46,7 +46,7 @@ def test_registry_pins_the_full_event_vocabulary():
         "run_start", "search_query", "search_results", "source",
         "mcp_call", "mcp_result", "tool_call", "tool_result",
         "skill", "report", "status", "clarification", "usage", "subagent_findings",
-        "script",
+        "script", "chart",
     }
 
 
@@ -129,3 +129,66 @@ if __name__ == "__main__":
             fn()
             print(f"ok  {name}")
     print("all event-protocol tests passed")
+
+
+# ---- chart artifacts: the one channel that carries rows to the reader ------------------
+
+def _points(n: int, start: str = "2026-06-01"):
+    from datetime import datetime, timedelta, timezone
+    t0 = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
+    return {"data": {"bitcoin": [
+        {"datetime": (t0 + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
+         "value": float(i * i % 37)} for i in range(n)]}}
+
+
+def test_chart_event_carries_downsampled_points_and_full_stats():
+    from deep_research_agent.events import MAX_CHART_POINTS, emit_chart
+    from deep_research_agent.series import find_series
+
+    series = find_series(_points(1500))
+    with capture_events_cm() as events:
+        emit_chart(series, source_label="Santiment")
+    charts = [e for e in events if e["type"] == "chart"]
+    assert len(charts) == 1
+    chart = charts[0]
+    assert chart["source"] == "Santiment" and chart["kind"] == "series"
+    assert chart["label"] == "bitcoin" and chart["id"]
+    one = chart["series"][0]
+    # Render-ready for the Santiment chart widget: it feeds each entry in unchanged.
+    assert one["name"] == one["label"] == "bitcoin" and one["style"] == "line" and one["pane"] == 0
+    assert len(one["data"]) <= MAX_CHART_POINTS
+    assert one["n"] == 1500 and one["truncated"] is True
+    assert one["summary"]["n"] == 1500                       # stats over ALL points
+    first = one["data"][0]
+    assert first["time"] == 1780272000 and isinstance(first["value"], float)  # unix seconds
+    assert one["csv"].count("\n") == 1501                     # header + every point, full resolution
+
+
+def test_chart_event_keeps_small_series_intact_and_skips_empty():
+    from deep_research_agent.events import emit_chart
+    from deep_research_agent.series import find_series
+
+    with capture_events_cm() as events:
+        chart_id = emit_chart(find_series(_points(30)))
+    chart = [e for e in events if e["type"] == "chart"][0]
+    assert chart_id == chart["id"] and len(chart_id) == 8     # the handle the model is told
+    one = chart["series"][0]
+    assert one["n"] == 30 and one["truncated"] is False and len(one["data"]) == 30
+    assert one["csv"].startswith("time,value\n2026-06-01,") and one["csv"].count("\n") == 31
+
+    with capture_events_cm() as events:
+        assert emit_chart({}) == ""         # nothing detected -> no artifact, no id
+    assert not [e for e in events if e["type"] == "chart"]
+
+
+def test_chart_event_bounds_how_many_series_it_ships():
+    from deep_research_agent.events import MAX_CHART_SERIES, emit_chart
+    from deep_research_agent.series import points_of
+
+    rows = _points(12)["data"]["bitcoin"]
+    many = {f"asset_{i}": points_of(rows) for i in range(MAX_CHART_SERIES + 5)}
+    with capture_events_cm() as events:
+        emit_chart(many)
+    chart = [e for e in events if e["type"] == "chart"][0]
+    assert len(chart["series"]) == MAX_CHART_SERIES
+    assert chart["series_omitted"] == 5
