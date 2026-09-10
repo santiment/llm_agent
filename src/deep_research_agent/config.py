@@ -117,6 +117,53 @@ MODEL_TIERS: dict[str, dict[str, str]] = {
 
 DEFAULT_MODEL_TIER = "extra-low"
 
+# Does the model accept OpenRouter's unified `reasoning` parameter? Per EXACT slug, from the
+# model index's `supported_parameters` (verified 2026-09-09; re-check before trusting). A
+# model that rejects it answers 400 on every provider, never retried — the run dies — so a
+# rejecting model is recorded as False, and an unlisted one is treated the same: it just runs
+# at the provider default. tests/test_model_tiering.py requires a flag for every tier slug.
+MODEL_REASONING: dict[str, bool] = {
+    "deepseek/deepseek-v4-flash-0731": True,
+    "deepseek/deepseek-v4-pro": True,
+    "google/gemini-3-flash-preview": True,
+    "google/gemini-3.5-flash-lite": True,
+    "google/gemini-3.6-flash": True,
+    "google/gemini-3.7-flash": True,
+    "openai/gpt-5.6-luna": True,
+    "openai/gpt-5.6-sol": True,
+    "qwen/qwen3.8-27b": True,
+    "z-ai/glm-5.3-flash": True,
+    # One family, different answers — why flags are per slug, not per prefix.
+    "qwen/qwen3-30b-a3b-instruct-2507": False,
+    "qwen/qwen3-30b-a3b-thinking-2507": True,
+    "qwen/qwen3-30b-a3b": True,
+}
+
+# Default for ``reasoning_capable``; DRA_REASONING_CAPABLE replaces it.
+_REASONING_CAPABLE = [slug for slug, accepts in MODEL_REASONING.items() if accepts]
+
+# Does OpenRouter price a prompt-cache read for the model (`pricing.input_cache_read`,
+# verified 2026-09-09; the ratio is cache-read / input price)? Every ReAct step re-sends the
+# growing prefix, so a model without a cache pays full price to re-read its own context —
+# no tier may name one (tests/test_model_tiering.py). Advisory at runtime (models.py warns),
+# hence no env override.
+MODEL_CACHING: dict[str, bool] = {
+    "deepseek/deepseek-v4-flash-0731": True,     # 0.25x
+    "deepseek/deepseek-v4-pro": True,            # 0.08x
+    "google/gemini-3-flash-preview": True,       # 0.10x
+    "google/gemini-3.5-flash-lite": True,        # 0.10x
+    "google/gemini-3.6-flash": True,             # 0.10x
+    "google/gemini-3.7-flash": True,             # 0.10x
+    "openai/gpt-5.6-luna": True,                 # 0.10x
+    "openai/gpt-5.6-sol": True,                  # 0.10x
+    "qwen/qwen3.8-27b": True,                    # 0.20x
+    "z-ai/glm-5.3-flash": True,                  # 0.20x
+    # No cache read priced for the whole family.
+    "qwen/qwen3-30b-a3b-instruct-2507": False,
+    "qwen/qwen3-30b-a3b-thinking-2507": False,
+    "qwen/qwen3-30b-a3b": False,
+}
+
 # Valid values for reasoning_effort ("" = provider default; "none" = disable thinking).
 _REASONING_EFFORTS = frozenset({"", "none", "minimal", "low", "medium", "high"})
 
@@ -300,6 +347,11 @@ class ResearchConfig:
     # disables thinking where supported. Unsupported models ignore the parameter.
     # DRA_REASONING_EFFORT.
     reasoning_effort: str = "low"
+    # Models the `reasoning` parameter may be sent to (the True flags of MODEL_REASONING);
+    # DRA_REASONING_CAPABLE replaces the list.
+    reasoning_capable: list[str] = field(
+        default_factory=lambda: list(_REASONING_CAPABLE)
+    )
     # Per-HTTP-request ceiling (seconds) and retry count on every model call. Without an
     # explicit timeout the OpenAI client's default applies to a request that a proxied
     # provider can stall far longer on — one hung call would otherwise pin a research unit
@@ -415,6 +467,16 @@ class ResearchConfig:
     def is_openrouter(self) -> bool:
         """OpenRouter-only behaviors (cost reporting, cache_control) key off this."""
         return "openrouter" in self.base_url.lower()
+
+    def supports_reasoning(self, model_id: str) -> bool:
+        """Exact-slug membership in ``reasoning_capable`` — a prefix match would pass a
+        family's non-reasoning member."""
+        return _strip_provider(model_id).strip().lower() in self.reasoning_capable
+
+    @staticmethod
+    def caches_prompts(model_id: str) -> bool:
+        """Whether OpenRouter prices a cache read for ``model_id``; unlisted is False."""
+        return MODEL_CACHING.get(_strip_provider(model_id).strip().lower(), False)
 
     @classmethod
     def from_runnable_config(cls, config: dict | None) -> "ResearchConfig":
@@ -560,6 +622,16 @@ class ResearchConfig:
         if isinstance(denylist, str):
             denylist = denylist.split(",")
 
+        # Same shape as the denylist: a list from a caller, comma-separated from env.
+        capable = _pick(
+            c,
+            "reasoning_capable",
+            env="DRA_REASONING_CAPABLE",
+            default=_REASONING_CAPABLE,
+        )
+        if isinstance(capable, str):
+            capable = capable.split(",")
+
         reasoning_effort = (
             str(
                 _pick(
@@ -597,6 +669,7 @@ class ResearchConfig:
                 c, "max_output_tokens", env="DRA_MAX_OUTPUT_TOKENS",
                 default=cls.max_output_tokens))),
             reasoning_effort=reasoning_effort,
+            reasoning_capable=[s.strip().lower() for s in capable if str(s).strip()],
             request_timeout=float(
                 _pick(
                     c,

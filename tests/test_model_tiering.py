@@ -19,7 +19,8 @@ import re
 from pathlib import Path
 
 from deep_research_agent import config
-from deep_research_agent.config import DEFAULT_MODEL_TIER, MODEL_TIERS, ResearchConfig
+from deep_research_agent.config import (DEFAULT_MODEL_TIER, MODEL_CACHING, MODEL_REASONING,
+                                         MODEL_TIERS, ResearchConfig)
 
 _ENV_KEYS = ("DRA_MODEL_TIER",)
 
@@ -177,6 +178,75 @@ def test_tiers_cost_more_as_they_go_up() -> None:
         assert lo[0] <= hi[0] and lo[1] <= hi[1], f"{higher} is not pricier than {lower}"
 
 
+def test_every_tier_model_carries_a_reasoning_flag() -> None:
+    # A missing flag is not a crash — models.py just omits the parameter — so this is the
+    # only thing that notices a model quietly stopped reasoning.
+    cfg = _cfg()
+    for tier, package in MODEL_TIERS.items():
+        for slot, slug in package.items():
+            assert slug in MODEL_REASONING, (
+                f"{tier}.{slot} = {slug} has no flag in config.MODEL_REASONING, so it will "
+                "run WITHOUT the reasoning parameter. Check the slug against OpenRouter's "
+                'model index (`supported_parameters` must contain "reasoning") and add '
+                "True, or add False to record that the model rejects it."
+            )
+            assert cfg.supports_reasoning(slug) is MODEL_REASONING[slug], (tier, slot, slug)
+
+
+def test_reasoning_is_withheld_from_models_flagged_false() -> None:
+    # `-instruct-2507` rejects the parameter, its `-thinking-2507` sibling accepts it: flags
+    # are per slug, never per family.
+    cfg = _cfg()
+    assert MODEL_REASONING["qwen/qwen3-30b-a3b-instruct-2507"] is False
+    assert not cfg.supports_reasoning("qwen/qwen3-30b-a3b-instruct-2507")
+    assert cfg.supports_reasoning("qwen/qwen3-30b-a3b-thinking-2507")
+    # An unflagged model is treated as rejecting: forfeit the parameter, never risk a 400.
+    assert "some/unreleased-model-v9" not in MODEL_REASONING
+    assert not cfg.supports_reasoning("some/unreleased-model-v9")
+    # The `openai:` prefix form resolves to the same bare slug (see _strip_provider).
+    assert cfg.supports_reasoning("openai:qwen/qwen3.8-27b")
+
+
+def test_reasoning_param_reaches_only_capable_models() -> None:
+    # Through the real model builder: present for a listed slug, absent for an unlisted one.
+    from deep_research_agent.models import build_chat_model
+
+    cfg = _cfg()
+    capable = build_chat_model(MODEL_TIERS["mid"]["research_model"], cfg)
+    assert (capable.extra_body or {}).get("reasoning") == {"effort": cfg.reasoning_effort}
+    rejecting = build_chat_model("qwen/qwen3-30b-a3b-instruct-2507", cfg)
+    assert "reasoning" not in (rejecting.extra_body or {})
+
+
+
+def test_no_tier_may_name_a_model_that_cannot_cache() -> None:
+    # Every ReAct step re-sends the growing prefix; a model without a cache pays full price
+    # to re-read its own context.
+    cfg = _cfg()
+    for tier, package in MODEL_TIERS.items():
+        for slot, slug in package.items():
+            assert slug in MODEL_CACHING, (
+                f"{tier}.{slot} = {slug} has no flag in config.MODEL_CACHING. Check "
+                "OpenRouter's model index for `pricing.input_cache_read` and add True, or "
+                "add False and pick a different model — a tier may not name one."
+            )
+            assert cfg.caches_prompts(slug), (
+                f"{tier}.{slot} = {slug} prices no cache read: an input-heavy role on it "
+                "pays full price for every re-sent prefix. Pick a caching model."
+            )
+
+
+def test_known_non_caching_models_are_recorded_and_rejected() -> None:
+    # Recorded as False, not omitted, so a tier edit cannot pick one up believing it caches.
+    cfg = _cfg()
+    for slug in ("qwen/qwen3-30b-a3b-instruct-2507", "qwen/qwen3-30b-a3b-thinking-2507",
+                 "qwen/qwen3-30b-a3b"):
+        assert MODEL_CACHING[slug] is False
+        assert not cfg.caches_prompts(slug)
+    # Unlisted is treated as non-caching: unknown is not a promise.
+    assert not cfg.caches_prompts("some/unreleased-model-v9")
+    assert cfg.caches_prompts("deepseek/deepseek-v4-flash-0731")
+
 if __name__ == "__main__":
     test_model_tier_package_selects_all_three()
     test_bare_config_defaults_to_cheapest_tier()
@@ -187,4 +257,9 @@ if __name__ == "__main__":
     test_every_tier_slot_documents_its_price()
     test_subagent_is_never_pricier_than_the_orchestrator()
     test_tiers_cost_more_as_they_go_up()
+    test_every_tier_model_carries_a_reasoning_flag()
+    test_reasoning_is_withheld_from_models_flagged_false()
+    test_reasoning_param_reaches_only_capable_models()
+    test_no_tier_may_name_a_model_that_cannot_cache()
+    test_known_non_caching_models_are_recorded_and_rejected()
     print("OK — tier-only model selection verified.")
