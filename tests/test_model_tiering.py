@@ -167,6 +167,31 @@ def test_subagent_is_never_pricier_than_the_orchestrator() -> None:
         assert subagent[1] <= research[1], f"{tier}: sub-agent output ${subagent[1]} > ${research[1]}"
 
 
+def test_utility_is_the_price_floor() -> None:
+    # The utility model is the floor: it powers the extract-subagent, an input-heavy
+    # map/extract over offloaded files that needs context length, not judgment. A utility
+    # pricier than the fleet it serves inverts the ladder inside one tier — `mid` once ran
+    # a flash-lite extractor at 4x/14x the fleet's price — which is why it is asserted.
+    for tier, slots in _tier_prices().items():
+        subagent, utility = slots["subagent_model"], slots["utility_model"]
+        assert utility[0] <= subagent[0], f"{tier}: utility input ${utility[0]} > ${subagent[0]}"
+        assert utility[1] <= subagent[1], f"{tier}: utility output ${utility[1]} > ${subagent[1]}"
+
+
+def test_fleet_is_at_least_the_planner_of_the_tier_below() -> None:
+    # Stepping up a tier must upgrade the data gathering, not just the planning: the fleet
+    # makes the calls that become findings, and three tiers once shared the floor fleet under
+    # ever-pricier planners. So each tier's sub-agent is priced at or above the planner of the
+    # tier below — in practice the same model, a staircase.
+    prices = _tier_prices()
+    ladder = ["extra-low", "low", "mid", "high"]
+    for lower, higher in zip(ladder, ladder[1:]):
+        planner_below, fleet = prices[lower]["research_model"], prices[higher]["subagent_model"]
+        assert fleet[0] >= planner_below[0] and fleet[1] >= planner_below[1], (
+            f"{higher}: sub-agent ${fleet} is cheaper than {lower}'s planner ${planner_below}"
+        )
+
+
 def test_tiers_cost_more_as_they_go_up() -> None:
     # `extra-low` < `low` < `mid` < `high` on the research slot, both axes. A "higher"
     # tier that is cheaper than the one below it means the names lie to the caller.
@@ -193,18 +218,17 @@ def test_every_tier_model_carries_a_reasoning_flag() -> None:
             assert cfg.supports_reasoning(slug) is MODEL_REASONING[slug], (tier, slot, slug)
 
 
-def test_reasoning_is_withheld_from_models_flagged_false() -> None:
-    # `-instruct-2507` rejects the parameter, its `-thinking-2507` sibling accepts it: flags
-    # are per slug, never per family.
+def test_reasoning_is_withheld_from_unflagged_models() -> None:
+    # Only a slug flagged True receives the parameter. Unflagged is treated as rejecting —
+    # forfeit the parameter, never risk a 400 — and membership is per EXACT slug, never per
+    # family: the flagged 0731 build does not cover the bare (0423) sibling slug.
     cfg = _cfg()
-    assert MODEL_REASONING["qwen/qwen3-30b-a3b-instruct-2507"] is False
-    assert not cfg.supports_reasoning("qwen/qwen3-30b-a3b-instruct-2507")
-    assert cfg.supports_reasoning("qwen/qwen3-30b-a3b-thinking-2507")
-    # An unflagged model is treated as rejecting: forfeit the parameter, never risk a 400.
     assert "some/unreleased-model-v9" not in MODEL_REASONING
     assert not cfg.supports_reasoning("some/unreleased-model-v9")
+    assert cfg.supports_reasoning("deepseek/deepseek-v4-flash-0731")
+    assert not cfg.supports_reasoning("deepseek/deepseek-v4-flash")
     # The `openai:` prefix form resolves to the same bare slug (see _strip_provider).
-    assert cfg.supports_reasoning("openai:qwen/qwen3.8-27b")
+    assert cfg.supports_reasoning("openai:deepseek/deepseek-v4-flash-0731")
 
 
 def test_reasoning_param_reaches_only_capable_models() -> None:
@@ -214,7 +238,7 @@ def test_reasoning_param_reaches_only_capable_models() -> None:
     cfg = _cfg()
     capable = build_chat_model(MODEL_TIERS["mid"]["research_model"], cfg)
     assert (capable.extra_body or {}).get("reasoning") == {"effort": cfg.reasoning_effort}
-    rejecting = build_chat_model("qwen/qwen3-30b-a3b-instruct-2507", cfg)
+    rejecting = build_chat_model("deepseek/deepseek-v4-flash", cfg)  # unflagged 0423 build
     assert "reasoning" not in (rejecting.extra_body or {})
 
 
@@ -236,13 +260,14 @@ def test_no_tier_may_name_a_model_that_cannot_cache() -> None:
             )
 
 
-def test_known_non_caching_models_are_recorded_and_rejected() -> None:
-    # Recorded as False, not omitted, so a tier edit cannot pick one up believing it caches.
+def test_non_caching_models_are_rejected() -> None:
+    # A model recorded as False is refused like an unlisted one — record, never omit, a
+    # model found without cache pricing, so a tier edit cannot pick it up believing it caches.
+    from unittest.mock import patch
+
     cfg = _cfg()
-    for slug in ("qwen/qwen3-30b-a3b-instruct-2507", "qwen/qwen3-30b-a3b-thinking-2507",
-                 "qwen/qwen3-30b-a3b"):
-        assert MODEL_CACHING[slug] is False
-        assert not cfg.caches_prompts(slug)
+    with patch.dict(MODEL_CACHING, {"some/no-cache-model": False}):
+        assert not cfg.caches_prompts("some/no-cache-model")
     # Unlisted is treated as non-caching: unknown is not a promise.
     assert not cfg.caches_prompts("some/unreleased-model-v9")
     assert cfg.caches_prompts("deepseek/deepseek-v4-flash-0731")
@@ -256,10 +281,12 @@ if __name__ == "__main__":
     test_budget_fallbacks_match_dataclass_defaults()
     test_every_tier_slot_documents_its_price()
     test_subagent_is_never_pricier_than_the_orchestrator()
+    test_utility_is_the_price_floor()
+    test_fleet_is_at_least_the_planner_of_the_tier_below()
     test_tiers_cost_more_as_they_go_up()
     test_every_tier_model_carries_a_reasoning_flag()
-    test_reasoning_is_withheld_from_models_flagged_false()
+    test_reasoning_is_withheld_from_unflagged_models()
     test_reasoning_param_reaches_only_capable_models()
     test_no_tier_may_name_a_model_that_cannot_cache()
-    test_known_non_caching_models_are_recorded_and_rejected()
+    test_non_caching_models_are_rejected()
     print("OK — tier-only model selection verified.")
