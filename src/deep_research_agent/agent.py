@@ -28,6 +28,7 @@ from .config import ResearchConfig
 from .findings_gate import SubagentFindingsMiddleware
 from .loop_guard import LoopGuardMiddleware
 from .metering import RunMeter, SubagentUsageMiddleware, UsageMeterMiddleware
+from .model_errors import ModelBackoffMiddleware, SubagentFailureMiddleware
 from .models import build_chat_model
 from .prompts import (coding_prompt, describe_mcp_sources, extract_prompt,
                       orchestrator_prompt, skills_block, subagent_prompt)
@@ -267,7 +268,14 @@ async def make_graph(config: dict | None = None):
                        # Capture only: its handoff is findings JSON with its own gate.
                        ScriptArtifactsMiddleware("research-subagent"),
                        ExecuteArtifactsMiddleware("research-subagent"),
-                       *shared_middleware],
+                       *shared_middleware,
+                       # It delegates to the extract / coding sub-agents through its own
+                       # `task`: one of those dying must not take this unit down.
+                       SubagentFailureMiddleware(),
+                       # LAST on every role: a throttled provider is waited out (budgeted)
+                       # before a model error stands, and a retry re-runs only the call.
+                       ModelBackoffMiddleware("research-subagent", cfg.subagent_model,
+                                              max_wait=cfg.model_rate_limit_max_wait)],
     }
     # Skills live with the sub-agents ONLY: they hold the file tools that load a SKILL.md.
     # The orchestrator gets names + descriptions in its prompt (describe_skills) and names
@@ -326,7 +334,9 @@ async def make_graph(config: dict | None = None):
                            # only way that code reaches the UI.
                            ExecuteArtifactsMiddleware("extract-subagent"),
                            *shared_middleware,
-                           ExcludeToolsMiddleware(EXTRACT_EXCLUDED_TOOLS)],
+                           ExcludeToolsMiddleware(EXTRACT_EXCLUDED_TOOLS),
+                           ModelBackoffMiddleware("extract-subagent", cfg.utility_model,
+                                                  max_wait=cfg.model_rate_limit_max_wait)],
         }
         subagents.append(extract_spec)
         nested_specs.append(nested(
@@ -364,7 +374,9 @@ async def make_graph(config: dict | None = None):
                            ScriptArtifactsMiddleware("coding-subagent", scrub=True),
                            ExecuteArtifactsMiddleware("coding-subagent"),
                            *shared_middleware,
-                           ExcludeToolsMiddleware(CODING_EXCLUDED_TOOLS)],
+                           ExcludeToolsMiddleware(CODING_EXCLUDED_TOOLS),
+                           ModelBackoffMiddleware("coding-subagent", cfg.coding_model,
+                                                  max_wait=cfg.model_rate_limit_max_wait)],
         }
         subagents.append(coding_spec)
         nested_specs.append(nested(
@@ -430,6 +442,13 @@ async def make_graph(config: dict | None = None):
         # No file tools for the orchestrator (nor their schemas on every step); a hidden tool
         # it calls by name is refused, not run. `task` is how files get read or written.
         ExcludeToolsMiddleware(ORCHESTRATOR_EXCLUDED_TOOLS),
+        # A sub-agent that dies mid-`task` comes back as an error tool result — the
+        # orchestrator retries the unit or reports the gap — instead of unwinding the run
+        # (a 429 on the sub-agent model did exactly that). Backoff LAST (see the sub-agent
+        # spec): a retry re-runs the model call only, not the request rewrites above.
+        SubagentFailureMiddleware(),
+        ModelBackoffMiddleware("orchestrator", cfg.research_model,
+                               max_wait=cfg.model_rate_limit_max_wait),
     ]
     if sandbox is not None:
         from .sandbox import SandboxCleanupMiddleware

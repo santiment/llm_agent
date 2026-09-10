@@ -229,6 +229,11 @@ A few important behaviors:
   single shared semaphore (`mcp_max_concurrency`, default 10) bounds simultaneous MCP calls across
   the orchestrator *and* all parallel sub-agents. Rate-limit (429) responses trigger bounded backoff
   rather than failure.
+- **A throttled model provider is waited out; a dead sub-agent is a tool error.** The SDK's own
+  retries on a model call last a few seconds; a shared provider pool throttles for longer. Every role
+  waits out retryable model errors (429 / 5xx / timeout) within `model_rate_limit_max_wait`
+  (`model_errors.py`), and if a sub-agent still dies mid-`task`, the orchestrator receives an error
+  tool result — retry the unit or report the gap — rather than the exception ending the run.
 - **Series ship as `chart` artifacts.** When `find_series` detects a time series in a tool result,
   the rows leave the model's context (offloaded to a file) and the same call emits a `chart` event:
   `series[{label, points: [[iso, value], …], n, truncated, summary}]`, downsampled to
@@ -366,6 +371,8 @@ The orchestrator's stack (assembled in `agent.py`, in this order):
 | **ClarificationGuardMiddleware** | `awrap_tool_call` | Blocks `request_clarification` *after* research has begun — so a weak model can't pop a nonsensical question card after minutes of work. Tells it to finish instead. |
 | **ClarificationFallbackMiddleware** | `after_model` | If the model *narrates* clarifying questions as plain text (pre-research) instead of calling the tool, this emits the `clarification` card anyway — so the UI behaves the same regardless of model. |
 | **UsageMeterMiddleware** | `before_agent` / `after_agent` | Starts the run clock and emits `run_start` (`started_at`); at the end emits the per-run `usage` event and the `RESEARCH USAGE` log line (tool calls, errors, rows/bytes, tokens, model calls, run time). `ResearchOutputMiddleware` reads the same clock, so the end `status` carries the run time in the success and the no-report case alike. |
+| **SubagentFailureMiddleware** | `awrap_tool_call` | A sub-agent that dies mid-`task` (its model provider throttled past the backoff budget, say) comes back as an **error tool result** naming the sub-agent and the cause — the orchestrator retries the unit once or reports the gap — instead of the exception unwinding the whole run. Also on the research-subagent, which nests the extract / coding workers through its own `task`. |
+| **ModelBackoffMiddleware** | `awrap_model_call` | Last on **every** role (one instance per role, so its `status` events name role + model). A retryable model error (429 / 5xx / timeout / connection) is waited out — `Retry-After`, else capped exponential backoff — and the call repeated until cumulative waiting would exceed `model_rate_limit_max_wait`; then the error stands. The SDK's own `max_retries` only covers sub-second blips; this is what survives a shared provider pool throttling for tens of seconds. |
 | **SandboxCleanupMiddleware** | `after_agent` | Destroys the run's sandbox session (only present when a sandbox is configured). |
 
 **Turn-scoping** underpins all of this (`turn.py`). A LangGraph thread accumulates *every* message
@@ -396,7 +403,7 @@ That's what keeps the agent portable.
 | `subagent_findings` | a folded findings table from a worker |
 | `script` | a collapsed "view script" tab holding code an agent ran: a FILE script (basename + `language` + final source, at the worker's handoff) or INLINE code from an `execute` heredoc / `python3 -c` (`inline.py` + its real `output`, as the call returns, for every role including the orchestrator). The only place a script surfaces: no role names a script path in prose, and the coder's handoff is scrubbed of paths before the orchestrator reads it (`script_artifacts.py`) |
 | `clarification` | the question card (re-enables input) |
-| `status` | lifecycle: `mcp_ready` / `mcp_error` (tool loading), `budget_soft` / `budget_halt` (ceilings), `revising` (a gate bounced a deliverable back), `compacting` / `compacted` (context compaction), `loop_detected` / `loop_halt` (repeated-identical-call guard), `subagent_start` / `subagent_done` (a sub-agent run, with `role` + `model`), then exactly one end-state — `done` or `error`, with a `reason` code and the run time (`elapsed_s` / `elapsed`, also appended to `detail`: "… Run time 4m 12s.") |
+| `status` | lifecycle: `mcp_ready` / `mcp_error` (tool loading), `budget_soft` / `budget_halt` (ceilings), `revising` (a gate bounced a deliverable back), `compacting` / `compacted` (context compaction), `loop_detected` / `loop_halt` (repeated-identical-call guard), `subagent_start` / `subagent_done` (a sub-agent run, with `role` + `model`), `rate_limited` / `model_unavailable` (a throttled or erroring model provider being waited out within `model_rate_limit_max_wait`, then given up on), `subagent_failed` (a sub-agent died mid-`task`; its caller got a tool error and the run continues), then exactly one end-state — `done` or `error`, with a `reason` code and the run time (`elapsed_s` / `elapsed`, also appended to `detail`: "… Run time 4m 12s.") |
 | `usage` | the per-run usage summary, incl. run time (`elapsed_s`, `elapsed`, `started_at`, `finished_at`) |
 | `report` | the final markdown answer (also persisted in state) |
 
@@ -532,7 +539,8 @@ All overridable per-run (`configurable`) or via env var; defaults shown.
 | `domain_prompt` | `DRA_DOMAIN_PROMPT` / `_FILE` | empty | deployment-specific text appended to both system prompts (§4); the `_FILE` variant reads it from a path |
 | `streaming` | `DRA_STREAMING` | true | live token streaming (some models are force-disabled) |
 | `streaming_denylist` | `DRA_STREAMING_DENYLIST` | `deepseek-v4-flash,deepseek-v4.1-flash` | model-name substrings that force `streaming` off regardless of the flag |
-| `request_timeout` / `max_retries` | `DRA_REQUEST_TIMEOUT`, `DRA_MAX_RETRIES` | 180 / 3 | per-model-call HTTP timeout and retry count — always set, so a hung provider call can't stall a run |
+| `request_timeout` / `max_retries` | `DRA_REQUEST_TIMEOUT`, `DRA_MAX_RETRIES` | 180 / 3 | per-model-call HTTP timeout and SDK retry count (sub-second retries — blips) — always set, so a hung provider call can't stall a run |
+| `model_rate_limit_max_wait` | `DRA_MODEL_RATE_LIMIT_MAX_WAIT` | 120 | backoff budget (s) per model call for a throttled / erroring provider — waited out, then the error stands; `0` = no waiting beyond the SDK's |
 | `recursion_limit` | `DRA_RECURSION_LIMIT` | 4500 | LangGraph super-step ceiling (secondary guard; the budget is primary) |
 
 ---

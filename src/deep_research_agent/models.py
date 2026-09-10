@@ -64,7 +64,9 @@ def build_chat_model(model_id: str, cfg: ResearchConfig) -> ChatOpenAI:
         # Always set both explicitly. A proxied provider can stall a single request far
         # past any sane bound; without a timeout that one call pins its research unit —
         # and its concurrency slot — for the rest of the run. max_retries covers the
-        # transient 429/5xx the same stack produces. DRA_REQUEST_TIMEOUT / DRA_MAX_RETRIES.
+        # sub-second 429/5xx blips the same stack produces (0.5 s doubling to 8 s); a
+        # throttle that outlasts them is waited out by ModelBackoffMiddleware within
+        # cfg.model_rate_limit_max_wait. DRA_REQUEST_TIMEOUT / DRA_MAX_RETRIES.
         timeout=cfg.request_timeout,
         max_retries=cfg.max_retries,
         extra_body=extra_body or None,

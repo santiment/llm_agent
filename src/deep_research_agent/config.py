@@ -359,8 +359,9 @@ class ResearchConfig:
     # explicit timeout the OpenAI client's default applies to a request that a proxied
     # provider can stall far longer on — one hung call would otherwise pin a research unit
     # (and its concurrency slot) for the rest of the run. Retries cover transient 429/5xx
-    # and are what the SDK already does between attempts with backoff; 0 disables them.
-    # Override via DRA_REQUEST_TIMEOUT / DRA_MAX_RETRIES.
+    # and are what the SDK already does between attempts with backoff (0.5 s doubling to
+    # 8 s — blips, not a throttle; that is model_rate_limit_max_wait below); 0 disables
+    # them. Override via DRA_REQUEST_TIMEOUT / DRA_MAX_RETRIES.
     request_timeout: float = 180.0
     max_retries: int = 3
     search_max_results: int = 6
@@ -376,6 +377,13 @@ class ResearchConfig:
     # permanently-throttled server can't hang a run forever. Same altitude as
     # mcp_max_concurrency so both throttle knobs are operator-tunable.
     mcp_rate_limit_max_wait: float = 120.0
+    # The same budget for MODEL calls (model_errors.ModelBackoffMiddleware): on a retryable
+    # provider error (429 / 5xx / timeout) the role waits — Retry-After, else capped
+    # exponential backoff — and calls again until cumulative backoff would exceed this,
+    # then the error stands. Covers the tens-of-seconds throttle a shared provider pool
+    # imposes, which the SDK's sub-second max_retries cannot; every role gets it, so one
+    # throttled sub-agent model no longer ends the run. 0 = no waiting beyond the SDK's.
+    model_rate_limit_max_wait: float = 120.0
     # How long (seconds) a server's tool LISTING is reused across graph builds. make_graph
     # runs per research run, and listing tools is a network round-trip per server (the
     # single biggest cost of a graph build — 0.4–0.7 s measured, what the dev server
@@ -711,6 +719,9 @@ class ResearchConfig:
                     default=cls.mcp_rate_limit_max_wait,
                 )
             ),
+            model_rate_limit_max_wait=max(0.0, float(_pick(
+                c, "model_rate_limit_max_wait", env="DRA_MODEL_RATE_LIMIT_MAX_WAIT",
+                default=cls.model_rate_limit_max_wait))),
             max_run_seconds=max(0, int(_pick(
                 c, "max_run_seconds", env="DRA_MAX_RUN_SECONDS", default=cls.max_run_seconds))),
             mcp_tools_ttl=max(0.0, float(_pick(
