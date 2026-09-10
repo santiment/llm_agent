@@ -107,17 +107,18 @@ three that shape a run:
 | Tier        | research (orchestrator) | subagent (workers)      | utility (extract)       | Use for |
 |-------------|-------------------------|-------------------------|-------------------------|---------|
 | `extra-low` | deepseek-v4-flash-0731  | deepseek-v4-flash-0731  | deepseek-v4-flash-0731  | demos, smoke tests, high-volume low-stakes |
-| `low`       | qwen3.8-27b             | deepseek-v4-flash-0731  | deepseek-v4-flash-0731  | cheapest sane agent |
-| `mid`       | gemini-3.7-flash        | deepseek-v4-flash-0731  | gemini-3.5-flash-lite   | the value sweet spot |
-| `high`      | gpt-5.6-sol             | gemini-3.7-flash        | gemini-3.5-flash-lite   | best quality per dollar |
+| `low`       | deepseek-v4.1-flash     | deepseek-v4-flash-0731  | deepseek-v4-flash-0731  | cheapest sane agent |
+| `mid`       | gemini-3.8-flash        | deepseek-v4.1-flash     | deepseek-v4-flash-0731  | the value sweet spot |
+| `high`      | gpt-5.6-sol             | gemini-3.8-flash        | deepseek-v4-flash-0731  | best quality per dollar |
 
 The default is `extra-low` so a bare checkout can't silently burn money — production callers opt
 **up** explicitly. The core idea of **model tiering**: a strong orchestrator *plans and
 synthesizes*; cheaper workers *grind the data*. Handing the top model to the sub-agent fleet — which
 makes most of the tool calls — would defeat the point, so that is an asserted invariant rather than
 an intention: `tests/test_model_tiering.py` parses the `# $in / $out` comment beside every slug in
-`MODEL_TIERS` and fails if a fleet is priced above its planner, if a tier is cheaper than the one
-below it, or if a slug carries no price at all.
+`MODEL_TIERS` and fails if a fleet is priced above its planner, if the utility model is priced above
+the fleet, if a tier is cheaper than the one below it, if a tier's fleet is cheaper than the
+planner of the tier below, or if a slug carries no price at all.
 (The `utility` slot powers the `extract-subagent`: when a large tool result is offloaded to a
 /workspace file, the file + a question goes to this cheapest model for reading/summarizing
 instead of being loaded into a more expensive context. Research-subagents — where the offloaded
@@ -530,7 +531,7 @@ All overridable per-run (`configurable`) or via env var; defaults shown.
 | custom tools dir | `DRA_CUSTOM_TOOLS_DIR` | `./custom_tools` | drop-in tools |
 | `domain_prompt` | `DRA_DOMAIN_PROMPT` / `_FILE` | empty | deployment-specific text appended to both system prompts (§4); the `_FILE` variant reads it from a path |
 | `streaming` | `DRA_STREAMING` | true | live token streaming (some models are force-disabled) |
-| `streaming_denylist` | `DRA_STREAMING_DENYLIST` | `deepseek-v4-flash` | model-name substrings that force `streaming` off regardless of the flag |
+| `streaming_denylist` | `DRA_STREAMING_DENYLIST` | `deepseek-v4-flash,deepseek-v4.1-flash` | model-name substrings that force `streaming` off regardless of the flag |
 | `request_timeout` / `max_retries` | `DRA_REQUEST_TIMEOUT`, `DRA_MAX_RETRIES` | 180 / 3 | per-model-call HTTP timeout and retry count — always set, so a hung provider call can't stall a run |
 | `recursion_limit` | `DRA_RECURSION_LIMIT` | 4500 | LangGraph super-step ceiling (secondary guard; the budget is primary) |
 

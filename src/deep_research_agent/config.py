@@ -58,14 +58,18 @@ _NUMERIC_HOST = re.compile(r"(?:0x[0-9a-f]+|\d+)(?:\.(?:0x[0-9a-f]+|\d+))*")
 
 # Default for the ``streaming_denylist`` field — a module constant so the field default
 # and the resolver share ONE list instead of repeating the model substring.
-_DEFAULT_STREAMING_DENYLIST = ["deepseek-v4-flash"]
+# `deepseek-v4.1-flash` is listed as a precaution: same family and providers as the build
+# that broke, streaming UNVERIFIED on it — drop the entry once a streamed run keeps its
+# tool_calls (DRA_STREAMING_DENYLIST=deepseek-v4-flash overrides meanwhile).
+_DEFAULT_STREAMING_DENYLIST = ["deepseek-v4-flash", "deepseek-v4.1-flash"]
 
 # Named model packages ("price tiers") — the ONLY place models are chosen; callers pick a
 # package by name (``model_tier`` / ``DRA_MODEL_TIER``), never a model. See README for what
 # each tier is for and which benchmark picked each slot. Inline $in/$out per 1M tokens,
-# verified against the OpenRouter model index 2026-09-03 (they drift);
-# tests/test_model_tiering.py parses them and fails if a fleet outprices its planner, if a
-# tier undercuts the one below it, or if a slug carries no price.
+# verified against the OpenRouter model index 2026-09-10 (they drift);
+# tests/test_model_tiering.py parses them and fails if a fleet outprices its planner, if the
+# utility outprices the fleet, if a tier undercuts the one below it, if a tier's fleet is
+# cheaper than the planner of the tier below, or if a slug carries no price.
 #
 # Slot → job class → what picked it (OpenRouter benchmarks + task-spend rankings, 2026-09-03):
 #   research_model    plans/delegates/synthesizes  τ²-bench airline + multi_step_planning/research_report
@@ -77,91 +81,90 @@ _DEFAULT_STREAMING_DENYLIST = ["deepseek-v4-flash"]
 # rare input, so their per-token price barely shows in a run — pick them for quality.
 MODEL_TIERS: dict[str, dict[str, str]] = {
     # Rock bottom: one model family end to end, so delegation pays off only via context
-    # isolation. `deepseek-v4-flash` is a _DEFAULT_STREAMING_DENYLIST substring and matches the
-    # -0731 slug too, so nothing here streams. 0731 is the current V4 Flash build: the bare
-    # `deepseek/deepseek-v4-flash` slug is the older 0423 one — pricier in, 1.0M ctx vs 1.31M,
-    # no parallel_tool_calls — so no slot should use it.
+    # isolation. Every slot is a _DEFAULT_STREAMING_DENYLIST match (`deepseek-v4-flash` covers
+    # the -0731 build, `deepseek-v4.1-flash` the coder), so nothing here streams. 0731 is the
+    # current V4 Flash build: the bare `deepseek/deepseek-v4-flash` slug is the older 0423 one
+    # — pricier in, 1.0M ctx vs 1.31M — so no slot should use it. The coder is the V4.1 Flash
+    # build (DeepSeek's own claim: exceeds V4 Pro), served first-party, at the same $in as the
+    # glm flash it replaced.
     "extra-low": {
         "research_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "subagent_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "compaction_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
-        "coding_model": "z-ai/glm-5.3-flash",  # $0.07 / $0.25
+        "coding_model": "deepseek/deepseek-v4.1-flash",  # $0.15 / $0.60
     },
-    # qwen3.8-27b: τ² 78.7% at fleet-adjacent prices, but slow (~5 min/task median).
+    # deepseek-v4.1-flash (released 2026-09-10, not on the benchmarks yet — picked ahead of
+    # them): the next DeepSeek Flash build at 2x the fleet's price, 1.0M ctx, 0.02x cache
+    # read, served first-party by DeepSeek (0731 is third-party only). Unpinned slug —
+    # DeepSeek may repoint it.
     "low": {
-        "research_model": "qwen/qwen3.8-27b",  # $0.42 / $2.55
+        "research_model": "deepseek/deepseek-v4.1-flash",  # $0.15 / $0.60
         "subagent_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "compaction_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
         "coding_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
     },
-    # gemini-3.7-flash: τ² #2 overall (80.6%) and GPQA #2 (94.3%) at a flash price.
+    # gemini-3.8-flash (2026-09-02, not on the benchmarks yet): newest Gemini Flash at the
+    # same price as the 3.7 build it replaced, which held τ² #2 overall (80.6%) and GPQA #2
+    # (94.3%). The fleet is `low`'s planner: each tier's fleet is the planner of the tier
+    # below (asserted), so stepping up upgrades the gathering, not just the plan. Utility is
+    # the floor everywhere.
     "mid": {
-        "research_model": "google/gemini-3.7-flash",  # $0.75 / $3.75
-        "subagent_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
-        "utility_model": "google/gemini-3.5-flash-lite",  # $0.30 / $2.50
+        "research_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
+        "subagent_model": "deepseek/deepseek-v4.1-flash",  # $0.15 / $0.60
+        "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "compaction_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
-        "coding_model": "google/gemini-3.6-flash",  # $0.75 / $3.75
+        "coding_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
     },
     # gpt-5.6-sol over claude-sonnet-5: same price and τ², +8.7pp GPQA, half the latency.
-    # The fleet here is a stronger agent than the planner on τ² — intended: it makes the calls.
+    # The fleet (3.8-flash; its 3.7 predecessor out-scored the planner on τ²) is a stronger
+    # tool-caller than the planner — intended: it makes the calls. Compaction on the fleet
+    # model rather than luna: the summary must keep every number and source for the planner
+    # and every sub-agent, and at a few compactions per run the price barely shows. Coder
+    # pinned to the GA `-0813` Pro build (first-party at $0.66/$1.98; the index lists a
+    # reseller's price): the bare `deepseek-v4-pro` slug is the 0423 build on degraded
+    # third-party hosts.
     "high": {
         "research_model": "openai/gpt-5.6-sol",  # $2.00 / $10.00
-        "subagent_model": "google/gemini-3.7-flash",  # $0.75 / $3.75
-        "utility_model": "google/gemini-3.5-flash-lite",  # $0.30 / $2.50
-        "compaction_model": "google/gemini-3-flash-preview",  # $0.50 / $3.00
-        "coding_model": "deepseek/deepseek-v4-pro",  # $1.04 / $2.08
+        "subagent_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
+        "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
+        "compaction_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
+        "coding_model": "deepseek/deepseek-v4-pro-0813",  # $1.05 / $3.15
     },
 }
 
 DEFAULT_MODEL_TIER = "extra-low"
 
 # Does the model accept OpenRouter's unified `reasoning` parameter? Per EXACT slug, from the
-# model index's `supported_parameters` (verified 2026-09-09; re-check before trusting). A
+# model index's `supported_parameters` (verified 2026-09-10; re-check before trusting). A
 # model that rejects it answers 400 on every provider, never retried — the run dies — so a
 # rejecting model is recorded as False, and an unlisted one is treated the same: it just runs
 # at the provider default. tests/test_model_tiering.py requires a flag for every tier slug.
 MODEL_REASONING: dict[str, bool] = {
     "deepseek/deepseek-v4-flash-0731": True,
-    "deepseek/deepseek-v4-pro": True,
-    "google/gemini-3-flash-preview": True,
-    "google/gemini-3.5-flash-lite": True,
-    "google/gemini-3.6-flash": True,
-    "google/gemini-3.7-flash": True,
+    "deepseek/deepseek-v4-pro-0813": True,
+    "deepseek/deepseek-v4.1-flash": True,
+    "google/gemini-3.8-flash": True,
     "openai/gpt-5.6-luna": True,
     "openai/gpt-5.6-sol": True,
-    "qwen/qwen3.8-27b": True,
-    "z-ai/glm-5.3-flash": True,
-    # One family, different answers — why flags are per slug, not per prefix.
-    "qwen/qwen3-30b-a3b-instruct-2507": False,
-    "qwen/qwen3-30b-a3b-thinking-2507": True,
-    "qwen/qwen3-30b-a3b": True,
 }
 
 # Default for ``reasoning_capable``; DRA_REASONING_CAPABLE replaces it.
 _REASONING_CAPABLE = [slug for slug, accepts in MODEL_REASONING.items() if accepts]
 
 # Does OpenRouter price a prompt-cache read for the model (`pricing.input_cache_read`,
-# verified 2026-09-09; the ratio is cache-read / input price)? Every ReAct step re-sends the
+# verified 2026-09-10; the ratio is cache-read / input price)? Every ReAct step re-sends the
 # growing prefix, so a model without a cache pays full price to re-read its own context —
 # no tier may name one (tests/test_model_tiering.py). Advisory at runtime (models.py warns),
 # hence no env override.
 MODEL_CACHING: dict[str, bool] = {
     "deepseek/deepseek-v4-flash-0731": True,     # 0.25x
-    "deepseek/deepseek-v4-pro": True,            # 0.08x
-    "google/gemini-3-flash-preview": True,       # 0.10x
-    "google/gemini-3.5-flash-lite": True,        # 0.10x
-    "google/gemini-3.6-flash": True,             # 0.10x
-    "google/gemini-3.7-flash": True,             # 0.10x
+    "deepseek/deepseek-v4-pro-0813": True,       # 0.03x
+    "deepseek/deepseek-v4.1-flash": True,        # 0.02x
+    "google/gemini-3.8-flash": True,             # 0.10x
     "openai/gpt-5.6-luna": True,                 # 0.10x
     "openai/gpt-5.6-sol": True,                  # 0.10x
-    "qwen/qwen3.8-27b": True,                    # 0.20x
-    "z-ai/glm-5.3-flash": True,                  # 0.20x
-    # No cache read priced for the whole family.
-    "qwen/qwen3-30b-a3b-instruct-2507": False,
-    "qwen/qwen3-30b-a3b-thinking-2507": False,
-    "qwen/qwen3-30b-a3b": False,
 }
 
 # Valid values for reasoning_effort ("" = provider default; "none" = disable thinking).
