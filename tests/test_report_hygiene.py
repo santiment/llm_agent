@@ -7,7 +7,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from deep_research_agent.report_hygiene import (collapse_series, lint_citations, report_problems, scrub_report,
+from deep_research_agent.report_hygiene import (chart_refs, collapse_data_blocks, collapse_series, delimited_runs,
+                                                lint_citations, report_problems, scrub_report,
                                                 series_row_count, series_runs)
 
 
@@ -302,3 +303,173 @@ def test_report_problems_machinery_detector_is_prose_safe():
         "## Sources\n- [1] Santiment social messages\n- [2] [Doc](https://example.com/data.json)\n"
     )
     assert not any("files, paths, code" in p for p in report_problems(md))
+
+
+# ---- CSV-shaped blocks with no timestamps ----------------------------------------------
+
+def _channel_rows() -> str:
+    return ("channel,messages\n"
+            "telegram_room_a,4821\ntelegram_room_b,3990\nreddit_cc,2210\n"
+            "twitter_x1,1870\nbitcointalk_t,1455\nfarcaster_ch,980\n")
+
+
+def test_delimited_runs_finds_a_csv_block_without_timestamps():
+    runs = delimited_runs("# R\n\n" + _channel_rows())
+    assert len(runs) == 1
+    start, end = runs[0]
+    assert end - start == 6      # the header line is not a data row
+
+
+def test_delimited_runs_ignore_short_blocks_and_markdown_tables():
+    assert delimited_runs("a,1\nb,2\nc,3\n") == []          # under MIN_DELIM_ROWS
+    table = ("| level | voices |\n| --- | --- |\n| 1.20 | 14 |\n| 1.05 | 9 |\n"
+             "| 0.98 | 7 |\n| 0.90 | 5 |\n| 0.85 | 4 |\n")
+    assert delimited_runs(table) == []                       # a real table is prose furniture
+    prose = ("Volume rose 12% [1]. Sentiment, which had been negative, turned [2].\n"
+             "Whales sold 4,200 BTC [1]. The move, at 2.5%, was small [2].\n")
+    assert delimited_runs(prose) == []
+
+
+def test_delimited_runs_break_when_the_delimiter_changes():
+    # A run needs one delimiter throughout: 4 comma rows + 2 semicolon rows flag nothing.
+    assert delimited_runs("a,1\nb,2\nc,3\nd,4\ne;5\nf;6\n") == []
+    # Under commas "5,6" is indistinguishable from "5,600", so mixed width still counts as
+    # one block — the safe direction.
+    assert len(delimited_runs("a,1\nb,2\nc,3\nd,4\ne,5,6\nf,7,8\n")) == 1
+    # Tabs carry no such ambiguity, so a genuine width change breaks a TSV run.
+    assert delimited_runs("a\t1\nb\t2\nc\t3\nd\t4\ne\t5\t6\nf\t7\t8\n") == []
+
+
+def test_report_problems_flags_a_pasted_csv_block():
+    md = "# R\n\n" + _channel_rows() + "\n## Sources\n- [1] Santiment social messages\n"
+    assert any("pastes a raw data block" in p for p in report_problems(md))
+
+
+def test_collapse_data_blocks_drops_both_shapes_with_their_fence_and_heading():
+    dated = "".join(f"2026-06-{d:02d},{d * 1.5}\n" for d in range(11, 20))
+    md = ("# Crowd read\n\n"
+          "## CSV 1: sentiment_balance_total — date,balance\n"
+          "```\ndate,balance\n" + dated + "```\n\n"
+          "## CSV 2: top_channels — channel,messages\n"
+          "```csv\n" + _channel_rows() + "```\n\n"
+          "## What the CSV export means\nSentiment flipped on 2026-06-24 [1].\n\n"
+          "## Sources\n- [1] Santiment social messages\n")
+    out = collapse_data_blocks(md)
+    # No data survives, in either shape.
+    assert not series_runs(out) and not delimited_runs(out)
+    assert "2026-06-15" not in out and "telegram_room_a," not in out
+    # The wrapper goes with it: no fence, no header row, no dump-labeling heading.
+    assert "```" not in out and "date,balance" not in out
+    assert "CSV 1:" not in out and "CSV 2:" not in out
+    # The statistics survive instead, and real prose is untouched.
+    assert "Raw series of 9 timestamped rows" in out
+    assert "Raw data block of 6 rows" in out
+    assert "total 15,326 across 6 rows" in out
+    assert "## What the CSV export means" in out          # prose heading, not a dump label
+    assert "Sentiment flipped on 2026-06-24 [1]." in out
+    assert "## Sources" in out and "- [1] Santiment social messages" in out
+    assert collapse_data_blocks(out) == out               # idempotent
+
+
+def test_collapse_data_blocks_noop_on_a_clean_report():
+    md = ("# R\n\nSocial volume peaked at 4,821 messages on 2026-06-16, up 3.2x from the "
+          "prior week's mean of 1,505 [1].\n\n## Sources\n- [1] Santiment social messages\n")
+    assert collapse_data_blocks(md) == md
+
+
+# ---- dump shapes with something before the date: `cat -n`, a pandas index, JSON -------
+
+_ROWS = [(f"2026-08-{d:02d}", 63000 + d * 137.5) for d in range(10, 22)]
+
+
+def test_line_numbered_rows_are_a_series():
+    numbered = "     1\tdate,price_usd\n" + "\n".join(
+        f"{i + 2:6d}\t{d},{v}" for i, (d, v) in enumerate(_ROWS))
+    out = collapse_data_blocks(numbered)
+    assert "2026-08-15" not in out and "date,price_usd" not in out
+    assert "Raw series of 12 timestamped rows" in out
+
+
+def test_pandas_print_is_a_series():
+    df = "          date  price_usd\n" + "\n".join(
+        f"{i:<2}  {d}   {v}" for i, (d, v) in enumerate(_ROWS))
+    out = collapse_data_blocks(df)
+    assert "2026-08-15" not in out and "price_usd" not in out      # header taken with the rows
+    assert "Raw series of 12 timestamped rows" in out
+
+
+def test_whole_text_json_series_is_collapsed():
+    js = "[" + ", ".join(f'{{"datetime": "{d}T00:00:00Z", "value": {v}}}' for d, v in _ROWS) + "]"
+    out = collapse_data_blocks(js)
+    assert "2026-08-15" not in out and "Raw series of 12 points" in out
+    assert "12 points, 2026-08-10 to 2026-08-21" in out              # the summary survives
+    # JSON quoted inside prose is not touched; a non-series JSON object is not touched.
+    prose = 'The API returned `{"value": 3}` for that call.'
+    assert collapse_data_blocks(prose) == prose
+    assert collapse_data_blocks('{"ok": true, "count": 31}') == '{"ok": true, "count": 31}'
+
+
+def test_numbered_dated_prose_list_is_not_a_series():
+    # A numbered list of dated headlines has a number, a date and PROSE — still prose.
+    md = "\n".join(f"{i}. 2026-08-{10 + i:02d}: ETF inflows hit ${i}.2B, the largest day this month"
+                   for i in range(1, 8))
+    assert series_runs(md) == [] and collapse_data_blocks(md) == md
+
+
+# ---- a placed chart survives every hygiene pass ----------------------------------------
+
+def test_chart_placeholder_passes_scrub_collapse_and_gate():
+    md = ("# BTC 30 days\n\nPrice rose 23% over the window[1].\n\n[chart:1a2b3c4d]\n\n"
+          "Volume peaked mid-August[1].\n\n## Sources\n- [1] Santiment\n")
+    out = collapse_data_blocks(scrub_report(md))
+    assert "[chart:1a2b3c4d]" in out and out == md
+    assert report_problems(md) == []
+    # Own-line placements only (that is what the UI renders), CRLF tolerated, fences ignored.
+    assert chart_refs(md + "\n[chart:ffffffff]\r\n[chart:1a2b3c4d]\n") == ["1a2b3c4d", "ffffffff"]
+    assert chart_refs("inline [chart:ffffffff] text\n```\n[chart:abcdef01]\n```\n") == []
+
+
+def test_scrub_drops_a_sentence_that_only_says_where_a_file_is():
+    # Seen live: "The file is saved at the underlying data with two columns" — the path was
+    # neutralized but the sentence about it shipped. The sentence has nothing for a reader.
+    md = ("Price rose 24% over the window[1]. The file is saved at /workspace/btc_30d_price.csv "
+          "with two columns: the date and the daily price. Volume peaked mid-August[1].")
+    out = scrub_report(md)
+    assert out == "Price rose 24% over the window[1]. Volume peaked mid-August[1]."
+    assert scrub_report(out) == out
+    # Same for the announcement line that introduces a dump (no sentence terminator).
+    assert scrub_report("Here's the CSV file — it's saved at `/workspace/x.csv` (31 rows):\n```\nx\n```") == "```\nx\n```"
+    # A path inside a sentence that carries content is neutralized, not deleted.
+    assert scrub_report("Prices from /workspace/data/px.json rose 24%[1].") == (
+        "Prices from the underlying data rose 24%[1].")
+
+
+def test_path_sentence_scrub_does_not_split_on_decimals_or_extensions():
+    # "1.5%" is not a sentence boundary: the claim survives with the path neutralized.
+    md = "The 12,400 flagged files in /workspace/data/scan.json are 1.5% of the total[1]."
+    assert scrub_report(md) == "The 12,400 flagged files in the underlying data are 1.5% of the total[1]."
+    # Two paths in one content sentence: both neutralized, no ".json" residue.
+    two = "Merged /workspace/a.json with /workspace/b.json to get a ratio of 0.42[1]."
+    assert scrub_report(two) == "Merged the underlying data with the underlying data to get a ratio of 0.42[1]."
+
+
+def test_json_stats_object_that_merely_contains_a_curve_is_kept():
+    # The `execute` guard runs this over the orchestrator's printouts: a stats object with
+    # a 12-point curve inside is the NUMBERS the model computed — it must survive intact.
+    curve = ",".join(f'{{"t": "2026-08-{d:02d}T00:00:00Z", "count": {d * 7}}}' for d in range(10, 22))
+    stats = ('{"total_matching": 3300, "sampled": 400, "organic_share": 61, "volume_curve": ['
+             + curve + '], "top_channels": [{"name": "a", "n": 12}]}')
+    assert collapse_data_blocks(stats) == stats
+    # …while a message that IS the series still collapses.
+    pure = "[" + ",".join(f'{{"datetime": "2026-08-{d:02d}T00:00:00Z", "value": {d}}}' for d in range(10, 22)) + "]"
+    assert "Raw series of 12 points" in collapse_data_blocks(pure)
+    # A metric-server result — nothing but series under a wrapper — collapses too.
+    wrapped = '{"data": {"bitcoin": ' + pure + '}}'
+    assert "Raw series of 12 points" in collapse_data_blocks(wrapped)
+
+
+def test_markdown_table_header_and_separator_go_with_the_collapsed_rows():
+    md = "| date | px |\n|---|---|\n" + "\n".join(f"| 2026-08-{d:02d} | {63000 + d} |" for d in range(10, 22)) + "\n"
+    out = collapse_data_blocks(md)
+    assert "| date | px |" not in out and "|---|" not in out
+    assert out.startswith("*(Raw series of 12 timestamped rows")

@@ -28,7 +28,7 @@ from .compaction import turn_spend
 from .completion import MAX_NUDGES
 from .events import domain_of, emit
 from .metering import fmt_elapsed
-from .report_hygiene import collapse_series, lint_citations, scrub_report
+from .report_hygiene import collapse_data_blocks, lint_citations, scrub_report
 from .turn import (NUDGE_NAME, called, count_nudges, current_turn, did_research_work,
                    is_json_object_dump, looks_delivered, raw_text, text_of,
                    tool_calls_of)
@@ -116,7 +116,8 @@ class ResearchOutputMiddleware(AgentMiddleware):
         # persisted final_report (and the salvage emit below) match what submit_report already
         # scrubbed on its live emit. Idempotent, so double-scrubbing the submit path is safe.
         report = scrub_report(report, self.tool_names)
-        report = collapse_series(report)  # drop raw series the gate could not get rewritten
+        # Drop raw series / pasted CSV blocks the gate could not get rewritten.
+        report = collapse_data_blocks(report)
 
         # submit_report already emitted the live `report` event; only emit on fallback.
         if report and not via_tool:
