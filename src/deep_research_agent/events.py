@@ -126,6 +126,10 @@ STATUS_STATES = frozenset({
     "model_call",                       # ``role`` + ``model`` + ``step`` (+ ``unit``/``after``)
     "runaway_output", "runaway_halt",   # carry ``detail`` + ``chars``
     "sandbox_reset",                    # carries ``detail``
+    # model_errors.py: a role waiting out a throttled model provider (``role``, ``model``,
+    # ``detail``, ``retry``, ``wait_s``, ``waited_s``, ``budget_s``), the budget spent
+    # (``retries``, ``waited_s``), and a sub-agent that died mid-`task` (``role``, ``detail``).
+    "rate_limited", "model_unavailable", "subagent_failed",
 })
 
 

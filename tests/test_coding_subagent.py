@@ -20,6 +20,7 @@ import deep_research_agent.agent as agent_mod
 from deep_research_agent.config import MODEL_TIERS
 from deep_research_agent.findings_gate import SubagentFindingsMiddleware
 from deep_research_agent.metering import SubagentUsageMiddleware
+from deep_research_agent.model_errors import ModelBackoffMiddleware
 from deep_research_agent.prompts import (coding_prompt, extract_prompt, orchestrator_prompt,
                                          subagent_prompt)
 from deep_research_agent.script_artifacts import ScriptArtifactsMiddleware
@@ -69,7 +70,9 @@ def test_coding_subagent_keeps_file_tools_but_not_grep_or_todos(monkeypatch) -> 
     assert len(filters) == 1 and filters[0].excluded == CODING_EXCLUDED_TOOLS
     assert {"grep", "write_todos"} == set(CODING_EXCLUDED_TOOLS)
     assert not {"execute", "write_file", "edit_file", "read_file"} & CODING_EXCLUDED_TOOLS
-    assert isinstance(spec["middleware"][-1], ExcludeToolsMiddleware)  # after tool injection
+    # After tool injection; only the model-call backoff (innermost) sits inside it.
+    assert isinstance(spec["middleware"][-2], ExcludeToolsMiddleware)
+    assert isinstance(spec["middleware"][-1], ModelBackoffMiddleware)
     # Not a findings producer: the gate would bounce its STATUS/OUTPUT/NOTES handoff.
     assert not any(isinstance(m, SubagentFindingsMiddleware) for m in spec["middleware"])
 

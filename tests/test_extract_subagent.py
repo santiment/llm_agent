@@ -12,6 +12,7 @@ from deepagents.middleware.subagents import SubAgentMiddleware
 import deep_research_agent.agent as agent_mod
 from deep_research_agent.config import DEFAULT_MODEL_TIER, MODEL_TIERS
 from deep_research_agent.findings_gate import SubagentFindingsMiddleware
+from deep_research_agent.model_errors import ModelBackoffMiddleware
 from deep_research_agent.prompts import extract_prompt
 
 
@@ -160,8 +161,10 @@ def test_extract_subagent_hides_everything_but_execute(monkeypatch) -> None:
     assert {"read_file", "ls", "glob", "grep", "write_file", "edit_file"} <= filters[0].excluded
     assert "execute" not in filters[0].excluded
     # The filter must come AFTER anything that injects tools (deepagents appends spec
-    # middleware after its default filesystem stack, so last-in-spec is late enough).
-    assert isinstance(extract["middleware"][-1], ExcludeToolsMiddleware)
+    # middleware after its default filesystem stack, so this late in the spec is enough);
+    # only the model-call backoff (innermost, wraps the bare call) sits inside it.
+    assert isinstance(extract["middleware"][-2], ExcludeToolsMiddleware)
+    assert isinstance(extract["middleware"][-1], ModelBackoffMiddleware)
 
     research = next(s for s in captured["subagents"] if s["name"] == "research-subagent")
     task_mw = next(m for m in research["middleware"] if isinstance(m, SubAgentMiddleware))

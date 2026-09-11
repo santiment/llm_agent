@@ -75,6 +75,7 @@ def test_status_states_pinned():
         "compacting", "compacted", "loop_detected", "loop_halt", "done", "error",
         "subagent_start", "subagent_done",
         "triage", "model_call", "runaway_output", "runaway_halt", "sandbox_reset",
+        "rate_limited", "model_unavailable", "subagent_failed",
     }
 
 
