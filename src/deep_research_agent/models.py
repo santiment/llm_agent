@@ -18,7 +18,21 @@ from .config import ResearchConfig
 log = logging.getLogger("deep_research_agent.models")
 
 
-def build_chat_model(model_id: str, cfg: ResearchConfig) -> ChatOpenAI:
+def provider_preferences(cfg: ResearchConfig) -> dict:
+    """OpenRouter's `provider` request object; empty when nothing is set. Thresholds go in
+    p50 form — the figure its endpoint feed reports as ``throughput_last_30m`` etc."""
+    out: dict = {}
+    if cfg.provider_min_throughput > 0:
+        out["preferred_min_throughput"] = {"p50": cfg.provider_min_throughput}
+    if cfg.provider_max_latency > 0:
+        out["preferred_max_latency"] = {"p50": cfg.provider_max_latency}
+    if cfg.provider_sort:
+        out["sort"] = cfg.provider_sort
+    return out
+
+
+def build_chat_model(model_id: str, cfg: ResearchConfig,
+                     provider: dict | None = None) -> ChatOpenAI:
     # Some OpenRouter models (e.g. deepseek-v4-flash) emit off-spec streaming chunks that
     # LangChain merges into DOUBLED metadata (finish_reason "stopstop", doubled model_name)
     # and DROP tool_calls — which stalls the ReAct loop. Force streaming off for those.
@@ -53,6 +67,14 @@ def build_chat_model(model_id: str, cfg: ResearchConfig) -> ChatOpenAI:
     # value, whichever the gateway reads wins.
     if cfg.max_output_tokens and cfg.is_openrouter:
         extra_body["max_tokens"] = cfg.max_output_tokens
+    # Provider routing: without it the price-weighted default lands the fleet on a model's
+    # slowest providers. `provider` is the per-model object from provider_routing.resolve
+    # (price cap, ignore list); None = the static soft preferences only.
+    if cfg.is_openrouter:
+        if provider is None:
+            provider = provider_preferences(cfg)
+        if provider:
+            extra_body["provider"] = provider
     return ChatOpenAI(
         model=model_id,
         api_key=cfg.openai_api_key or "missing-key",

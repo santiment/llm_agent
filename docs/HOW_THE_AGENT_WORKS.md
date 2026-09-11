@@ -541,6 +541,12 @@ All overridable per-run (`configurable`) or via env var; defaults shown.
 | `streaming_denylist` | `DRA_STREAMING_DENYLIST` | `deepseek-v4-flash,deepseek-v4.1-flash` | model-name substrings that force `streaming` off regardless of the flag |
 | `request_timeout` / `max_retries` | `DRA_REQUEST_TIMEOUT`, `DRA_MAX_RETRIES` | 180 / 3 | per-model-call HTTP timeout and SDK retry count (sub-second retries — blips) — always set, so a hung provider call can't stall a run |
 | `model_rate_limit_max_wait` | `DRA_MODEL_RATE_LIMIT_MAX_WAIT` | 120 | backoff budget (s) per model call for a throttled / erroring provider — waited out, then the error stands; `0` = no waiting beyond the SDK's |
+| `provider_min_throughput` | `DRA_PROVIDER_MIN_THROUGHPUT` | 50 | OpenRouter routing: deprioritize provider endpoints under this p50 tokens/s (soft — price weighting continues among those that qualify; the cheapest endpoints of one model run 5–10x slower than its fastest); `0` = off |
+| `provider_max_latency` | `DRA_PROVIDER_MAX_LATENCY` | 0 | same, for p50 time-to-first-token in seconds; `0` = off |
+| `provider_sort` | `DRA_PROVIDER_SORT` | — | hard override `price` / `throughput` / `latency`: top endpoint on that axis, OpenRouter load balancing off |
+| `provider_max_price_factor` | `DRA_PROVIDER_MAX_PRICE_FACTOR` | 1.25 | hard cap: refuse endpoints pricier than this x the cheapest healthy one (per axis), read per model from the live endpoint feed at graph start; `0` = off |
+| `provider_min_uptime` | `DRA_PROVIDER_MIN_UPTIME` | 97 | stability floor (% uptime, last 30 min): endpoints below it don't anchor the cap; a provider with no healthy endpoint is skipped via `ignore`; `0` = off |
+| `provider_routing_ttl` | `DRA_PROVIDER_ROUTING_TTL` | 300 | seconds the endpoint feed is cached across graph builds; `0` = every run |
 | `recursion_limit` | `DRA_RECURSION_LIMIT` | 4500 | LangGraph super-step ceiling (secondary guard; the budget is primary) |
 
 ---

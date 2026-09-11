@@ -33,6 +33,18 @@ def capture_events_cm():
         events._writer = orig
 
 
+@pytest.fixture(autouse=True)
+def _no_provider_feed(monkeypatch):
+    """``make_graph`` resolves provider routing from OpenRouter's endpoint feed; tests never
+    touch the network, so the feed reads as unreachable (soft preferences only)."""
+    import deep_research_agent.provider_routing as pr
+
+    async def unreachable(slug, ttl, timeout=5.0):
+        return None
+
+    monkeypatch.setattr(pr, "fetch_endpoints", unreachable)
+
+
 @pytest.fixture
 def capture_events():
     """Pytest fixture yielding the list that ``events.emit()`` writes captured events into during the test."""

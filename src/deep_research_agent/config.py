@@ -84,22 +84,21 @@ MODEL_TIERS: dict[str, dict[str, str]] = {
     # isolation. Every slot is a _DEFAULT_STREAMING_DENYLIST match (`deepseek-v4-flash` covers
     # the -0731 build, `deepseek-v4.1-flash` the coder), so nothing here streams. 0731 is the
     # current V4 Flash build: the bare `deepseek/deepseek-v4-flash` slug is the older 0423 one
-    # — pricier in, 1.0M ctx vs 1.31M — so no slot should use it. The coder is the V4.1 Flash
-    # build (DeepSeek's own claim: exceeds V4 Pro), served first-party, at the same $in as the
-    # glm flash it replaced.
+    # — pricier in, 1.0M ctx vs 1.31M — so no slot should use it. The coder is `low`'s
+    # planner (V4.1 Flash); its input is tiny, so the 4x price barely registers.
     "extra-low": {
         "research_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "subagent_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "compaction_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
-        "coding_model": "deepseek/deepseek-v4.1-flash",  # $0.15 / $0.60
+        "coding_model": "deepseek/deepseek-v4.1-flash",  # $0.30 / $1.20
     },
-    # deepseek-v4.1-flash (released 2026-09-10, not on the benchmarks yet — picked ahead of
-    # them): the next DeepSeek Flash build at 2x the fleet's price, 1.0M ctx, 0.02x cache
-    # read, served first-party by DeepSeek (0731 is third-party only). Unpinned slug —
-    # DeepSeek may repoint it.
+    # deepseek-v4.1-flash (GA 2026-09-10): τ² airline 76.7% (#16), above 0731 (73.2%) and
+    # everything near its price; 1.0M ctx, 0.02x cache read, 9 endpoints on 09-11 (4 on
+    # launch day, when a 429 from all of them killed a run). Per-provider speed spans 12 to
+    # 127 tok/s — routing, not the model, sets it (provider_min_throughput). Unpinned slug.
     "low": {
-        "research_model": "deepseek/deepseek-v4.1-flash",  # $0.15 / $0.60
+        "research_model": "deepseek/deepseek-v4.1-flash",  # $0.30 / $1.20
         "subagent_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "compaction_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
@@ -112,7 +111,7 @@ MODEL_TIERS: dict[str, dict[str, str]] = {
     # the floor everywhere.
     "mid": {
         "research_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
-        "subagent_model": "deepseek/deepseek-v4.1-flash",  # $0.15 / $0.60
+        "subagent_model": "deepseek/deepseek-v4.1-flash",  # $0.30 / $1.20
         "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
         "compaction_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
         "coding_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
@@ -169,6 +168,8 @@ MODEL_CACHING: dict[str, bool] = {
 
 # Valid values for reasoning_effort ("" = provider default; "none" = disable thinking).
 _REASONING_EFFORTS = frozenset({"", "none", "minimal", "low", "medium", "high"})
+# Valid values for provider_sort ("" = OpenRouter's price-weighted load balancing).
+_PROVIDER_SORTS = frozenset({"", "price", "throughput", "latency"})
 
 
 def _env(*names: str, default: str = "") -> str:
@@ -350,6 +351,20 @@ class ResearchConfig:
     # disables thinking where supported. Unsupported models ignore the parameter.
     # DRA_REASONING_EFFORT.
     reasoning_effort: str = "low"
+    # OpenRouter provider routing, sent under `provider` (models.py; the live per-model parts
+    # come from provider_routing.py). Soft: preferred_* thresholds (p50 tokens/s; p50 seconds
+    # to first token) push slow endpoints to the back, none excluded; 0 = off. Hard:
+    # provider_sort (price | throughput | latency) turns balancing off; max_price_factor caps
+    # every endpoint at factor x the cheapest HEALTHY one (status ok, uptime_last_30m >=
+    # min_uptime %) — pricier ones are refused even when the cheap one is slow; 0 = off.
+    # Providers with no healthy endpoint go on `ignore`. Feed cached routing_ttl seconds.
+    # DRA_PROVIDER_{MIN_THROUGHPUT,MAX_LATENCY,SORT,MAX_PRICE_FACTOR,MIN_UPTIME,ROUTING_TTL}.
+    provider_min_throughput: float = 50.0
+    provider_max_latency: float = 0.0
+    provider_sort: str = ""
+    provider_max_price_factor: float = 1.25
+    provider_min_uptime: float = 97.0
+    provider_routing_ttl: float = 300.0
     # Models the `reasoning` parameter may be sent to (the True flags of MODEL_REASONING);
     # DRA_REASONING_CAPABLE replaces the list.
     reasoning_capable: list[str] = field(
@@ -664,6 +679,24 @@ class ResearchConfig:
             )
             reasoning_effort = cls.reasoning_effort
 
+        provider_sort = str(_pick(
+            c, "provider_sort", env="DRA_PROVIDER_SORT", default=cls.provider_sort,
+        )).strip().lower()
+        if provider_sort not in _PROVIDER_SORTS:
+            log.warning(
+                "unknown provider_sort %r — keeping OpenRouter's load balancing (allowed: %s)",
+                provider_sort, ", ".join(sorted(v or '""' for v in _PROVIDER_SORTS)),
+            )
+            provider_sort = cls.provider_sort
+        # 0 = off; anything else is a multiplier of the cheapest price, so never below 1.
+        provider_max_price_factor = float(_pick(
+            c, "provider_max_price_factor", env="DRA_PROVIDER_MAX_PRICE_FACTOR",
+            default=cls.provider_max_price_factor))
+        if provider_max_price_factor > 0:
+            provider_max_price_factor = max(1.0, provider_max_price_factor)
+        else:
+            provider_max_price_factor = 0.0
+
         return cls(
             openai_api_key=openai_key,
             base_url=base_url,
@@ -681,6 +714,20 @@ class ResearchConfig:
                 default=cls.max_output_tokens))),
             reasoning_effort=reasoning_effort,
             reasoning_capable=[s.strip().lower() for s in capable if str(s).strip()],
+            provider_min_throughput=max(0.0, float(_pick(
+                c, "provider_min_throughput", env="DRA_PROVIDER_MIN_THROUGHPUT",
+                default=cls.provider_min_throughput))),
+            provider_max_latency=max(0.0, float(_pick(
+                c, "provider_max_latency", env="DRA_PROVIDER_MAX_LATENCY",
+                default=cls.provider_max_latency))),
+            provider_sort=provider_sort,
+            provider_max_price_factor=provider_max_price_factor,
+            provider_min_uptime=min(100.0, max(0.0, float(_pick(
+                c, "provider_min_uptime", env="DRA_PROVIDER_MIN_UPTIME",
+                default=cls.provider_min_uptime)))),
+            provider_routing_ttl=max(0.0, float(_pick(
+                c, "provider_routing_ttl", env="DRA_PROVIDER_ROUTING_TTL",
+                default=cls.provider_routing_ttl))),
             request_timeout=float(
                 _pick(
                     c,

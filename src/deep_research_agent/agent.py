@@ -32,6 +32,7 @@ from .model_errors import ModelBackoffMiddleware, SubagentFailureMiddleware
 from .models import build_chat_model
 from .prompts import (coding_prompt, describe_mcp_sources, extract_prompt,
                       orchestrator_prompt, skills_block, subagent_prompt)
+from .provider_routing import resolve as resolve_routing
 from .report_gate import ReportQualityGateMiddleware
 from .script_artifacts import ExecuteArtifactsMiddleware, ScriptArtifactsMiddleware
 from .skill_usage import SkillUsageMiddleware
@@ -164,16 +165,22 @@ async def make_graph(config: dict | None = None):
     # Both must be tool-capable. report_model is reserved for a future dedicated
     # synthesis step — using it (often a cheap "nano") for the tool loop makes the
     # agent skip tools and terminate early.
-    research_model = build_chat_model(cfg.research_model, cfg)
+    # Per-model OpenRouter provider routing (price cap, ignore list, speed preference) from
+    # the live endpoint feed — see provider_routing.py. Cached; unreachable = soft prefs only.
+    routing = await resolve_routing(cfg, (cfg.research_model, cfg.subagent_model,
+                                          cfg.utility_model, cfg.compaction_model,
+                                          cfg.coding_model))
+    research_model = build_chat_model(cfg.research_model, cfg, routing.get(cfg.research_model))
     # Always a fresh build — never alias the orchestrator's instance on string-equal
     # ids, so future per-tier kwargs (temperature, callbacks) can't be silently shared.
-    subagent_model = build_chat_model(cfg.subagent_model, cfg)
+    subagent_model = build_chat_model(cfg.subagent_model, cfg, routing.get(cfg.subagent_model))
     # The extract-subagent's model (map/extract over offloaded files).
-    utility_model = build_chat_model(cfg.utility_model, cfg)
+    utility_model = build_chat_model(cfg.utility_model, cfg, routing.get(cfg.utility_model))
     # The compaction summarizer's model — rare, input-heavy, quality over depth.
-    compaction_model = build_chat_model(cfg.compaction_model, cfg)
+    compaction_model = build_chat_model(cfg.compaction_model, cfg,
+                                        routing.get(cfg.compaction_model))
     # The coding-subagent's model: a dedicated coder on a small input (below).
-    coding_model = build_chat_model(cfg.coding_model, cfg)
+    coding_model = build_chat_model(cfg.coding_model, cfg, routing.get(cfg.coding_model))
     log.info("models: research=%s subagent=%s utility=%s compaction=%s coding=%s",
              cfg.research_model, cfg.subagent_model, cfg.utility_model,
              cfg.compaction_model, cfg.coding_model)
