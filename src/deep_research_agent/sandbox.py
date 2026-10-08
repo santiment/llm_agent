@@ -125,10 +125,14 @@ class HttpSandboxBackend(BaseSandbox):
     def id(self) -> str:
         return self._id
 
-    def _reset_session(self, why: str) -> str:
-        """Forget a dead session and open (and re-seed) a fresh one. Files are lost; the
-        caller tells the model so via ``_RESET_NOTE``."""
+    def _reset_session(self, dead: str, why: str) -> str:
+        """Forget the dead session ``dead`` and open (and re-seed) a fresh one. Files are
+        lost; the caller tells the model so via ``_RESET_NOTE``. Parallel sub-agents hit a
+        dead session together: only the first resets, the rest reuse its replacement
+        instead of discarding it (and whatever was already written there)."""
         with self._lock:
+            if self._session_id not in (None, dead):
+                return self._session_id
             old, self._session_id = self._session_id, None
         log.warning("sandbox session %s is gone (%s) — opening a fresh one; files written "
                     "earlier in this run are lost", old, why[:200])
@@ -157,7 +161,7 @@ class HttpSandboxBackend(BaseSandbox):
                 raise
             why = str(exc)
         # Dead session: one fresh session, one retry, and the model is told what happened.
-        sid = self._reset_session(why)
+        sid = self._reset_session(sid, why)
         res = self._exec_once(sid, command, secs)
         return ExecuteResponse(output=_RESET_NOTE + res.output, exit_code=res.exit_code,
                                truncated=res.truncated)

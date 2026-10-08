@@ -17,10 +17,11 @@ import re
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import ToolMessage
 
 from .events import emit
-from .turn import called, current_turn, did_research_work, text_of, tool_call_of
+from .turn import (called, current_turn, did_research_work, final_reply, text_of,
+                   tool_call_of)
 
 log = logging.getLogger("deep_research_agent.clarify")
 
@@ -51,8 +52,8 @@ class ClarificationFallbackMiddleware(AgentMiddleware):
 
     def after_model(self, state: dict, runtime) -> dict[str, Any] | None:
         messages = state.get("messages") or []
-        last = messages[-1] if messages else None
-        if not isinstance(last, AIMessage) or getattr(last, "tool_calls", None):
+        last = final_reply(messages)
+        if last is None:
             return None
         turn = current_turn(messages)
         # Tool path already emitted the event, or this is a report / mid-research stop.

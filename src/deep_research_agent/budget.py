@@ -10,7 +10,7 @@ checked before each model call (scoped to the current turn):
     under both.
 
 Two stages, mirroring ``ForceCompletionMiddleware``'s proven nudge pattern:
-  - SOFT (>= 75% of either ceiling): inject ONE wrap-up instruction so the model stops
+  - SOFT (>= 75% of any ceiling): inject a wrap-up instruction so the model stops
     gathering and calls ``submit_report`` with what it has — a graceful, real partial
     report. Capped at ``MAX_BUDGET_NUDGES`` so it can't loop.
   - HARD (>= the ceiling): jump straight to ``end``. ``ResearchOutputMiddleware`` then

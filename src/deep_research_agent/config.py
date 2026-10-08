@@ -275,9 +275,24 @@ def url_blocked(url: str, *, allow_private: bool) -> str | None:
     return None
 
 
-def _mcp_url_blocked(url: str) -> str | None:
-    """The MCP-config policy: private/loopback allowed (see ``url_blocked``)."""
-    return url_blocked(url, allow_private=True)
+def _resolve_sandbox(c: dict) -> tuple[str, str]:
+    """``(sandbox_url, sandbox_token)``. The deployment's ``LLM_SANDBOX_TOKEN`` is bound
+    to ITS ``LLM_SANDBOX_URL``: a caller that points ``sandbox_url`` elsewhere must bring
+    its own ``sandbox_token`` — otherwise our bearer (and every offloaded tool result)
+    would go to the caller's host. Same key-exfiltration guard as ``base_url``."""
+    env_url = _env("LLM_SANDBOX_URL").rstrip("/")
+    url = str(_pick(c, "sandbox_url", env="LLM_SANDBOX_URL", default="")).rstrip("/")
+    token = str(_pick(c, "sandbox_token", default=""))
+    if not url or url == env_url:
+        return url, token or _env("LLM_SANDBOX_TOKEN")
+    blocked = url_blocked(url, allow_private=True)
+    if blocked:
+        log.warning("refusing sandbox_url %s: %s — sandbox disabled for this run", url, blocked)
+        return "", ""
+    if not token and _env("LLM_SANDBOX_TOKEN"):
+        log.warning("sandbox_url %s overrides LLM_SANDBOX_URL without its own sandbox_token; "
+                    "the deployment's token is not sent to it", url)
+    return url, token
 
 
 def _slug_from_url(url: str) -> str:
@@ -599,6 +614,9 @@ class ResearchConfig:
         # `mcp_config`, `DRA_MCP_SERVERS` (JSON list of {label,url,...}), or a single
         # `DRA_MCP_URL` (+ `DRA_MCP_LABEL`). Each entry may carry a friendly `label`.
         mcp_servers = c.get("mcp_servers") or []
+        # The deployment's DRA_MCP_BEARER goes ONLY to servers the deployment configured:
+        # attached to a caller-supplied URL it would hand our credential to that host.
+        mcp_from_env = False
         if not mcp_servers and c.get("mcp_config"):
             mc = c["mcp_config"]
             # Compat contract: url is a BASE and the client appends "/mcp"
@@ -615,23 +633,27 @@ class ResearchConfig:
                 }
             ]
         if not mcp_servers and _env("DRA_MCP_SERVERS"):
+            mcp_from_env = True
             try:
                 parsed = json.loads(_env("DRA_MCP_SERVERS"))
                 mcp_servers = parsed if isinstance(parsed, list) else []
             except (ValueError, TypeError):
                 mcp_servers = []
         if not mcp_servers and _env("DRA_MCP_URL"):
+            mcp_from_env = True
             mcp_servers = [{"url": _env("DRA_MCP_URL"), "label": _env("DRA_MCP_LABEL")}]
 
         # Normalize URLs, drop SSRF-unsafe targets, derive a connection key + friendly
         # label, attach bearer auth.
-        bearer = _env("DRA_MCP_BEARER")
+        bearer = _env("DRA_MCP_BEARER") if mcp_from_env else ""
         safe_servers: list[dict] = []
+        taken: set[str] = set()
         for s in mcp_servers:
             if s.get("url"):
                 s["url"] = _normalize_mcp_url(s["url"])
             blocked = (
-                _mcp_url_blocked(s.get("url", "")) if s.get("url") else "missing url"
+                # operator MCP URLs may be private/loopback (see url_blocked)
+                url_blocked(s["url"], allow_private=True) if s.get("url") else "missing url"
             )
             if blocked:
                 log.warning(
@@ -640,6 +662,12 @@ class ResearchConfig:
                 continue
             if not s.get("name"):
                 s["name"] = _slug_from_url(s.get("url", "")) or "mcp"
+            # The name is the connection key: two bare hosts both normalize to ".../mcp",
+            # and a duplicate key silently drops the first server.
+            base, n = s["name"], 2
+            while s["name"] in taken:
+                s["name"], n = f"{base}_{n}", n + 1
+            taken.add(s["name"])
             if not (s.get("label") or "").strip():
                 # No explicit label → derive a readable one from the slug name
                 # ("data_provider" -> "Data Provider"), never the generic placeholder.
@@ -709,6 +737,8 @@ class ResearchConfig:
             provider_max_price_factor = max(1.0, provider_max_price_factor)
         else:
             provider_max_price_factor = 0.0
+
+        sandbox_url, sandbox_token = _resolve_sandbox(c)
 
         return cls(
             openai_api_key=openai_key,
@@ -871,12 +901,8 @@ class ResearchConfig:
             offload_dir=_pick(
                 c, "offload_dir", env="DRA_OFFLOAD_DIR", default=cls.offload_dir
             ),
-            sandbox_url=str(
-                _pick(c, "sandbox_url", env="LLM_SANDBOX_URL", default=cls.sandbox_url)
-            ).rstrip("/"),
-            sandbox_token=_pick(
-                c, "sandbox_token", env="LLM_SANDBOX_TOKEN", default=cls.sandbox_token
-            ),
+            sandbox_url=sandbox_url,
+            sandbox_token=sandbox_token,
             sandbox_network=_flag(
                 c,
                 "sandbox_network",

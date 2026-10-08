@@ -48,6 +48,15 @@ _TERMINAL_TOOLS = {"submit_report", "request_clarification"}
 _CALC_TOOLS = {"execute"}
 
 
+def final_reply(messages: list) -> AIMessage | None:
+    """The last message when it is an AI reply with no tool calls — the agent stopping
+    (a report, a handoff, a question, or a stall) — else None: the loop continues."""
+    last = messages[-1] if messages else None
+    if not isinstance(last, AIMessage) or getattr(last, "tool_calls", None):
+        return None
+    return last
+
+
 def turn_anchor_index(messages: list) -> int:
     """Index of the current turn's anchor (the last real HumanMessage), or -1."""
     for i in range(len(messages) - 1, -1, -1):

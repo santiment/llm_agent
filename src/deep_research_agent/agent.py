@@ -38,7 +38,7 @@ from .provider_routing import resolve as resolve_routing
 from .report_gate import ReportQualityGateMiddleware
 from .script_artifacts import ExecuteArtifactsMiddleware, ScriptArtifactsMiddleware
 from .skill_usage import SkillUsageMiddleware
-from .tool_filter import (CODING_EXCLUDED_TOOLS, EXTRACT_EXCLUDED_TOOLS,
+from .tool_filter import (CODING_EXCLUDED_TOOLS, EXECUTE_HINT, EXTRACT_EXCLUDED_TOOLS,
                           ORCHESTRATOR_EXCLUDED_TOOLS, ExcludeToolsMiddleware)
 from .triage import TriageRouterMiddleware
 from .events import instrument_tool, result_handling
@@ -326,23 +326,21 @@ async def make_graph(config: dict | None = None):
     # direct path skips deepagents' default stack, so a nested spec carries its own
     # filesystem stack, then the same middleware as the top-level spec.
     nested_specs: list[dict] = []
-    if sandbox is not None:
+
+    def nested(spec: dict, files_prompt: str) -> dict:
+        # The default filesystem prompt advertises read_file/grep, which the tool filter
+        # may remove — so each nested spec states its own file rules.
         from deepagents.middleware.filesystem import FilesystemMiddleware
         from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
-        from deepagents.middleware.subagents import SubAgentMiddleware
 
-
-        def nested(spec: dict, files_prompt: str) -> dict:
-            # The default filesystem prompt advertises read_file/grep, which the tool filter
-            # may remove — so each nested spec states its own file rules.
-            return {
-                **spec,
-                "middleware": [
-                    FilesystemMiddleware(backend=backend, system_prompt=files_prompt),
-                    PatchToolCallsMiddleware(),
-                    *spec["middleware"],
-                ],
-            }
+        return {
+            **spec,
+            "middleware": [
+                FilesystemMiddleware(backend=backend, system_prompt=files_prompt),
+                PatchToolCallsMiddleware(),
+                *spec["middleware"],
+            ],
+        }
 
     # Utility-model consumer: reads offloaded /workspace result files on the cheapest
     # model. Registered only when offloading is live; the filter hides every built-in
@@ -370,7 +368,7 @@ async def make_graph(config: dict | None = None):
                            *shared_middleware,
                            compaction_for("extract-subagent", cfg.utility_model),
                            *cache_middleware,
-                           ExcludeToolsMiddleware(EXTRACT_EXCLUDED_TOOLS),
+                           ExcludeToolsMiddleware(EXTRACT_EXCLUDED_TOOLS, hint=EXECUTE_HINT),
                            ProviderRoutingFallbackMiddleware("extract-subagent", cfg.utility_model,
                                                              ttl=cfg.provider_routing_ttl),
                            ModelBackoffMiddleware("extract-subagent", cfg.utility_model,
@@ -391,6 +389,8 @@ async def make_graph(config: dict | None = None):
     # ScriptArtifactsMiddleware carries the code itself to the UI out of band. Keeps the
     # file tools (it writes and edits scripts); loses grep/write_todos.
     if sandbox is not None:
+        from deepagents.middleware.subagents import SubAgentMiddleware
+
         coding_spec = {
             "name": "coding-subagent",
             "description": (
@@ -414,7 +414,7 @@ async def make_graph(config: dict | None = None):
                            *shared_middleware,
                            compaction_for("coding-subagent", cfg.coding_model),
                            *cache_middleware,
-                           ExcludeToolsMiddleware(CODING_EXCLUDED_TOOLS),
+                           ExcludeToolsMiddleware(CODING_EXCLUDED_TOOLS, hint=EXECUTE_HINT),
                            ProviderRoutingFallbackMiddleware("coding-subagent", cfg.coding_model,
                                                              ttl=cfg.provider_routing_ttl),
                            ModelBackoffMiddleware("coding-subagent", cfg.coding_model,

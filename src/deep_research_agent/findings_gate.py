@@ -36,7 +36,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from .events import emit
 from .report_hygiene import MAX_QUOTED_POINTS, collapse_data_blocks, dated_points, series_runs
-from .turn import FINDINGS_NUDGE_NAME, count_nudges, text_of
+from .turn import FINDINGS_NUDGE_NAME, count_nudges, final_reply, text_of
 
 log = logging.getLogger("deep_research_agent.findings_gate")
 
@@ -350,10 +350,8 @@ class SubagentFindingsMiddleware(AgentMiddleware):
     @hook_config(can_jump_to=["model"])
     def after_model(self, state: dict, runtime) -> dict[str, Any] | None:
         messages = state.get("messages") or []
-        last = messages[-1] if messages else None
-        if not isinstance(last, AIMessage):
-            return None
-        if getattr(last, "tool_calls", None):
+        last = final_reply(messages)
+        if last is None:
             return None  # still working — the loop continues on its own
         content = text_of(last.content)
         if not content.strip():

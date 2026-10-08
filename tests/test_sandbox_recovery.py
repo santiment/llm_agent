@@ -68,3 +68,13 @@ def test_other_errors_still_raise():
         assert "500" in str(exc)
     else:
         raise AssertionError("a non-session error must propagate")
+
+
+def test_parallel_callers_on_a_dead_session_share_one_replacement():
+    """Two sub-agents hit the same dead session: the second must reuse the first one's
+    replacement, not throw it away (and the files written to it) by resetting again."""
+    b, calls = _backend({"s2": "ok\n"})
+    assert b._ensure_session() == "s1"
+    assert b._reset_session("s1", "first caller") == "s2"
+    assert b._reset_session("s1", "second caller, same dead session") == "s2"
+    assert [c for c in calls if c == ("POST", "/sessions")] == [("POST", "/sessions")] * 2

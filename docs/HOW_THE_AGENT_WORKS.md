@@ -5,7 +5,8 @@
 This document explains the agent end-to-end: what happens when a question comes in, how the work
 is planned and delegated, how data is gathered and turned into analysis, and the guardrails that
 keep a run honest. It is written to be read top-to-bottom by anyone on the team, but each section
-also stands alone.
+also stands alone. To watch one run step through it — lanes per actor, the event stream, and
+what the user sees — open [`how-the-agent-works.html`](how-the-agent-works.html) in a browser.
 
 ---
 
@@ -386,19 +387,26 @@ can decide themselves. Hook points:
 - `awrap_tool_call` — wraps a specific tool call (can intercept/replace it).
 - `after_agent` — runs once when the run ends.
 
-The orchestrator's stack (assembled in `agent.py`, in this order):
+The orchestrator's stack (assembled in `agent.py`, in this order; `SkillUsageMiddleware`, the findings gate and the script capture live on the sub-agents):
 
 | Middleware | Hook | Job |
 |------------|------|-----|
-| **BudgetMiddleware** | `before_model` | Hard backstop against runaway runs. Two ceilings (cumulative tool calls, cumulative tokens). At **75%** it injects one "wrap up and deliver now" nudge; at **100%** it jumps straight to `end`. |
+| **TriageRouterMiddleware** | `before_model` | First on the stack. On the first step of a fresh user turn, a ~250-token call on the research model decides SIMPLE vs RESEARCH; SIMPLE is answered right there and the turn ends without paying the ~12k-token harness. |
+| **LoopGuardMiddleware** | `before_model` / `after_model` | Shared by every role. Repeated identical tool calls get a nudge, then a hard stop (`loop_detected` / `loop_halt`); runaway repetitive output is cut (`runaway_output` / `runaway_halt`). |
+| **ContextCompactionMiddleware** | `before_model` | On every role, one instance per role: the trigger is `compaction_tokens` or `compaction_window_fraction` of that role's model window, whichever is lower. Above it, older messages are summarized on the compaction model; budget counters carry over. |
+| **PromptCacheMiddleware** | `wrap_model_call` | On every role, OpenRouter only: `cache_control` breakpoints on the system prompt and newest messages. |
+| **BudgetMiddleware** | `before_model` | Hard backstop against runaway runs. Three ceilings (cumulative tool calls, cumulative tokens, wall-clock seconds). At **75%** of any it injects a "wrap up and deliver now" nudge (at most `MAX_BUDGET_NUDGES` = 2); at **100%** it jumps straight to `end`. |
 | **ForceCompletionMiddleware** | `after_model` | Prevents premature termination. If the model stops with a bare *"Now I will compare…"* intent message and no tool call mid-research, it nudges the model to act (capped). If the model wrote the whole report as a plain message, one mechanical "resubmit via `submit_report` verbatim" nudge; a raw JSON blob gets a "rewrite as a real report" nudge instead. |
 | **ReportQualityGateMiddleware** | `awrap_tool_call` | Intercepts `submit_report` **before** delivery. If the (scrubbed) report still violates the contract — uncited sources, an internal source split across many Sources lines, raw field names, file paths / file names / "offloaded files" / code calls — it bounces it back **once** with specific fixes. Then delivers as-is. |
 | **ResearchOutputMiddleware** | `after_agent` | Harvests sources, persists the final report into state, and authoritatively classifies *why the run ended* (see §13). Also the salvage path: if the model researched but never called `submit_report`, it recovers genuine report-looking prose (never a JSON blob, never a bare intent stub). |
-| **SkillUsageMiddleware** | `after_model` | Emits a `skill` event the first time each skill is read in a turn. |
 | **ClarificationGuardMiddleware** | `awrap_tool_call` | Blocks `request_clarification` *after* research has begun — so a weak model can't pop a nonsensical question card after minutes of work. Tells it to finish instead. |
 | **ClarificationFallbackMiddleware** | `after_model` | If the model *narrates* clarifying questions as plain text (pre-research) instead of calling the tool, this emits the `clarification` card anyway — so the UI behaves the same regardless of model. |
+| **ExecuteArtifactsMiddleware** | `wrap_tool_call` | Code the orchestrator runs inline through `execute` streams as a `script` event with its real output (it has no file tools, so this is the only trace of it). Also on every worker role. |
 | **UsageMeterMiddleware** | `before_agent` / `after_agent` | Starts the run clock and emits `run_start` (`started_at`); at the end emits the per-run `usage` event and the `RESEARCH USAGE` log line (tool calls, errors, rows/bytes, tokens, model calls, run time). `ResearchOutputMiddleware` reads the same clock, so the end `status` carries the run time in the success and the no-report case alike. |
+| **ExecuteResultGuardMiddleware** | `wrap_tool_call` | Collapses raw rows in an orchestrator `execute` result, as the report scrub does — the one remaining route for data into the expensive context. |
+| **ExcludeToolsMiddleware** | `wrap_model_call` / `wrap_tool_call` | Hides the file tools from the orchestrator (and per-role tools from the workers) and refuses them by name if called anyway. |
 | **SubagentFailureMiddleware** | `awrap_tool_call` | A sub-agent that dies mid-`task` (its model provider throttled past the backoff budget, say) comes back as an **error tool result** naming the sub-agent and the cause — the orchestrator retries the unit once or reports the gap — instead of the exception unwinding the whole run. Also on the research-subagent, which nests the extract / coding workers through its own `task`. |
+| **ProviderRoutingFallbackMiddleware** | `awrap_model_call` | On every role, right outside the backoff. When OpenRouter refuses a call because our routing object (price cap, provider lists) leaves no endpoint the account may use, it retries at once with less of it — price cap, then provider lists, then the whole object — and remembers the level that worked per model. |
 | **ModelBackoffMiddleware** | `awrap_model_call` | Last on **every** role (one instance per role, so its `status` events name role + model). A retryable model error (429 / 5xx / timeout / connection) is waited out — `Retry-After`, else capped exponential backoff — and the call repeated until cumulative waiting would exceed `model_rate_limit_max_wait`; then the error stands. The SDK's own `max_retries` only covers sub-second blips; this is what survives a shared provider pool throttling for tens of seconds. |
 | **SandboxCleanupMiddleware** | `after_agent` | Destroys the run's sandbox session (only present when a sandbox is configured). |
 
@@ -561,7 +569,7 @@ All overridable per-run (`configurable`) or via env var; defaults shown.
 | `offload_results` | `DRA_OFFLOAD_RESULTS` | true | offload large results to a file vs truncate |
 | `offload_dir` | `DRA_OFFLOAD_DIR` | `/workspace/data` | where offloaded results land (inside the sandbox) |
 | sandbox | `LLM_SANDBOX_URL` (+ `_TOKEN`) | unset | enables `execute`; unset → no code execution |
-| sandbox network / timeout | `LLM_SANDBOX_NETWORK`, `LLM_SANDBOX_SESSION_TIMEOUT` | false / 900 | outbound network from inside the sandbox; session lifetime (s) |
+| sandbox network / timeout | `LLM_SANDBOX_NETWORK`, `LLM_SANDBOX_SESSION_TIMEOUT` | false / 5400 | outbound network from inside the sandbox; session lifetime (s) — must outlive `max_run_seconds`; the sandbox service clamps it to its `SANDBOX_MAX_SESSION_SECONDS` (default 3600) |
 | skills dir | `DRA_SKILLS_DIR` | `./skills` | read-only skills mount |
 | custom tools dir | `DRA_CUSTOM_TOOLS_DIR` | `./custom_tools` | drop-in tools |
 | `domain_prompt` | `DRA_DOMAIN_PROMPT` / `_FILE` | empty | deployment-specific text appended to both system prompts (§4); the `_FILE` variant reads it from a path |

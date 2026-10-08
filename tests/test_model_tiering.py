@@ -272,6 +272,17 @@ def test_non_caching_models_are_rejected() -> None:
     assert not cfg.caches_prompts("some/unreleased-model-v9")
     assert cfg.caches_prompts("deepseek/deepseek-v4-flash-0731")
 
+def test_walkthrough_page_mirrors_model_tiers() -> None:
+    # docs/how-the-agent-works.html shows the models per tier from an embedded copy of
+    # MODEL_TIERS (a static page cannot import config.py) — fail when the two drift.
+    import json
+
+    page = (Path(__file__).resolve().parents[1] / "docs" / "how-the-agent-works.html").read_text()
+    block = re.search(r'<script type="application/json" id="model-tiers">(.*?)</script>', page, re.S)
+    assert block, "model-tiers JSON block missing from the walkthrough page"
+    assert json.loads(block.group(1)) == MODEL_TIERS
+
+
 if __name__ == "__main__":
     test_model_tier_package_selects_all_three()
     test_bare_config_defaults_to_cheapest_tier()
@@ -289,4 +300,5 @@ if __name__ == "__main__":
     test_reasoning_param_reaches_only_capable_models()
     test_no_tier_may_name_a_model_that_cannot_cache()
     test_non_caching_models_are_rejected()
+    test_walkthrough_page_mirrors_model_tiers()
     print("OK — tier-only model selection verified.")
