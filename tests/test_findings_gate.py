@@ -15,6 +15,8 @@ and is also pytest-discoverable. No network, no API keys.
 
 from __future__ import annotations
 
+import json
+
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from deep_research_agent.findings_gate import (
@@ -321,3 +323,80 @@ def test_a_fence_without_a_newline_still_counts_as_the_bare_object() -> None:
     work = [HumanMessage("u"), ToolMessage("r", tool_call_id="1")]
     assert SubagentFindingsMiddleware().after_model(
         make_state(*work, AIMessage("```json" + VALID + "```")), None) is None
+
+
+# --- batched briefs: two or three closely related questions, each answered or gapped by tag ----
+
+def test_brief_questions_reads_the_numbered_tags_from_the_brief_only() -> None:
+    from deep_research_agent.findings_gate import brief_questions
+
+    brief = HumanMessage("FILE: /workspace/x.json\nQUESTIONS:\n  Q1: themes\n  Q2: claims\n Q3) split\n")
+    assert brief_questions([brief, ToolMessage("rows", tool_call_id="1")]) == ["Q1", "Q2", "Q3"]
+    assert brief_questions([HumanMessage("QUESTION: themes only")]) == []
+    nudge = HumanMessage("Q1: this is a nudge, not the brief", name=FINDINGS_NUDGE_NAME)
+    assert brief_questions([nudge, HumanMessage("Q2: real brief")]) == ["Q2"]
+    assert brief_questions([HumanMessage("Q1: a\nQ4: beyond the batch cap\nQ1: again")]) == ["Q1"]
+    assert brief_questions([HumanMessage("- **Q1**: bold\n(Q2) bracketed\nsee Q3 mid-sentence")]) == ["Q1", "Q2"]
+
+
+def test_coverage_needs_a_tagged_finding_or_gap_per_question() -> None:
+    from deep_research_agent.findings_gate import coverage_problems
+
+    obj = {"summary": "s", "findings": [{"finding": "Q1: ETF talk dominates (41 msgs)", "source": "S"}],
+           "gaps": ["Q2: not determinable — no price targets named"]}
+    assert coverage_problems(obj, ["Q1", "Q2"]) == []
+    problems = coverage_problems(obj, ["Q1", "Q2", "Q3"])
+    assert len(problems) == 1 and problems[0].startswith("Q3:")
+    assert coverage_problems(obj, []) == []                       # single-question brief: no rule
+    assert coverage_problems(None, ["Q1"]) == []                  # shape problems are reported elsewhere
+    untagged = {"summary": "s", "findings": [{"finding": "ETF talk dominates", "source": "S"}], "gaps": []}
+    assert [p[:6] for p in coverage_problems(untagged, ["Q1", "Q2"])] == ["Q1, Q2"]
+    styled = {"summary": "s", "findings": [{"finding": "**Q1** — ETF talk", "source": "S"}],
+              "gaps": ["(Q2) not determinable"]}
+    assert coverage_problems(styled, ["Q1", "Q2"]) == []
+
+
+def test_batched_brief_bounces_a_skipped_question_once_then_accepts_when_gapped() -> None:
+    mw = SubagentFindingsMiddleware()
+    brief = HumanMessage("FILE: /workspace/x.json\nQUESTIONS:\nQ1: themes\nQ2: claims\nSOURCE LABEL: S")
+    work = [brief, ToolMessage("rows", tool_call_id="1")]
+    partial = AIMessage('{"summary": "themes read", "findings": [{"finding": "Q1: ETF talk (41 msgs)",'
+                        ' "evidence": "41 of 200 random", "source": "S"}], "gaps": []}')
+    update = mw.after_model(make_state(*work, partial), None)
+    assert update and update.get("jump_to") == "model"
+    assert "Q2" in update["messages"][0].content and "Q1" not in update["messages"][0].content.split("Q2")[0][-4:]
+
+    complete = AIMessage('{"summary": "themes read", "findings": [{"finding": "Q1: ETF talk (41 msgs)",'
+                         ' "evidence": "41 of 200 random", "source": "S"}],'
+                         ' "gaps": ["Q2: not determinable — no checkable claims in the sample"]}')
+    with capture_events_cm() as events:
+        accepted = mw.after_model(make_state(*work, complete), None)
+    assert accepted is None                                             # already the bare object: accepted as-is
+    assert [e["type"] for e in events] == ["subagent_findings"]
+
+
+def test_prompts_and_skill_batch_only_closely_related_questions() -> None:
+    from pathlib import Path
+    from deep_research_agent import prompts
+
+    assert "NUMBERED QUESTIONS (`Q1:`–`Q3:` in your task)" in prompts.extract_prompt("")
+    sub = prompts.subagent_prompt("", "")
+    assert "ONE question per task" in sub and "Never more than three per task" in sub
+    assert "two or three CLOSELY RELATED" in prompts.orchestrator_prompt("", "")
+    skill = Path(__file__).resolve().parents[1].joinpath("skills/crowd-positioning/signals.md").read_text()
+    assert "go in ONE\n`task(" in skill and "Q1: <Themes" in skill and "one task each" not in skill
+
+
+def test_after_the_nudge_a_still_skipped_question_becomes_an_explicit_gap() -> None:
+    mw = SubagentFindingsMiddleware()
+    brief = HumanMessage("QUESTIONS:\nQ1: themes\nQ2: claims\nQ3: split\nSOURCE LABEL: S")
+    nudge = HumanMessage("fix it", name=FINDINGS_NUDGE_NAME)
+    still_partial = AIMessage('{"summary": "s", "findings": [{"finding": "Q1: ETF talk (41 msgs)",'
+                              ' "source": "S"}], "gaps": ["Q3: not determinable — too few messages"]}')
+    with capture_events_cm() as events:
+        update = mw.after_model(make_state(brief, ToolMessage("rows", tool_call_id="1"), nudge, still_partial), None)
+    assert update and update.get("jump_to") is None                      # accepted, not bounced again
+    handed = json.loads(update["messages"][0].content.strip("`json\n"))
+    assert handed["gaps"] == ["Q3: not determinable — too few messages",
+                              "Q2: not answered by the extract worker — ask it again in its own task"]
+    assert events[0]["type"] == "subagent_findings" and events[0]["gaps"] == handed["gaps"]

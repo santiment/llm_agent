@@ -70,8 +70,10 @@ def test_coding_subagent_keeps_file_tools_but_not_grep_or_todos(monkeypatch) -> 
     assert len(filters) == 1 and filters[0].excluded == CODING_EXCLUDED_TOOLS
     assert {"grep", "write_todos"} == set(CODING_EXCLUDED_TOOLS)
     assert not {"execute", "write_file", "edit_file", "read_file"} & CODING_EXCLUDED_TOOLS
-    # After tool injection; only the model-call backoff (innermost) sits inside it.
-    assert isinstance(spec["middleware"][-2], ExcludeToolsMiddleware)
+    # After tool injection; only the model-call wrappers (routing fallback, then the
+    # innermost backoff) sit inside it.
+    assert isinstance(spec["middleware"][-3], ExcludeToolsMiddleware)
+    assert type(spec["middleware"][-2]).__name__ == "ProviderRoutingFallbackMiddleware"
     assert isinstance(spec["middleware"][-1], ModelBackoffMiddleware)
     # Not a findings producer: the gate would bounce its STATUS/OUTPUT/NOTES handoff.
     assert not any(isinstance(m, SubagentFindingsMiddleware) for m in spec["middleware"])

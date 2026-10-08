@@ -162,8 +162,9 @@ def test_extract_subagent_hides_everything_but_execute(monkeypatch) -> None:
     assert "execute" not in filters[0].excluded
     # The filter must come AFTER anything that injects tools (deepagents appends spec
     # middleware after its default filesystem stack, so this late in the spec is enough);
-    # only the model-call backoff (innermost, wraps the bare call) sits inside it.
-    assert isinstance(extract["middleware"][-2], ExcludeToolsMiddleware)
+    # only the model-call wrappers (routing fallback, then the innermost backoff) sit inside it.
+    assert isinstance(extract["middleware"][-3], ExcludeToolsMiddleware)
+    assert type(extract["middleware"][-2]).__name__ == "ProviderRoutingFallbackMiddleware"
     assert isinstance(extract["middleware"][-1], ModelBackoffMiddleware)
 
     research = next(s for s in captured["subagents"] if s["name"] == "research-subagent")

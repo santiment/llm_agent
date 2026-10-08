@@ -23,6 +23,8 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from .events import emit
 from .turn import current_turn, text_of
+from .model_errors import (ainvoke_with_routing_fallback, invoke_with_routing_fallback,
+                           model_slug)
 
 log = logging.getLogger("deep_research_agent.triage")
 
@@ -80,6 +82,7 @@ class TriageRouterMiddleware(AgentMiddleware):
         super().__init__()
         self.router = model.with_config(tags=["nostream"])
         self.answerer = model
+        self.slug = model_slug(model)   # for the routing fallback's memo and log lines
 
     # -- shared -----------------------------------------------------------------------
 
@@ -121,8 +124,12 @@ class TriageRouterMiddleware(AgentMiddleware):
             return None
         question, context = routable
         try:
-            verdict = parse_verdict(text_of(self.router.invoke(self._router_input(question, context)).content))
-            answer = self.answerer.invoke(self._answer_input(question, context)) if verdict == "simple" else None
+            resp = invoke_with_routing_fallback(self.router, self._router_input(question, context),
+                                                role="triage", slug=self.slug)
+            verdict = parse_verdict(text_of(resp.content))
+            answer = (invoke_with_routing_fallback(self.answerer, self._answer_input(question, context),
+                                                   role="triage", slug=self.slug)
+                      if verdict == "simple" else None)
         except Exception as exc:  # the router must never take a run down
             log.warning("TRIAGE router failed (%s) — running the full agent", exc)
             return None
@@ -135,9 +142,11 @@ class TriageRouterMiddleware(AgentMiddleware):
             return None
         question, context = routable
         try:
-            resp = await self.router.ainvoke(self._router_input(question, context))
+            resp = await ainvoke_with_routing_fallback(
+                self.router, self._router_input(question, context), role="triage", slug=self.slug)
             verdict = parse_verdict(text_of(resp.content))
-            answer = (await self.answerer.ainvoke(self._answer_input(question, context))
+            answer = (await ainvoke_with_routing_fallback(
+                self.answerer, self._answer_input(question, context), role="triage", slug=self.slug)
                       if verdict == "simple" else None)
         except Exception as exc:
             log.warning("TRIAGE router failed (%s) — running the full agent", exc)

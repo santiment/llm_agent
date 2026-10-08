@@ -22,16 +22,18 @@ from .budget import BudgetMiddleware
 from .caching import PromptCacheMiddleware
 from .citations import ResearchOutputMiddleware
 from .clarify_fallback import ClarificationFallbackMiddleware, ClarificationGuardMiddleware
-from .compaction import ContextCompactionMiddleware
+from .compaction import ContextCompactionMiddleware, compaction_trigger
 from .completion import ForceCompletionMiddleware
 from .config import ResearchConfig
 from .findings_gate import SubagentFindingsMiddleware
 from .loop_guard import LoopGuardMiddleware
 from .metering import RunMeter, SubagentUsageMiddleware, UsageMeterMiddleware
-from .model_errors import ModelBackoffMiddleware, SubagentFailureMiddleware
+from .model_errors import (ModelBackoffMiddleware, ProviderRoutingFallbackMiddleware,
+                           SubagentFailureMiddleware)
 from .models import build_chat_model
 from .prompts import (coding_prompt, describe_mcp_sources, extract_prompt,
                       orchestrator_prompt, skills_block, subagent_prompt)
+from .provider_routing import context_windows
 from .provider_routing import resolve as resolve_routing
 from .report_gate import ReportQualityGateMiddleware
 from .script_artifacts import ExecuteArtifactsMiddleware, ScriptArtifactsMiddleware
@@ -170,17 +172,21 @@ async def make_graph(config: dict | None = None):
     routing = await resolve_routing(cfg, (cfg.research_model, cfg.subagent_model,
                                           cfg.utility_model, cfg.compaction_model,
                                           cfg.coding_model))
-    research_model = build_chat_model(cfg.research_model, cfg, routing.get(cfg.research_model))
+    research_model = build_chat_model(cfg.research_model, cfg, routing.get(cfg.research_model),
+                                      role="orchestrator")
     # Always a fresh build — never alias the orchestrator's instance on string-equal
     # ids, so future per-tier kwargs (temperature, callbacks) can't be silently shared.
-    subagent_model = build_chat_model(cfg.subagent_model, cfg, routing.get(cfg.subagent_model))
+    subagent_model = build_chat_model(cfg.subagent_model, cfg, routing.get(cfg.subagent_model),
+                                      role="research-subagent")
     # The extract-subagent's model (map/extract over offloaded files).
-    utility_model = build_chat_model(cfg.utility_model, cfg, routing.get(cfg.utility_model))
+    utility_model = build_chat_model(cfg.utility_model, cfg, routing.get(cfg.utility_model),
+                                     role="extract-subagent")
     # The compaction summarizer's model — rare, input-heavy, quality over depth.
-    compaction_model = build_chat_model(cfg.compaction_model, cfg,
-                                        routing.get(cfg.compaction_model))
+    compaction_model = build_chat_model(cfg.compaction_model, cfg, routing.get(cfg.compaction_model),
+                                        role="compaction")
     # The coding-subagent's model: a dedicated coder on a small input (below).
-    coding_model = build_chat_model(cfg.coding_model, cfg, routing.get(cfg.coding_model))
+    coding_model = build_chat_model(cfg.coding_model, cfg, routing.get(cfg.coding_model),
+                                    role="coding-subagent")
     log.info("models: research=%s subagent=%s utility=%s compaction=%s coding=%s",
              cfg.research_model, cfg.subagent_model, cfg.utility_model,
              cfg.compaction_model, cfg.coding_model)
@@ -242,14 +248,28 @@ async def make_graph(config: dict | None = None):
     # "execute" appear in legitimate report prose all the time.
     data_tool_names = tuple(sorted(t.name for t in tools))
 
-    # Shared by the orchestrator and every sub-agent (all stateless). Compaction
-    # self-disables at trigger_tokens <= 0; cache breakpoints are OpenRouter-only.
-    shared_middleware: list = [
-        LoopGuardMiddleware(),
-        ContextCompactionMiddleware(compaction_model, trigger_tokens=cfg.compaction_tokens),
-    ]
-    if cfg.prompt_caching and cfg.is_openrouter:
-        shared_middleware.append(PromptCacheMiddleware())
+    # Shared by the orchestrator and every sub-agent (all stateless); cache breakpoints are
+    # OpenRouter-only. Compaction is per ROLE (below): its trigger follows the role model's
+    # context window, so it cannot be one shared instance.
+    shared_middleware: list = [LoopGuardMiddleware()]
+    cache_middleware: list = ([PromptCacheMiddleware()]
+                              if cfg.prompt_caching and cfg.is_openrouter else [])
+    # Context windows from the same endpoint feed the routing read (cached): the trigger is
+    # compaction_tokens or compaction_window_fraction of the role model's window, whichever
+    # is lower — a smaller-window model in a tier compacts in time without a config edit.
+    # No feed (off OpenRouter, unreachable) -> the absolute alone. Self-disables at 0.
+    windows = await context_windows(cfg, (cfg.research_model, cfg.subagent_model,
+                                          cfg.utility_model, cfg.compaction_model,
+                                          cfg.coding_model), routing)
+
+    def compaction_for(role: str, slug: str) -> ContextCompactionMiddleware:
+        trigger = compaction_trigger(cfg.compaction_tokens, windows.get(slug),
+                                     cfg.compaction_window_fraction)
+        log.info("COMPACTION role=%s model=%s window=%s trigger=%s", role, slug,
+                 f"{windows[slug]:,}" if windows.get(slug) else "unknown",
+                 f"{trigger:,}" if trigger else "off")
+        return ContextCompactionMiddleware(compaction_model, trigger_tokens=trigger,
+                                           summarizer_window=windows.get(cfg.compaction_model))
 
     # A sub-agent owns ONE UNIT of research (e.g. a single entity / period / segment): it makes
     # ALL the calls that unit needs in its OWN context and returns only consolidated dense
@@ -276,9 +296,16 @@ async def make_graph(config: dict | None = None):
                        ScriptArtifactsMiddleware("research-subagent"),
                        ExecuteArtifactsMiddleware("research-subagent"),
                        *shared_middleware,
+                       compaction_for("research-subagent", cfg.subagent_model),
+                       *cache_middleware,
                        # It delegates to the extract / coding sub-agents through its own
                        # `task`: one of those dying must not take this unit down.
                        SubagentFailureMiddleware(),
+                       # A call OpenRouter refuses over our own routing object (price cap,
+                       # ignore list) is retried with less of it — a model we name can be
+                       # slow or pricey for a while, never unreachable by our preference.
+                       ProviderRoutingFallbackMiddleware("research-subagent", cfg.subagent_model,
+                                                         ttl=cfg.provider_routing_ttl),
                        # LAST on every role: a throttled provider is waited out (budgeted)
                        # before a model error stands, and a retry re-runs only the call.
                        ModelBackoffMiddleware("research-subagent", cfg.subagent_model,
@@ -341,7 +368,11 @@ async def make_graph(config: dict | None = None):
                            # only way that code reaches the UI.
                            ExecuteArtifactsMiddleware("extract-subagent"),
                            *shared_middleware,
+                           compaction_for("extract-subagent", cfg.utility_model),
+                           *cache_middleware,
                            ExcludeToolsMiddleware(EXTRACT_EXCLUDED_TOOLS),
+                           ProviderRoutingFallbackMiddleware("extract-subagent", cfg.utility_model,
+                                                             ttl=cfg.provider_routing_ttl),
                            ModelBackoffMiddleware("extract-subagent", cfg.utility_model,
                                                   max_wait=cfg.model_rate_limit_max_wait)],
         }
@@ -381,7 +412,11 @@ async def make_graph(config: dict | None = None):
                            ScriptArtifactsMiddleware("coding-subagent", scrub=True),
                            ExecuteArtifactsMiddleware("coding-subagent"),
                            *shared_middleware,
+                           compaction_for("coding-subagent", cfg.coding_model),
+                           *cache_middleware,
                            ExcludeToolsMiddleware(CODING_EXCLUDED_TOOLS),
+                           ProviderRoutingFallbackMiddleware("coding-subagent", cfg.coding_model,
+                                                             ttl=cfg.provider_routing_ttl),
                            ModelBackoffMiddleware("coding-subagent", cfg.coding_model,
                                                   max_wait=cfg.model_rate_limit_max_wait)],
         }
@@ -408,6 +443,8 @@ async def make_graph(config: dict | None = None):
         # Compaction must run before BudgetMiddleware so the budget check sees the shrunk
         # transcript plus the compacted_* counters.
         *shared_middleware,
+        compaction_for("orchestrator", cfg.research_model),
+        *cache_middleware,
         # Hard backstop against runaway runs: cumulative tool-call + token ceilings,
         # soft wrap-up nudge then hard stop.
         BudgetMiddleware(
@@ -454,6 +491,8 @@ async def make_graph(config: dict | None = None):
         # (a 429 on the sub-agent model did exactly that). Backoff LAST (see the sub-agent
         # spec): a retry re-runs the model call only, not the request rewrites above.
         SubagentFailureMiddleware(),
+        ProviderRoutingFallbackMiddleware("orchestrator", cfg.research_model,
+                                          ttl=cfg.provider_routing_ttl),
         ModelBackoffMiddleware("orchestrator", cfg.research_model,
                                max_wait=cfg.model_rate_limit_max_wait),
     ]

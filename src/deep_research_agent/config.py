@@ -458,7 +458,20 @@ class ResearchConfig:
     # In-flight context compaction (compaction.py): an estimated context above this many
     # tokens summarizes older messages on compaction_model. Absolute, since an OpenRouter slug
     # does not expose its window; 0 disables. DRA_COMPACTION_TOKENS.
-    compaction_tokens: int = 100_000
+    # 800k = ~80% of the smallest window any tier slot has (every slot model is 1M+ on
+    # OpenRouter's feed, 2026-09-11; re-check when a tier changes). The 200k headroom covers
+    # one step's growth between checks, the response, and the chars/4 estimate's error.
+    # Compacting far below the window (the old 100k) bought nothing: with prompt caching a
+    # re-sent context is billed at the cache-read rate, while each compaction is a
+    # full-price summarizer call that loses detail and, with a fat tail, re-fired every
+    # couple of steps. NOTE max_total_tokens: the budget sums every call's total tokens,
+    # cached or not, so a context near this trigger spends 4M in ~5 steps.
+    compaction_tokens: int = 800_000
+    # ... and never above this fraction of the ROLE model's context window, read per model
+    # from OpenRouter's endpoint feed at graph build (no feed: the absolute alone). So a
+    # 256k-window model in a tier compacts at ~205k without anyone editing a number. 0 turns
+    # the window rule off. DRA_COMPACTION_WINDOW_FRACTION.
+    compaction_window_fraction: float = 0.8
     # cache_control breakpoints on every model request (caching.py); OpenRouter only.
     # DRA_PROMPT_CACHING.
     prompt_caching: bool = True
@@ -823,6 +836,9 @@ class ResearchConfig:
                     default=cls.compaction_tokens,
                 )
             ),
+            compaction_window_fraction=min(1.0, max(0.0, float(_pick(
+                c, "compaction_window_fraction", env="DRA_COMPACTION_WINDOW_FRACTION",
+                default=cls.compaction_window_fraction)))),
             prompt_caching=_flag(
                 c,
                 "prompt_caching",

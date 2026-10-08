@@ -29,6 +29,7 @@ from .completion import MAX_NUDGES
 from .events import domain_of, emit
 from .metering import fmt_elapsed
 from .report_hygiene import collapse_data_blocks, lint_citations, scrub_report
+from .tools.report import deliver_charts
 from .turn import (NUDGE_NAME, called, count_nudges, current_turn, did_research_work,
                    is_json_object_dump, looks_delivered, raw_text, text_of,
                    tool_calls_of)
@@ -121,6 +122,7 @@ class ResearchOutputMiddleware(AgentMiddleware):
 
         # submit_report already emitted the live `report` event; only emit on fallback.
         if report and not via_tool:
+            report = deliver_charts(report)
             emit({"type": "report", "markdown": report})
 
         # ---- Authoritative end-of-run determination: EXACTLY why the turn ended ----

@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 
-from deep_research_agent.events import instrument_tool
+from deep_research_agent.events import emit_placed_charts, instrument_tool, stashed_chart
 from deep_research_agent.tools.report import build_submit_report_tool
 from test_series import santiment
 from conftest import EmptyArgs, capture_events_cm
@@ -137,46 +138,59 @@ def test_small_non_series_mcp_block_still_passes_through_inline():
     assert _run(_mcp_blocks(ranking), offload_sink=sink) == ranking and sink.files == []
 
 
-# ---- the chart artifact: same detection as the offload, one event per tool result ------
+# ---- the chart artifact: same detection as the offload, one per tool result — HELD, not
+# emitted (a UI that renders chart events on arrival made a card of every fetched series);
+# it reaches the UI only when a report places it (test_chart_placement.py). -----------------
 
 def _charts(events):
     return [e for e in events if e["type"] == "chart"]
 
 
-def test_offloaded_series_also_ships_a_chart_artifact():
+def _chart_ids(out: str) -> list[str]:
+    return re.findall(r"^chart: ([0-9a-f]{8})", out, re.M)
+
+
+def test_offloaded_series_holds_a_chart_artifact_and_names_it():
     with capture_events_cm() as events:
         out = _run(santiment(), offload_sink=_Sink(), offload_dir="/workspace/data",
                    source_label="Santiment")
     assert out.startswith("[Time series saved to a file")      # model still gets the stub
-    charts = _charts(events)
-    assert len(charts) == 1
+    assert _charts(events) == []                                # fetching is not showing
+    ids = _chart_ids(out)
+    assert len(ids) == 1
     # The stub names the chart, so a finding/report can place it instead of the rows.
-    assert f"chart: {charts[0]['id']}" in out and f"[chart:{charts[0]['id']}]" in out
-    one = charts[0]["series"][0]
+    assert f"[chart:{ids[0]}]" in out
+    chart = stashed_chart(ids[0])
+    one = chart["series"][0]
     # The result names its metric, so the title is metric — slug, not the bare slug.
-    assert charts[0]["label"] == "price_usd — bitcoin" and charts[0]["source"] == "Santiment"
+    assert chart["label"] == "price_usd — bitcoin" and chart["source"] == "Santiment"
     assert one["name"] == "price_usd — bitcoin"
     assert one["n"] == 8 and len(one["data"]) == 8              # every point reaches the UI
     assert one["summary"]["first"] == 79000 and one["summary"]["direction"] == "flat"
+    # Placing it is what emits it.
+    with capture_events_cm() as events:
+        assert emit_placed_charts(ids) == (ids, [])
+    assert [e["id"] for e in _charts(events)] == ids
 
 
-def test_series_without_a_sandbox_still_ships_a_chart():
-    # No sandbox: the rows stay in the model's text, but the reader still gets the chart.
+def test_series_without_a_sandbox_still_holds_a_chart():
+    # No sandbox: the rows stay in the model's text, but the chart is there to place.
     with capture_events_cm() as events:
         out = _run(santiment())
-    assert len(_charts(events)) == 1 and f"[chart:{_charts(events)[0]['id']}]" in out
+    ids = _chart_ids(out)
+    assert len(ids) == 1 and f"[chart:{ids[0]}]" in out and stashed_chart(ids[0])
+    assert _charts(events) == []
 
 
-def test_a_row_dump_ships_no_chart():
-    # Offloaded for size, but nothing to plot: no artifact.
+def test_a_row_dump_holds_no_chart():
+    # Offloaded for size, but nothing to plot: no artifact, no id.
     rows = json.dumps([{"slug": f"c{i}", "rank": i} for i in range(2000)])
     with capture_events_cm() as events:
         out = _run(rows, offload_sink=_Sink(), max_result_rows=1000, max_result_chars=60_000)
     assert out.startswith("[Large result saved to a file")
-    assert _charts(events) == []
+    assert _charts(events) == [] and _chart_ids(out) == []
 
 
-def test_one_tool_result_ships_exactly_one_chart_event():
-    with capture_events_cm() as events:
-        _run(santiment(), offload_sink=_Sink())
-    assert len(_charts(events)) == 1                            # not one per series, one per result
+def test_one_tool_result_holds_exactly_one_chart():
+    out = _run(santiment(), offload_sink=_Sink())
+    assert len(_chart_ids(out)) == 1                            # not one per series, one per result

@@ -32,7 +32,7 @@ def provider_preferences(cfg: ResearchConfig) -> dict:
 
 
 def build_chat_model(model_id: str, cfg: ResearchConfig,
-                     provider: dict | None = None) -> ChatOpenAI:
+                     provider: dict | None = None, role: str = "") -> ChatOpenAI:
     # Some OpenRouter models (e.g. deepseek-v4-flash) emit off-spec streaming chunks that
     # LangChain merges into DOUBLED metadata (finish_reason "stopstop", doubled model_name)
     # and DROP tool_calls — which stalls the ReAct loop. Force streaming off for those.
@@ -80,6 +80,11 @@ def build_chat_model(model_id: str, cfg: ResearchConfig,
         api_key=cfg.openai_api_key or "missing-key",
         base_url=cfg.base_url,
         temperature=cfg.temperature,
+        # Run metadata rides every chunk on the `messages` stream (LangGraph merges the
+        # model's config metadata into the chunk's), so a UI can tell WHOSE tokens these
+        # are: the orchestrator narrates for the reader; a coding- or extract-subagent's
+        # final message is a handoff to its caller (STATUS/OUTPUT/NOTES), not prose to show.
+        metadata={"role": role} if role else None,
         # Per-call output cap (DRA_MAX_OUTPUT_TOKENS): the bound on a runaway response —
         # see ResearchConfig.max_output_tokens. None = no cap.
         max_tokens=cfg.max_output_tokens or None,

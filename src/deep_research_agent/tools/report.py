@@ -11,14 +11,32 @@ import logging
 
 from langchain_core.tools import StructuredTool
 
-from ..events import emit
-from ..report_hygiene import chart_refs, collapse_data_blocks, scrub_report
+from ..events import emit, emit_placed_charts
+from ..report_hygiene import chart_refs, collapse_data_blocks, drop_chart_refs, scrub_report
 
 log = logging.getLogger("deep_research_agent.report")
 
 # A report longer than this is almost certainly a raw-row dump, not a synthesis (the
 # 20k-row blow-up was >1M chars). ~50k chars ≈ a very long but legitimate report.
 _MAX_REPORT_CHARS = 50_000
+
+
+def deliver_charts(md: str) -> str:
+    """Emit the held chart artifacts the report places (``[chart:<id>]`` on its own line), in
+    report order, so each precedes the ``report`` event that references it — the only way a
+    chart reaches the UI. A placement the run no longer holds (evicted, expired, never a real
+    id) is removed from the text: the reader gets no dangling token."""
+    refs = chart_refs(md)
+    if not refs:
+        return md
+    placed, missing = emit_placed_charts(refs)
+    if placed:
+        log.info("REPORT: places %d chart artifact(s): %s", len(placed), ", ".join(placed))
+    if missing:
+        log.warning("REPORT: %d chart placement(s) not held (evicted / expired / unknown id), "
+                    "dropped from the text: %s", len(missing), ", ".join(missing))
+        md = drop_chart_refs(md, missing)
+    return md
 
 
 def build_submit_report_tool(tool_names=()) -> StructuredTool:
@@ -47,8 +65,7 @@ def build_submit_report_tool(tool_names=()) -> StructuredTool:
                 "\n\n> _[Report truncated — exceeded the length cap. Summarize and aggregate "
                 "findings (totals, counts, top-N); do not transcribe raw rows.]_\n"
             )
-        if refs := chart_refs(md):
-            log.info("REPORT: places %d chart artifact(s): %s", len(refs), ", ".join(refs))
+        md = deliver_charts(md)
         emit({"type": "report", "markdown": md})
         return (
             "Report delivered to the user. You are DONE — end your turn now. Do not "

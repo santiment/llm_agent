@@ -124,6 +124,15 @@ _FENCED = re.compile(r"```.*?```", re.DOTALL)
 def chart_refs(md: str) -> list[str]:
     """Chart ids a report places (own-line tokens outside code fences), in order, once."""
     return list(dict.fromkeys(CHART_REF.findall(_FENCED.sub("", md or ""))))
+
+
+def drop_chart_refs(md: str, ids) -> str:
+    """Remove the own-line placements of ``ids`` — charts the run no longer holds — so the
+    reader gets no dangling token. Other placements and everything else stay put."""
+    gone = set(ids)
+    if not gone:
+        return md
+    return CHART_REF.sub(lambda m: "" if m.group(1) in gone else m.group(0), md or "")
 _SOURCES_HEADING = re.compile(r"(?im)^\s{0,3}#{1,6}\s*sources\b.*$")
 # A backticked field/identifier (snake_case) — machinery that must not appear in the
 # report body. (Bare tool names are matched by the per-run ``_patterns().bare``.)

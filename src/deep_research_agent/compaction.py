@@ -1,8 +1,11 @@
 """In-flight context compaction: shrink a long transcript instead of dying on the window.
 
-When the estimated size of the next model call crosses ``trigger_tokens`` (absolute, since an
-OpenRouter slug does not expose its window; 0 disables), everything before a recent tail is
-summarized on the tier's compaction model and the history becomes ``[summary, anchor, tail]``. The
+When the estimated size of the next model call crosses ``trigger_tokens`` (0 disables),
+everything before a recent tail is summarized on the tier's compaction model and the history
+becomes ``[summary, anchor, tail]``. The trigger is per ROLE — ``compaction_trigger``: the
+absolute knob (``compaction_tokens``) or ``compaction_window_fraction`` of the role model's
+context window as OpenRouter's endpoint feed reports it, whichever is lower; no feed, the
+absolute alone. The
 summary is a HumanMessage tagged ``COMPACTION_SUMMARY_NAME`` placed BEFORE the turn's anchor
 (the real user message), so ``current_turn()`` keeps working. The dropped tool calls/tokens
 are kept in state keyed to the anchor id (``compacted_counts``) so budget/metering still see
@@ -23,13 +26,15 @@ from typing_extensions import NotRequired
 from .events import emit
 from .turn import (CHARS_PER_TOKEN, COMPACTION_SUMMARY_NAME, current_turn, raw_text,
                    text_of, tokens_in, tool_calls_in, tool_calls_of, turn_anchor_index)
+from .model_errors import (ainvoke_with_routing_fallback, invoke_with_routing_fallback,
+                           model_slug)
 
 log = logging.getLogger("deep_research_agent.compaction")
 
 DEFAULT_KEEP_RECENT = 12       # messages kept verbatim behind the anchor
 _MIN_TO_SUMMARIZE = 6          # fewer messages are not worth a summarizer call
 _MAX_ENTRY_CHARS = 2_000       # transcript bounds for the summarizer input
-_MAX_TRANSCRIPT_CHARS = 400_000
+_MAX_TRANSCRIPT_CHARS = 400_000  # floor; the middleware allows 2 chars per trigger token
 
 _SUMMARY_SYSTEM = """You are compressing a deep-research agent's working context so a \
 successor agent can continue the research seamlessly. Write a DETAILED HANDOFF SUMMARY \
@@ -114,7 +119,11 @@ def _context_estimate(messages: list) -> int:
     return base + chars // CHARS_PER_TOKEN
 
 
-def _transcript(messages: list) -> str:
+def _transcript(messages: list, max_chars: int = _MAX_TRANSCRIPT_CHARS) -> str:
+    """The summarizer's input: every message as a labeled entry cut to ``_MAX_ENTRY_CHARS``,
+    the whole bounded to ``max_chars`` (oldest trimmed). The bound must grow with the
+    trigger — at an 800k-token trigger a fixed 400k chars would hand the summarizer a
+    fraction of the work and the summary would silently drop the rest."""
     lines: list[str] = []
     for m in messages:
         if isinstance(m, SystemMessage):
@@ -126,20 +135,34 @@ def _transcript(messages: list) -> str:
         body = (f"[requested tool calls: {calls}]\n" if calls else "") + _short(text_of(m.content), _MAX_ENTRY_CHARS)
         lines.append(f"--- {label} ---\n{body}")
     text = "\n".join(lines)
-    if len(text) > _MAX_TRANSCRIPT_CHARS:
-        text = "[…oldest messages trimmed…]\n" + text[-_MAX_TRANSCRIPT_CHARS:]
+    if len(text) > max_chars:
+        text = "[…oldest messages trimmed…]\n" + text[-max_chars:]
     return text
+
+
+def compaction_trigger(absolute: int, window: int | None, fraction: float) -> int:
+    """Where compaction fires for one role's model: ``absolute`` (the knob), or ``fraction``
+    of the model's context ``window`` when that is lower. Off (absolute <= 0) stays off; no
+    window, or the window rule off (fraction <= 0), leaves the absolute."""
+    if absolute <= 0:
+        return 0
+    if not window or window <= 0 or fraction <= 0:
+        return int(absolute)
+    return min(int(absolute), int(window * fraction))
 
 
 class ContextCompactionMiddleware(AgentMiddleware):
     state_schema = CompactionState
 
     def __init__(self, model, *, trigger_tokens: int,
-                 keep_recent: int = DEFAULT_KEEP_RECENT) -> None:
+                 keep_recent: int = DEFAULT_KEEP_RECENT,
+                 summarizer_window: int | None = None) -> None:
         super().__init__()
         self.model = model
         self.trigger_tokens = int(trigger_tokens)
         self.keep_recent = max(1, int(keep_recent))
+        # The compaction model's own window (tokens), when known: bounds what we hand it.
+        self.summarizer_window = int(summarizer_window) if summarizer_window else None
 
     def _plan(self, messages: list) -> dict[str, Any] | None:
         """The partition to compact, or None when there is nothing to do."""
@@ -172,9 +195,17 @@ class ContextCompactionMiddleware(AgentMiddleware):
             "dropped_tokens": tokens_in(zone_current),
         }
 
+    def transcript_chars(self) -> int:
+        """Summarizer input bound: 2 chars (~half a token) per trigger token — or per token
+        of the compaction model's own window when that is smaller — never below the floor.
+        ~400k tokens at the 800k default, inside every compaction model's window."""
+        tokens = min(self.trigger_tokens, self.summarizer_window or self.trigger_tokens)
+        return max(_MAX_TRANSCRIPT_CHARS, 2 * tokens)
+
     def _summary_input(self, plan: dict[str, Any]) -> list:
+        transcript = _transcript(plan["summarized"], max_chars=self.transcript_chars())
         return [SystemMessage(content=_SUMMARY_SYSTEM),
-                HumanMessage(content="Transcript to compress:\n\n" + _transcript(plan["summarized"]))]
+                HumanMessage(content="Transcript to compress:\n\n" + transcript)]
 
     def _apply(self, state: dict, plan: dict[str, Any], summary: str) -> dict[str, Any]:
         anchor = plan["anchor"]
@@ -218,7 +249,8 @@ class ContextCompactionMiddleware(AgentMiddleware):
         if plan is None:
             return None
         try:
-            response = self.model.invoke(self._summary_input(plan))
+            response = invoke_with_routing_fallback(self.model, self._summary_input(plan),
+                                                    role="compaction", slug=model_slug(self.model))
         except Exception as exc:
             log.warning("COMPACTION: summarizer failed (%s) — leaving context as-is", exc)
             return None
@@ -229,7 +261,8 @@ class ContextCompactionMiddleware(AgentMiddleware):
         if plan is None:
             return None
         try:
-            response = await self.model.ainvoke(self._summary_input(plan))
+            response = await ainvoke_with_routing_fallback(
+                self.model, self._summary_input(plan), role="compaction", slug=model_slug(self.model))
         except Exception as exc:
             log.warning("COMPACTION: summarizer failed (%s) — leaving context as-is", exc)
             return None

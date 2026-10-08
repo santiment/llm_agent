@@ -35,8 +35,10 @@ in ``EVENT_SCHEMAS`` order:
                           (``{id, name, label, style: "line", pane, data: [{time, value}, …]}``,
                           ``time`` in unix seconds) plus ``n``, ``truncated``, ``summary`` and,
                           up to MAX_CSV_POINTS, ``csv`` (full resolution, for a download
-                          control); ``source`` is the friendly data-source label or "". Emitted
-                          straight from the tool result; the model learns only the ``id``
+                          control); ``source`` is the friendly data-source label or "". Built
+                          when the tool result arrives but HELD: emitted, in report order,
+                          right before the ``report`` event that places it — a chart no report
+                          places never reaches the UI. The model learns only the ``id``
   - ``script``         -> code an agent RAN, as CODE (``language`` + basename ``name``):
                           render it as a COLLAPSED "view script" tab. A file script comes
                           at the worker's handoff; code run inline through ``execute`` comes
@@ -65,7 +67,9 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid
+from collections import OrderedDict
 from contextlib import nullcontext
 from typing import Any, Iterable
 from urllib.parse import urlparse
@@ -130,6 +134,9 @@ STATUS_STATES = frozenset({
     # ``detail``, ``retry``, ``wait_s``, ``waited_s``, ``budget_s``), the budget spent
     # (``retries``, ``waited_s``), and a sub-agent that died mid-`task` (``role``, ``detail``).
     "rate_limited", "model_unavailable", "subagent_failed",
+    # model_errors.py: OpenRouter refused a call over our routing object and it is retried
+    # with less of it (``role``, ``model``, ``detail``, ``step``, ``level``, ``dropped``).
+    "provider_fallback",
 })
 
 
@@ -362,20 +369,20 @@ MAX_CSV_POINTS = 2_000   # above this the event carries no `csv`; the chart stil
 
 # What the model is told about a chart, appended to the tool result the rows left.
 CHART_NOTE = (
-    "chart: {id} — this series is already displayed to the user as a chart. To put it in "
-    "the report or a finding, write [chart:{id}] on its own line where the data belongs. "
-    "Never transcribe the points."
+    "chart: {id} — a chart of this series exists. The reader sees it ONLY where a report or "
+    "finding places [chart:{id}] on its own line; place it only if this exact series is what "
+    "the question is about or the user asked to see it — otherwise leave it unplaced. Never "
+    "transcribe the points."
 )
 
 
-def emit_chart(series: dict, *, source_label: str = "", metric: str = "") -> str:
-    """One ``chart`` event for the series found in a tool result — the same detection that
-    takes the rows out of the model's context. Returns the event id ("" when nothing was
-    emitted): the ONE thing about the chart a model gets to see, so it can place the chart
-    in the report instead of the rows. ``source_label`` is the deployment's friendly source
-    name (MCP ``label``), never a tool name; ``metric`` names the measure when known."""
+def build_chart(series: dict, *, source_label: str = "", metric: str = "") -> dict | None:
+    """The ``chart`` event for the series found in a tool result — the same detection that
+    takes the rows out of the model's context — or None without one. ``source_label`` is the
+    deployment's friendly source name (MCP ``label``), never a tool name; ``metric`` names
+    the measure when known. Not emitted here: see ``stash_chart``."""
     if not series:
-        return ""
+        return None
     labels = list(series)[:MAX_CHART_SERIES]
     payload = []
     for i, label in enumerate(labels):
@@ -396,17 +403,70 @@ def emit_chart(series: dict, *, source_label: str = "", metric: str = "") -> str
         if len(points) <= MAX_CSV_POINTS:
             entry["csv"] = "time,value\n" + "\n".join(f"{iso(t)},{v}" for t, v in points) + "\n"
         payload.append(entry)
-    chart_id = new_id()
-    emit({
+    return {
         "type": "chart",
-        "id": chart_id,
+        "id": new_id(),
         "label": ", ".join(entry["name"] for entry in payload)[:120],
         "source": source_label,
         "kind": "series",
         "series": payload,
         "series_omitted": max(0, len(series) - len(labels)),
-    })
-    return chart_id
+    }
+
+
+# Charts are HELD at fetch time and reach the UI only when a report places them
+# (`[chart:<id>]` on its own line). A run fetches many series it never shows — baselines,
+# context, a sub-agent's detour — and a UI that renders every chart event on arrival made
+# a card of each (seven for one "why did sentiment peak" question). Bounded by count and
+# age so a run that places nothing leaves nothing behind. Module-level like the other
+# caches: the tool wrapper stashes, the report tool (any run, same process) emits.
+MAX_STASHED_CHARTS = 256
+CHART_TTL_S = 4 * 3600
+_CHARTS: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+
+
+def stash_chart(series: dict, *, source_label: str = "", metric: str = "") -> str:
+    """Build the chart for a tool result and hold it for placement. Returns its id ("" when
+    there is nothing to chart): the ONE thing about the chart a model gets to see."""
+    event = build_chart(series, source_label=source_label, metric=metric)
+    if event is None:
+        return ""
+    now = time.monotonic()
+    for cid, (born, _) in list(_CHARTS.items()):     # insertion-ordered: oldest first
+        if now - born <= CHART_TTL_S:
+            break
+        del _CHARTS[cid]
+    while len(_CHARTS) >= MAX_STASHED_CHARTS:
+        _CHARTS.popitem(last=False)
+    _CHARTS[event["id"]] = (now, event)
+    return event["id"]
+
+
+def stashed_chart(chart_id: str) -> dict | None:
+    """The held chart event for ``chart_id``, or None when the run no longer holds it."""
+    hit = _CHARTS.get(chart_id)
+    return hit[1] if hit else None
+
+
+def emit_placed_charts(ids: Iterable[str]) -> tuple[list[str], list[str]]:
+    """Emit the held charts a report places, in the report's order, so each precedes the
+    ``report`` event that references it. Returns ``(placed, missing)`` — a missing id was
+    evicted, expired or never real, and its placement should leave the text. Held charts
+    stay held: a follow-up turn may place the same one again."""
+    placed: list[str] = []
+    missing: list[str] = []
+    for cid in ids:
+        hit = _CHARTS.get(cid)
+        if hit is None:
+            missing.append(cid)
+            continue
+        emit(hit[1])
+        placed.append(cid)
+    return placed, missing
+
+
+def clear_charts() -> None:
+    _CHARTS.clear()
 
 
 def _metric_of(result: Any) -> str:
@@ -685,9 +745,10 @@ def instrument_tool(
                     log.info("RESULT OFFLOADED (%s): %s [raw: %d bytes, rows=%s]",
                              tool.name, note, raw_bytes, raw_rows)
                     series = offloaded_series or series   # for the chart event below
-            # One chart per tool result, offloaded or inline; no-op without series. The
-            # model is told the id so the report can place the chart instead of the rows.
-            chart_id = emit_chart(series, source_label=source_label, metric=metric)
+            # One chart per tool result, offloaded or inline; no-op without series. HELD,
+            # not emitted: the model is told the id, and the chart reaches the UI only if a
+            # report places it (tools/report.deliver_charts) — never because it was fetched.
+            chart_id = stash_chart(series, source_label=source_label, metric=metric)
             note = CHART_NOTE.format(id=chart_id) if chart_id else ""
             if capped is not None and note:
                 result = f"{result}\n{note}"

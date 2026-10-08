@@ -160,3 +160,119 @@ if __name__ == "__main__":
     test_usage_metadata_beats_chars_estimate()
     test_budget_still_bites_after_compaction()
     print("OK — context compaction verified.")
+
+
+# --- the trigger sits near the window; the summarizer's input bound follows it -------------
+
+def test_default_trigger_is_near_the_window_and_transcript_bound_follows() -> None:
+    from deep_research_agent.compaction import _MAX_TRANSCRIPT_CHARS, _transcript
+    from deep_research_agent.config import ResearchConfig
+
+    assert ResearchConfig.compaction_tokens == 800_000       # ~80% of the 1M every tier model has
+    assert _mw(trigger=800_000).transcript_chars() == 1_600_000
+    assert _mw(trigger=5_000).transcript_chars() == _MAX_TRANSCRIPT_CHARS   # never below the floor
+    long = [HumanMessage(content="x" * 1_500) for _ in range(10)]   # ~15k chars of entries
+    assert "trimmed" not in _transcript(long, max_chars=100_000)
+    trimmed = _transcript(long, max_chars=3_000)
+    assert trimmed.startswith("[…oldest messages trimmed…]") and len(trimmed) <= 3_000 + 40
+
+
+# --- the trigger follows the role model's window ----------------------------------------------
+
+def test_compaction_trigger_is_the_lower_of_absolute_and_window_fraction() -> None:
+    from deep_research_agent.compaction import compaction_trigger
+
+    assert compaction_trigger(800_000, 1_048_576, 0.8) == 800_000       # 1M window: absolute wins
+    assert compaction_trigger(800_000, 262_144, 0.8) == 209_715         # 256k window: 80% of it
+    assert compaction_trigger(800_000, None, 0.8) == 800_000            # no feed: absolute alone
+    assert compaction_trigger(800_000, 262_144, 0) == 800_000           # window rule off
+    assert compaction_trigger(0, 262_144, 0.8) == 0                     # off stays off
+
+
+def test_summarizer_bound_respects_the_compaction_models_window() -> None:
+    from deep_research_agent.compaction import _MAX_TRANSCRIPT_CHARS
+
+    assert _mw(trigger=800_000).transcript_chars() == 1_600_000
+    mw = ContextCompactionMiddleware(_FakeModel(), trigger_tokens=800_000, summarizer_window=262_144)
+    assert mw.transcript_chars() == 2 * 262_144                          # the summarizer's window binds
+    mw = ContextCompactionMiddleware(_FakeModel(), trigger_tokens=800_000, summarizer_window=100_000)
+    assert mw.transcript_chars() == _MAX_TRANSCRIPT_CHARS                 # never below the floor
+
+
+def test_window_is_the_smallest_the_routing_admits() -> None:
+    import deep_research_agent.provider_routing as pr
+    from deep_research_agent.config import ResearchConfig
+
+    cfg = ResearchConfig.from_runnable_config({"configurable": {"openai_api_key": "k"}})
+
+    def ep(provider, prompt, completion, ctx, uptime=99.5, status=0):
+        return {"provider_name": provider, "tag": provider.lower(), "status": status,
+                "uptime_last_30m": uptime, "context_length": ctx,
+                "pricing": {"prompt": str(prompt / 1e6), "completion": str(completion / 1e6)}}
+
+    feed = [ep("Cheap", 0.05, 0.16, 1_048_576), ep("Small", 0.06, 0.18, 262_144),
+            ep("Pricey", 0.44, 1.32, 1_310_720), ep("Down", 0.05, 0.16, 131_072, uptime=50, status=-2)]
+    cap = {"max_price": {"prompt": 0.0625, "completion": 0.2}}
+    assert pr.context_window(cfg, feed, cap) == 262_144                   # Cheap + Small admitted
+    assert pr.context_window(cfg, feed, {**cap, "ignore": ["small"]}) == 1_048_576
+    assert pr.context_window(cfg, feed, {}) == 262_144                    # relaxed: every healthy one
+    assert pr.context_window(cfg, feed, {"max_price": {"prompt": 0.01, "completion": 0.01}}) == 262_144  # admits none -> all healthy
+    assert pr.context_window(cfg, [], cap) is None and pr.context_window(cfg, None, cap) is None
+    assert pr.context_window(cfg, [ep("NoCtx", 0.05, 0.16, None)], {}) is None
+
+
+def test_context_windows_is_none_off_openrouter_and_when_the_feed_is_unreachable(monkeypatch) -> None:
+    import deep_research_agent.provider_routing as pr
+    from deep_research_agent.config import ResearchConfig
+
+    async def unreachable(slug, ttl, timeout=5.0):
+        return None
+
+    monkeypatch.setattr(pr, "fetch_endpoints", unreachable)
+    cfg = ResearchConfig.from_runnable_config({"configurable": {"openai_api_key": "k"}})
+    assert asyncio.run(pr.context_windows(cfg, ["a/b", "a/b", "c/d"], {})) == {"a/b": None, "c/d": None}
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
+    local = ResearchConfig.from_runnable_config({"configurable": {"openai_api_key": "k"}})
+    assert not local.is_openrouter
+    assert asyncio.run(pr.context_windows(local, ["a/b"], {})) == {"a/b": None}
+
+
+def test_every_role_gets_its_own_trigger_from_its_models_window(monkeypatch) -> None:
+    import deep_research_agent.provider_routing as pr
+    from conftest import make_graph_capture
+    from deep_research_agent.config import ResearchConfig
+
+    # `high`: planner, fleet, utility, compaction and coder are four distinct models; give the
+    # fleet/compaction model (the same slug) a small window and everything else a big one.
+    config = {"configurable": {"openai_api_key": "k", "mcp_servers": [], "model_tier": "high",
+                               "sandbox_url": "http://sandbox.invalid:8080"}}
+    cfg = ResearchConfig.from_runnable_config(config)
+    assert cfg.subagent_model == cfg.compaction_model != cfg.research_model
+
+    def ep(ctx):
+        return {"provider_name": "P", "tag": "p", "status": 0, "uptime_last_30m": 99.9,
+                "context_length": ctx, "pricing": {"prompt": "0.0000001", "completion": "0.0000004"}}
+
+    async def fake_fetch(slug, ttl, timeout=5.0):
+        return [ep(262_144 if slug == cfg.subagent_model else 1_050_000)]
+
+    monkeypatch.setattr(pr, "fetch_endpoints", fake_fetch)
+    monkeypatch.delenv("LLM_SANDBOX_URL", raising=False)
+    captured = make_graph_capture(monkeypatch, config)
+
+    def compactor(mws):
+        found = [m for m in mws if isinstance(m, ContextCompactionMiddleware)]
+        assert len(found) == 1
+        return found[0]
+
+    orch = compactor(captured["middleware"])
+    assert orch.trigger_tokens == 800_000                                # 1.05M window: absolute wins
+    assert orch.summarizer_window == 262_144                             # the compaction model's own window
+    specs = {s["name"]: compactor(s["middleware"]) for s in captured["subagents"]}
+    assert specs["research-subagent"].trigger_tokens == 209_715           # 80% of its 256k window
+    assert specs["extract-subagent"].trigger_tokens == 800_000
+    assert specs["coding-subagent"].trigger_tokens == 800_000
+    assert all(c.model.model_name == cfg.compaction_model for c in specs.values())  # summarizer stays the tier's
+    # Budget still runs after compaction on the orchestrator (it must see the shrunk transcript).
+    mws = captured["middleware"]
+    assert mws.index(orch) < mws.index(next(m for m in mws if isinstance(m, BudgetMiddleware)))

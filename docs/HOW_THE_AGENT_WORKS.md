@@ -234,6 +234,15 @@ A few important behaviors:
   waits out retryable model errors (429 / 5xx / timeout) within `model_rate_limit_max_wait`
   (`model_errors.py`), and if a sub-agent still dies mid-`task`, the orchestrator receives an error
   tool result — retry the unit or report the gap — rather than the exception ending the run.
+- **A routing preference of ours can never make a model unreachable.** The price cap and ignore
+  list (`provider_routing.py`) are hard on OpenRouter's side, and its account filters run before
+  them on endpoints the public feed lists — a cap anchored on an endpoint the account cannot use
+  leaves nothing and the call 404s (`No endpoints found that satisfy the max price`). The
+  `ProviderRoutingFallbackMiddleware` (`model_errors.py`, right outside the backoff) retries at
+  once with the cap dropped, then the ignore list, then no routing object at all, emits
+  `provider_fallback` per step, and remembers the level per model for the routing TTL so parallel
+  roles and the next graph build start there. The triage router and the compaction summarizer,
+  which call their models outside an agent step, run the same ladder (`invoke_with_routing_fallback`).
 - **Series ship as `chart` artifacts.** When `find_series` detects a time series in a tool result,
   the rows leave the model's context (offloaded to a file) and the same call emits a `chart` event:
   `series[{label, points: [[iso, value], …], n, truncated, summary}]`, downsampled to
@@ -241,9 +250,21 @@ A few important behaviors:
   full-resolution `csv` per series up to `MAX_CSV_POINTS` for a download control. The model learns
   only the event id: the tool result gains a `chart: <id>` line, findings carry `[chart:<id>]`, and
   the report places the chart by writing `[chart:<id>]` on its own line — the UI renders the card
-  there. That is how data reaches the report; rows never do. `source` is the deployment's
+  there. That is how data reaches the report; rows never do. The event is **held, not emitted, at
+  fetch time** (`events.stash_chart`, bounded by count and age): `submit_report` — and the salvage
+  path — emit the held charts the report places, in report order, right before the `report` event
+  (`tools/report.deliver_charts`), and a placement the run no longer holds is dropped from the text.
+  A chart no report places never reaches the UI, whatever the frontend does with chart events on
+  arrival. `source` is the deployment's
   data-source label (MCP `label`), never a tool name. A chart-shaped MCP result that is not a detectable series (e.g.
   the connector's `show_chart`) still streams as an ordinary `tool_result`.
+- **Charts are placed deliberately, never automatically.** Fetching a series is not showing it:
+  the chart id on a result is an offer, and the prompts (`CHARTS` in the orchestrator, `FETCHING
+  IS NOT SHOWING` in the sub-agent) let a chart reach the reader only when that exact series is
+  what the question is about or the user asked to see it — default zero, never the same series
+  twice, never price/volume/market-cap pulled as context, never another entity's series. Display
+  tools such as `show_chart` are called by a sub-agent only when its brief explicitly asks for
+  that chart, so a brief that says nothing about charts renders none.
 
 ---
 
@@ -275,6 +296,12 @@ loop**:
   accepts whatever comes back (prose degrades gracefully — the orchestrator can still read it; the
   gate must never fail a run over formatting).
 - Valid findings are emitted as a `subagent_findings` event so the UI can render a folded table.
+- **Batched briefs.** A brief may carry two or three *closely related* questions on the same file,
+  numbered `Q1:`–`Q3:` (one reading pass answers them all, so the text is read once, not once per
+  question — never more than three, never unrelated ones). The worker starts every finding and gap
+  with its question's tag; the gate requires each numbered question to have a tagged finding or a
+  tagged gap, bounces once otherwise, and after that adds an explicit gap for any question still
+  unanswered so the caller re-asks it in its own task instead of losing it.
 
 The orchestrator reuses each finding's `source` for its inline `[n]` citations and spawns follow-up
 sub-agents for any non-empty `gaps`.
@@ -403,7 +430,7 @@ That's what keeps the agent portable.
 | `subagent_findings` | a folded findings table from a worker |
 | `script` | a collapsed "view script" tab holding code an agent ran: a FILE script (basename + `language` + final source, at the worker's handoff) or INLINE code from an `execute` heredoc / `python3 -c` (`inline.py` + its real `output`, as the call returns, for every role including the orchestrator). The only place a script surfaces: no role names a script path in prose, and the coder's handoff is scrubbed of paths before the orchestrator reads it (`script_artifacts.py`) |
 | `clarification` | the question card (re-enables input) |
-| `status` | lifecycle: `mcp_ready` / `mcp_error` (tool loading), `budget_soft` / `budget_halt` (ceilings), `revising` (a gate bounced a deliverable back), `compacting` / `compacted` (context compaction), `loop_detected` / `loop_halt` (repeated-identical-call guard), `subagent_start` / `subagent_done` (a sub-agent run, with `role` + `model`), `rate_limited` / `model_unavailable` (a throttled or erroring model provider being waited out within `model_rate_limit_max_wait`, then given up on), `subagent_failed` (a sub-agent died mid-`task`; its caller got a tool error and the run continues), then exactly one end-state — `done` or `error`, with a `reason` code and the run time (`elapsed_s` / `elapsed`, also appended to `detail`: "… Run time 4m 12s.") |
+| `status` | lifecycle: `mcp_ready` / `mcp_error` (tool loading), `budget_soft` / `budget_halt` (ceilings), `revising` (a gate bounced a deliverable back), `compacting` / `compacted` (context compaction), `loop_detected` / `loop_halt` (repeated-identical-call guard), `subagent_start` / `subagent_done` (a sub-agent run, with `role` + `model`), `rate_limited` / `model_unavailable` (a throttled or erroring model provider being waited out within `model_rate_limit_max_wait`, then given up on), `provider_fallback` (OpenRouter refused a call over our routing object — price cap / ignore list — and it is retried with less of it; `step`, `level`, `dropped`), `subagent_failed` (a sub-agent died mid-`task`; its caller got a tool error and the run continues), then exactly one end-state — `done` or `error`, with a `reason` code and the run time (`elapsed_s` / `elapsed`, also appended to `detail`: "… Run time 4m 12s.") |
 | `usage` | the per-run usage summary, incl. run time (`elapsed_s`, `elapsed`, `started_at`, `finished_at`) |
 | `report` | the final markdown answer (also persisted in state) |
 
@@ -524,7 +551,8 @@ All overridable per-run (`configurable`) or via env var; defaults shown.
 | MCP servers | `DRA_MCP_SERVERS` / `DRA_MCP_URL` | none | data sources |
 | `max_tool_calls` | `DRA_MAX_TOOL_CALLS` | 200 | runaway-run ceiling |
 | `max_total_tokens` | `DRA_MAX_TOTAL_TOKENS` | 4,000,000 | runaway-run ceiling |
-| `compaction_tokens` | `DRA_COMPACTION_TOKENS` | 100,000 | in-flight context compaction trigger (est. tokens); older messages summarized on the utility model, budget counters carry over; 0 = off |
+| `compaction_tokens` | `DRA_COMPACTION_TOKENS` | 800,000 | absolute in-flight compaction trigger (est. tokens); older messages summarized on the compaction model, budget counters carry over; 0 = off |
+| `compaction_window_fraction` | `DRA_COMPACTION_WINDOW_FRACTION` | 0.8 | per role, compaction fires at this fraction of the role model's context window (OpenRouter endpoint feed) when lower than the absolute; 0 = window rule off |
 | `prompt_caching` | `DRA_PROMPT_CACHING` | true | `cache_control` breakpoints on system prompt + newest messages (OpenRouter only) |
 | `web_fetch` | `DRA_WEB_FETCH` | true | full-page reader tool for sub-agents (big pages offload to the sandbox) |
 | `mcp_max_concurrency` | `DRA_MCP_MAX_CONCURRENCY` | 10 | simultaneous MCP calls cap |

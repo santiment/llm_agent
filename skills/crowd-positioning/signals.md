@@ -227,10 +227,12 @@ print(R.word_novelty(d["stats"]["trend_words"], prior["stats"]["trend_words"]))
 ## Text extraction (utility model via `extract-subagent`)
 
 Reading the message text is the token-heavy part of this skill, so it runs on the cheapest model.
-Do not open the text in your own context (no printing of text fields, no slicing text columns). Send
-one `task(subagent_type="extract-subagent", description=...)` per question — three tasks, in
-parallel, six at the absolute most (per-source splits only for a file over ~5,000 messages). A thin
-answer is not re-asked; it is the finding. The reader sees NOTHING but your description, so make it
+Do not open the text in your own context (no printing of text fields, no slicing text columns). The
+three questions below are closely related and one reading pass answers them all, so they go in ONE
+`task(subagent_type="extract-subagent", description=...)` numbered `Q1:`–`Q3:` (the worker tags
+every finding and gap with its question; a question left with neither is bounced back to it). One
+task per file — two at most, split by `source`, only for a file over ~5,000 messages. A thin answer
+is not re-asked; it is the finding. The reader sees NOTHING but your description, so make it
 self-contained:
 
 ```
@@ -240,7 +242,10 @@ FILE: /workspace/data/social_messages-<call_id>.json — JSON object; the posts 
   file at once.
 SOURCE LABEL: Santiment social messages
 CONTEXT: <coin>, <window>. Candidate themes from trend_words: <theme -> words -> share of volume>.
-QUESTION: <one of the three below>
+QUESTIONS (answer each; start every finding and gap with its tag):
+  Q1: <Themes — below>
+  Q2: <Checkable claims — below>
+  Q3: <Disagreement — below>
 RULES: judge prevalence and mood ONLY from stratum == "random"; use head/poles for the spread and
   the disagreement. Every item carries the number of messages backing it and 1-2 verbatim quotes
   (with `url` when present). A text repeated many times (same words, different numbers/links) is
@@ -250,8 +255,8 @@ RULES: judge prevalence and mood ONLY from stratum == "random"; use head/poles f
   advice.
 ```
 
-The three questions (one task each; for monster windows add `only source == "<source>"` and run one
-task per source, then merge):
+The three questions (one task, Q1–Q3; for monster windows add `only source == "<source>"` and run
+one such task per source, then merge):
 
 - **Themes** — for each candidate theme, one line of what is actually being said and how many
   `random`-stratum messages back it; list any theme present in the text but missing from the
@@ -273,8 +278,11 @@ file it came from is not a source and never appears in a finding.
 - **`trending_stories` / `combined_trends`** — confirm the spike is a real, captured trend and
   cross-check your `trend_words`; the stories also give **linkable source URLs** for the report.
 - **`assets_by_metric`** — the cross-sectional baseline for signal 1 (above).
-- **`show_chart`** (if the Santiment MCP exposes it) — render the social-volume-vs-price overlay so
-  the report carries visual evidence of the spike and how price reacted.
+- **`show_chart`** (if the Santiment MCP exposes it) — a DISPLAY tool, not a data call: use it
+  ONLY when your brief explicitly asks for a rendered chart, and then once — the
+  social-volume-vs-price overlay for the asset under study. Fetching the series already hands the
+  orchestrator a `[chart:<id>]` it can place in the report; do not render charts on your own
+  initiative, never for other assets, and never price / volume / market cap on their own.
 
 ## Notes
 

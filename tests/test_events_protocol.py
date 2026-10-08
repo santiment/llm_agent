@@ -75,7 +75,7 @@ def test_status_states_pinned():
         "compacting", "compacted", "loop_detected", "loop_halt", "done", "error",
         "subagent_start", "subagent_done",
         "triage", "model_call", "runaway_output", "runaway_halt", "sandbox_reset",
-        "rate_limited", "model_unavailable", "subagent_failed",
+        "rate_limited", "model_unavailable", "subagent_failed", "provider_fallback",
     }
 
 
@@ -132,7 +132,8 @@ if __name__ == "__main__":
     print("all event-protocol tests passed")
 
 
-# ---- chart artifacts: the one channel that carries rows to the reader ------------------
+# ---- chart artifacts: the one channel that carries rows to the reader. Built per tool result,
+# HELD until a report places them (test_chart_placement.py) — never emitted at fetch time. -----
 
 def _points(n: int, start: str = "2026-06-01"):
     from datetime import datetime, timedelta, timezone
@@ -143,15 +144,12 @@ def _points(n: int, start: str = "2026-06-01"):
 
 
 def test_chart_event_carries_downsampled_points_and_full_stats():
-    from deep_research_agent.events import MAX_CHART_POINTS, emit_chart
+    from deep_research_agent.events import MAX_CHART_POINTS, build_chart
     from deep_research_agent.series import find_series
 
     series = find_series(_points(1500))
-    with capture_events_cm() as events:
-        emit_chart(series, source_label="Santiment")
-    charts = [e for e in events if e["type"] == "chart"]
-    assert len(charts) == 1
-    chart = charts[0]
+    chart = build_chart(series, source_label="Santiment")
+    assert chart["type"] == "chart"
     assert chart["source"] == "Santiment" and chart["kind"] == "series"
     assert chart["label"] == "bitcoin" and chart["id"]
     one = chart["series"][0]
@@ -166,30 +164,28 @@ def test_chart_event_carries_downsampled_points_and_full_stats():
 
 
 def test_chart_event_keeps_small_series_intact_and_skips_empty():
-    from deep_research_agent.events import emit_chart
+    from deep_research_agent.events import build_chart, stash_chart, stashed_chart
     from deep_research_agent.series import find_series
 
-    with capture_events_cm() as events:
-        chart_id = emit_chart(find_series(_points(30)))
-    chart = [e for e in events if e["type"] == "chart"][0]
-    assert chart_id == chart["id"] and len(chart_id) == 8     # the handle the model is told
+    chart = build_chart(find_series(_points(30)))
+    assert len(chart["id"]) == 8                              # the handle the model is told
     one = chart["series"][0]
     assert one["n"] == 30 and one["truncated"] is False and len(one["data"]) == 30
     assert one["csv"].startswith("time,value\n2026-06-01,") and one["csv"].count("\n") == 31
 
+    assert build_chart({}) is None                            # nothing detected -> no artifact
     with capture_events_cm() as events:
-        assert emit_chart({}) == ""         # nothing detected -> no artifact, no id
-    assert not [e for e in events if e["type"] == "chart"]
+        assert stash_chart({}) == ""                          # ... and no id, nothing held
+        cid = stash_chart(find_series(_points(30)))
+    assert not events and stashed_chart(cid)["id"] == cid     # held, not emitted
 
 
 def test_chart_event_bounds_how_many_series_it_ships():
-    from deep_research_agent.events import MAX_CHART_SERIES, emit_chart
+    from deep_research_agent.events import MAX_CHART_SERIES, build_chart
     from deep_research_agent.series import points_of
 
     rows = _points(12)["data"]["bitcoin"]
     many = {f"asset_{i}": points_of(rows) for i in range(MAX_CHART_SERIES + 5)}
-    with capture_events_cm() as events:
-        emit_chart(many)
-    chart = [e for e in events if e["type"] == "chart"][0]
+    chart = build_chart(many)
     assert len(chart["series"]) == MAX_CHART_SERIES
     assert chart["series_omitted"] == 5

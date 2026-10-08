@@ -28,6 +28,13 @@ Every line you emit is a **signal with a baseline**, never a story. Not "lots of
 exchanges this window)." If a sentence has no number and no comparison, cut it. If a list has more
 than five lines, it is a data dump, not a finding.
 
+**Scope.** This playbook answers *how is the crowd positioned, and is that extreme*. It is NOT the
+recipe for "why did sentiment / social volume peak on <date>" — that is attribution: pin the peak in
+the one series asked about, pull `social_messages` for that window, have `extract-subagent` name the
+drivers with counts and quotes, add the day's news, answer in prose. For such a question apply only
+step 1 (the messages) and the extract step; skip signals 1–4, pull no baseline metrics, render no
+chart, unless the brief asks for positioning or the user asked to see one.
+
 ## When to use
 
 A token is trending or its social dominance/volume spiked (now or a named past window) and the user

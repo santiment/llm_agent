@@ -35,10 +35,12 @@ def test_orchestrator_hides_file_tools_but_keeps_execute(monkeypatch):
     assert {"ls", "read_file", "write_file", "edit_file", "glob", "grep"} == set(ORCHESTRATOR_EXCLUDED_TOOLS)
     assert "execute" not in ORCHESTRATOR_EXCLUDED_TOOLS and "task" not in ORCHESTRATOR_EXCLUDED_TOOLS
     # After tool injection: past the filter sit only the failure isolation for `task`,
-    # the model-call backoff (innermost, wraps the bare call) and the sandbox cleanup.
+    # the model-call wrappers (routing fallback, then the innermost backoff) and the
+    # sandbox cleanup.
     after = captured["middleware"][captured["middleware"].index(filters[0]) + 1:]
     assert {type(m).__name__ for m in after} <= {
-        "SubagentFailureMiddleware", "ModelBackoffMiddleware", "SandboxCleanupMiddleware"}
+        "SubagentFailureMiddleware", "ProviderRoutingFallbackMiddleware",
+        "ModelBackoffMiddleware", "SandboxCleanupMiddleware"}
     assert any(isinstance(m, SubagentFailureMiddleware) for m in after)
     assert any(isinstance(m, ModelBackoffMiddleware) for m in after)
     # Its `execute` results are scrubbed of raw rows before they reach its context — the

@@ -188,6 +188,68 @@ def _data_dump_problems(where: str, obj: dict) -> list[str]:
     return out
 
 
+# A brief may batch two or three CLOSELY RELATED questions on one file as `Q1:`..`Q3:` — one
+# reading pass answers them all, so the text is read once instead of once per question. The
+# worker tags every finding and gap with its question; the gate holds it to that: a question
+# with neither is a skipped question, bounced once. Tags beyond Q3 are not a batch (never more
+# than three per task) and are ignored here — the prompts forbid them.
+MAX_BATCHED_QUESTIONS = 3
+# A tag at the start of a line / field, allowing list markers, bold or brackets before it
+# ("- Q1:", "**Q2**", "(Q3)") but never word characters: "Q1" mid-sentence is not a tag.
+_BRIEF_QUESTION = re.compile(rf"^[^\w\n]*Q([1-{MAX_BATCHED_QUESTIONS}])\b", re.MULTILINE)
+_TAGGED = re.compile(rf"^[^\w\n]*(Q[1-{MAX_BATCHED_QUESTIONS}])\b")
+
+
+def _brief(messages: list) -> str:
+    """The sub-agent's brief: the first real (non-nudge) human message."""
+    for m in messages:
+        if isinstance(m, HumanMessage) and getattr(m, "name", None) != FINDINGS_NUDGE_NAME:
+            return text_of(m.content)
+    return ""
+
+
+def brief_questions(messages: list) -> list[str]:
+    """The question tags the brief numbers (``Q1``..``Q3``), in order; [] for a
+    single-question brief."""
+    return list(dict.fromkeys(f"Q{n}" for n in _BRIEF_QUESTION.findall(_brief(messages))))
+
+
+def coverage_problems(obj: dict | None, tags: list[str]) -> list[str]:
+    """Every numbered question needs a finding OR a gap that starts with its tag."""
+    if not tags or not isinstance(obj, dict):
+        return []
+    covered: set[str] = set()
+    for f in obj.get("findings") or []:
+        m = _TAGGED.match(str(f.get("finding") or "")) if isinstance(f, dict) else None
+        if m:
+            covered.add(m.group(1))
+    for g in obj.get("gaps") or []:
+        m = _TAGGED.match(str(g))
+        if m:
+            covered.add(m.group(1))
+    missing = [t for t in tags if t not in covered]
+    if not missing:
+        return []
+    return [f"{', '.join(missing)}: no finding and no gap starts with this tag. The brief "
+            f"numbered its questions; every finding starts with its question's tag "
+            f"(`Q1: …`) and a question the rows cannot answer gets a gap starting with its "
+            f"tag (`Q2: not determinable — …`). A question with neither was skipped"]
+
+
+def _gap_skipped_questions(obj: dict, tags: list[str]) -> None:
+    """After the nudge is spent: every numbered question with neither a tagged finding nor a
+    tagged gap gets an explicit gap, so the caller re-asks it alone instead of never knowing."""
+    if not coverage_problems(obj, tags):
+        return
+    covered = {m.group(1) for m in (_TAGGED.match(str(f.get("finding") or ""))
+                                    for f in obj.get("findings") or [] if isinstance(f, dict)) if m}
+    covered |= {m.group(1) for m in (_TAGGED.match(str(g)) for g in obj.get("gaps") or []) if m}
+    gaps = obj.get("gaps") if isinstance(obj.get("gaps"), list) else []
+    gaps.extend(f"{t}: not answered by the extract worker — ask it again in its own task"
+                for t in tags if t not in covered)
+    obj["gaps"] = gaps
+
+
 def _unit_label(messages: list) -> str:
     """A short label for the sub-agent's assigned unit — the orchestrator's task
     description, i.e. the first real (non-nudge) human message in the sub-agent's state."""
@@ -299,6 +361,8 @@ class SubagentFindingsMiddleware(AgentMiddleware):
 
         obj = extract_findings(content)
         problems = _problems(obj)
+        # A batched brief (Q1..Q3): each question answered or explicitly gapped, by tag.
+        problems.extend(coverage_problems(obj, brief_questions(messages)))
         # The parent gets the WHOLE message, not the parsed object — a series pasted after
         # the closing brace reached an orchestrator that way. Text outside the object is
         # held to the same standard as a field.
@@ -326,6 +390,9 @@ class SubagentFindingsMiddleware(AgentMiddleware):
             # the object, and hand over the rest.
             if obj is not None:
                 _sanitize(obj)
+                # A batched question still unanswered is a hole the caller must see: name
+                # it as a gap so the question can be re-asked in its own task, not lost.
+                _gap_skipped_questions(obj, brief_questions(messages))
                 log.warning("FINDINGS GATE: nudges exhausted — accepting the sanitized object "
                             "only: %s", problems)
                 _emit_findings_event(messages, obj)
