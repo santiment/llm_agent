@@ -66,6 +66,15 @@ def test_metadata_sandbox_url_disables_the_sandbox():
     assert (cfg.sandbox_url, cfg.sandbox_token) == ("", "")
 
 
+def test_metadata_in_any_spelling_disables_the_sandbox():
+    # The resolver reads every one of these as a cloud-metadata address.
+    for url in ("http://2852039166", "http://0xA9FEA9FE", "http://169.254.43518",
+                "http://[::ffff:169.254.169.254]", "http://metadata.google.internal.",
+                "http://[fd00:ec2::254]"):
+        assert _cfg(_SANDBOX_ENV, sandbox_url=url).sandbox_url == "", url
+    assert _cfg(_SANDBOX_ENV, sandbox_url="http://10.0.0.5:8080").sandbox_url == "http://10.0.0.5:8080"
+
+
 def test_mcp_bearer_goes_to_env_servers_only():
     env = {"DRA_MCP_BEARER": "MCPSECRET", "DRA_MCP_URL": "http://mcp.internal:8000/mcp/data"}
     from_env = _cfg(env).mcp_servers
@@ -74,6 +83,14 @@ def test_mcp_bearer_goes_to_env_servers_only():
     assert "Authorization" not in (from_caller[0].get("headers") or {})
     compat = _cfg(env, mcp_config={"url": "https://evil.example"}).mcp_servers
     assert "Authorization" not in (compat[0].get("headers") or {})
+
+
+def test_explicit_mcp_names_are_reserved_and_duplicates_load_once():
+    servers = _cfg(mcp_servers=[{"url": "http://a:8000"}, {"url": "http://b:9000"},
+                                {"url": "http://c:7000", "name": "mcp_2"},
+                                {"url": "http://a:8000/"}]).mcp_servers
+    assert [(s["url"], s["name"]) for s in servers] == [
+        ("http://a:8000/mcp", "mcp"), ("http://b:9000/mcp", "mcp_3"), ("http://c:7000/mcp", "mcp_2")]
 
 
 def test_mcp_names_are_unique_connection_keys():
@@ -88,6 +105,8 @@ if __name__ == "__main__":
     test_caller_sandbox_url_with_own_token_is_honored()
     test_caller_repeating_env_sandbox_url_keeps_env_token()
     test_metadata_sandbox_url_disables_the_sandbox()
+    test_metadata_in_any_spelling_disables_the_sandbox()
     test_mcp_bearer_goes_to_env_servers_only()
     test_mcp_names_are_unique_connection_keys()
+    test_explicit_mcp_names_are_reserved_and_duplicates_load_once()
     print("OK — credentials stay with the endpoints the deployment configured.")

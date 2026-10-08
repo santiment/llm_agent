@@ -199,7 +199,9 @@ def test_ladder_climbs_to_bare_then_the_error_stands() -> None:
     assert [b.get("provider") for b in sent] == [FULL, pr.relax(FULL, 1), pr.relax(FULL, 2), None]
     assert "provider" not in sent[-1] and sent[-1] == EXTRAS  # bare: OpenRouter's own routing
     assert [e["level"] for e in events if e.get("state") == "provider_fallback"] == [1, 2, 3]
-    assert pr.relaxed_level(SLUG) == 3
+    # Relaxing fixed nothing, so nothing is remembered: an unfixable 404 ("no endpoints that
+    # support tool use") must not strip every role's price cap and lists for the TTL.
+    assert pr.relaxed_level(SLUG) == 0
 
 
 def test_a_bare_request_has_nothing_to_relax() -> None:

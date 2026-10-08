@@ -284,9 +284,9 @@ mean, median, direction): quote the summary, or compute more in `execute` (perce
 z-score of the spike window, correlation, sums) and report the computed numbers. A report \
 containing a raw series is bounced back, and any rows still present are deleted before \
 delivery — the reader gets nothing for them. When the reader should SEE the data (and only then — see \
-CHARTS), place the chart: a tool result or finding that carries `[chart:<id>]` names a chart already rendered \
-for the user — write that token on its own line in the report where the data belongs and \
-the chart appears there, with a CSV download. That is how data reaches the report.
+CHARTS), place the chart: a tool result or finding that carries `[chart:<id>]` names a chart that exists but is \
+NOT shown to anyone yet — write that token on its own line in the report where the data \
+belongs and the chart appears there, with a CSV download. That is how data reaches the report.
 - SIZE the finding in context: give magnitude as a SHARE of the relevant universe, not just \
 an absolute (e.g. "1,200 records flagged — about 1.5% of the 80,000 tracked", not just \
 "1,200"). When the user asks "is there a lot of X", that question MUST be answerable from \

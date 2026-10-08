@@ -27,6 +27,7 @@ from .turn import (
     called,
     count_nudges,
     current_turn,
+    delivered_report,
     did_research_work,
     final_reply,
     is_json_object_dump,
@@ -79,7 +80,9 @@ class ForceCompletionMiddleware(AgentMiddleware):
         # Scope to the current turn: a prior turn's submit_report must NOT count here,
         # or a follow-up would terminate immediately and inherit the old report.
         turn = current_turn(messages)
-        if called(turn, "submit_report") or called(turn, "request_clarification"):
+        # A report the quality gate bounced was NOT delivered: a model that answers the
+        # bounce with prose still gets the resubmit nudge below.
+        if delivered_report(turn) or called(turn, "request_clarification"):
             return None
         content = text_of(last.content)
         if not content.strip():

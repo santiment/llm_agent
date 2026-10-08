@@ -254,8 +254,10 @@ def _relaxed_body(body: dict[str, Any] | None, original: dict[str, Any], level: 
 def relax_step(role: str, slug: str, ttl: float, original: dict[str, Any], level: int,
                exc: BaseException) -> int | None:
     """The relax level to retry at after ``exc``, or None to let it propagate: not a routing
-    refusal, or nothing left to give up. Logs, emits ``provider_fallback`` and remembers the
-    level for ``slug``. Shared by the middleware and the direct-call helpers below."""
+    refusal, or nothing left to give up. Logs and emits ``provider_fallback``; the caller
+    remembers the level only once a call at it SUCCEEDS (``_remember_if_relaxed``) — a 404
+    that relaxing cannot fix ("no endpoints … support tool use") must not strip every role's
+    price cap for the TTL. Shared by the middleware and the direct-call helpers below."""
     step = routing_rejection(exc)
     if step is None:
         return None
@@ -267,14 +269,21 @@ def relax_step(role: str, slug: str, ttl: float, original: dict[str, Any], level
                   MAX_RELAX_LEVEL, detail)
         return None
     dropped = sorted(set(relax(original, level)) - set(relax(original, nxt)))
-    remember_relaxed(slug, nxt, ttl)
     log.warning("MODEL ROUTING role=%s model=%s: no endpoint passed %r — retrying without "
-                "%s (relax level %d/%d, remembered %.0fs): %s", role, slug or "?",
-                step, ", ".join(dropped) or "the routing object", nxt, MAX_RELAX_LEVEL,
-                ttl, detail)
+                "%s (relax level %d/%d): %s", role, slug or "?",
+                step, ", ".join(dropped) or "the routing object", nxt, MAX_RELAX_LEVEL, detail)
     emit({"type": "status", "state": "provider_fallback", "role": role, "model": slug,
           "detail": detail, "step": step, "level": nxt, "dropped": dropped})
     return nxt
+
+
+def _remember_if_relaxed(slug: str, start: int, level: int, ttl: float) -> None:
+    """A call at ``level`` just succeeded: if it had to climb above where it started,
+    remember the level for ``slug`` so other roles and graph builds start there."""
+    if level > start:
+        remember_relaxed(slug, level, ttl)
+        log.info("MODEL ROUTING model=%s: relax level %d worked — remembered %.0fs",
+                 slug or "?", level, ttl)
 
 
 def _direct_start(model, slug: str):
@@ -295,9 +304,12 @@ def invoke_with_routing_fallback(model, input, *, role: str, slug: str = "", ttl
     without a routing object is called as-is."""
     slug = slug or model_slug(model)
     body, original, level, kwargs = _direct_start(model, slug)
+    start = level
     while True:
         try:
-            return model.invoke(input, **kwargs)
+            result = model.invoke(input, **kwargs)
+            _remember_if_relaxed(slug, start, level, ttl)
+            return result
         except GraphBubbleUp:
             raise
         except Exception as exc:
@@ -312,9 +324,12 @@ async def ainvoke_with_routing_fallback(model, input, *, role: str, slug: str = 
     """Async twin of ``invoke_with_routing_fallback``."""
     slug = slug or model_slug(model)
     body, original, level, kwargs = _direct_start(model, slug)
+    start = level
     while True:
         try:
-            return await model.ainvoke(input, **kwargs)
+            result = await model.ainvoke(input, **kwargs)
+            _remember_if_relaxed(slug, start, level, ttl)
+            return result
         except GraphBubbleUp:
             raise
         except Exception as exc:
@@ -332,7 +347,7 @@ class ProviderRoutingFallbackMiddleware(AgentMiddleware):
     Tier" step took 6 endpoints to 2, the cap took those to 0) — the call 404s instead of
     falling back. Here that 404 climbs ``provider_routing.relax``: the cap first, then the
     provider lists, then the whole object; each step is one immediate retry, since the
-    refusal is deterministic. The level that worked is remembered per model for ``ttl``
+    refusal is deterministic. The level that WORKED is remembered per model for ``ttl``
     seconds (the routing TTL) so every parallel sub-agent on the model, and the next graph
     build, start there. Every other exception propagates untouched.
 
@@ -348,9 +363,12 @@ class ProviderRoutingFallbackMiddleware(AgentMiddleware):
 
     def wrap_model_call(self, request, handler):
         original, level, request = self._start(request)
+        start = level
         while True:
             try:
-                return handler(request)
+                response = handler(request)
+                _remember_if_relaxed(self.model, start, level, self.ttl)
+                return response
             except GraphBubbleUp:
                 raise
             except Exception as exc:
@@ -361,9 +379,12 @@ class ProviderRoutingFallbackMiddleware(AgentMiddleware):
 
     async def awrap_model_call(self, request, handler):
         original, level, request = self._start(request)
+        start = level
         while True:
             try:
-                return await handler(request)
+                response = await handler(request)
+                _remember_if_relaxed(self.model, start, level, self.ttl)
+                return response
             except GraphBubbleUp:
                 raise
             except Exception as exc:

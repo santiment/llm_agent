@@ -60,15 +60,39 @@ def test_unknown_evicted_or_expired_ids_are_reported_missing():
     a = _held()
     assert emit_placed_charts(["deadbeef", a]) == ([a], ["deadbeef"])
     # Age: an entry older than the TTL goes on the next stash.
-    born, event = events._CHARTS[a]
-    events._CHARTS[a] = (born - CHART_TTL_S - 1, event)
+    born, event = events._CHARTS[""][a]                     # "" = outside a LangGraph run
+    events._CHARTS[""][a] = (born - CHART_TTL_S - 1, event)
     b = _held()
     assert stashed_chart(a) is None and stashed_chart(b) is not None
     # Count: the oldest leaves first once the bound is hit.
     clear_charts()
     ids = [_held(12) for _ in range(MAX_STASHED_CHARTS + 3)]
-    assert len(events._CHARTS) == MAX_STASHED_CHARTS
+    assert len(events._CHARTS[""]) == MAX_STASHED_CHARTS
     assert all(stashed_chart(i) is None for i in ids[:3]) and stashed_chart(ids[-1]) is not None
+
+
+def test_charts_are_held_per_thread():
+    # One run's fan-out must not evict another's charts, and a report may only place charts
+    # its own thread fetched — an id pasted from someone else's report resolves to nothing.
+    from unittest.mock import patch
+
+    with patch.object(events, "_chart_scope", return_value="thread-a"):
+        a = _held()
+    with patch.object(events, "_chart_scope", return_value="thread-b"):
+        others = [_held(12) for _ in range(MAX_STASHED_CHARTS + 1)]
+        assert stashed_chart(a) is None
+        assert emit_placed_charts([a]) == ([], [a])
+    with patch.object(events, "_chart_scope", return_value="thread-a"):
+        assert stashed_chart(a) is not None                  # B's flood never touched A's
+        assert stashed_chart(others[-1]) is None
+
+
+def test_thread_scope_comes_from_the_langgraph_config():
+    from langchain_core.runnables import RunnableLambda
+
+    seen = RunnableLambda(lambda _: events._chart_scope()).invoke(
+        None, {"configurable": {"thread_id": "t-123"}})
+    assert seen == "t-123" and events._chart_scope() == ""
 
 
 # --- the report places; dangling placements leave the text -------------------------------
@@ -148,3 +172,66 @@ def test_every_model_carries_its_role_in_run_metadata(monkeypatch):
     roles = {s["name"]: s["model"].metadata["role"] for s in captured["subagents"]}
     assert roles == {"research-subagent": "research-subagent", "extract-subagent": "extract-subagent",
                      "coding-subagent": "coding-subagent"}
+
+
+def test_findings_event_carries_no_chart_tokens_but_the_parent_keeps_them():
+    # The UI never got a chart event for a finding's token; the orchestrator needs it to place.
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    from conftest import make_state
+    from deep_research_agent.findings_gate import SubagentFindingsMiddleware
+
+    a = _held()
+    handoff = AIMessage('{"summary": "price fell [chart:%s]", "findings": [{"finding": '
+                        '"BTC -8.4%% over 30d\\n[chart:%s]", "evidence": "first/last", '
+                        '"source": "Santiment"}], "gaps": []}' % (a, a))
+    with capture_events_cm() as ev:
+        update = SubagentFindingsMiddleware().after_model(
+            make_state(HumanMessage("unit: market"), ToolMessage("rows", tool_call_id="1"), handoff), None)
+    found = [e for e in ev if e["type"] == "subagent_findings"][0]
+    assert "[chart:" not in found["summary"] and "[chart:" not in found["findings"][0]["finding"]
+    parent_sees = update["messages"][0].content if update else handoff.content
+    assert f"[chart:{a}]" in parent_sees
+
+
+def test_persisted_report_matches_what_the_user_got():
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    from conftest import make_state
+    from deep_research_agent.citations import ResearchOutputMiddleware
+    from deep_research_agent.turn import REPORT_DELIVERED
+
+    a = _held()
+    rep = f"# R\n\nText [1].\n\n[chart:{a}]\n\n[chart:0badc0de]\n\n## Sources\n- [1] https://x.example/a\n"
+    call = {"name": "submit_report", "args": {"report_markdown": rep}, "id": "t1"}
+    out = ResearchOutputMiddleware(max_tool_calls=80, max_total_tokens=1_000_000).after_agent(
+        make_state(HumanMessage("q"), AIMessage("", tool_calls=[call]),
+                   ToolMessage(REPORT_DELIVERED, tool_call_id="t1")), None)
+    assert f"[chart:{a}]" in out["final_report"] and "0badc0de" not in out["final_report"]
+
+
+def test_total_held_charts_are_bounded_across_threads():
+    from unittest.mock import patch
+
+    with patch.object(events, "MAX_STASHED_CHARTS_TOTAL", 10), patch.object(events, "MAX_STASHED_CHARTS", 4):
+        first = None
+        for t in range(6):
+            with patch.object(events, "_chart_scope", return_value=f"t{t}"):
+                ids = [_held(12) for _ in range(3)]
+                first = first or ids[0]
+        assert sum(len(h) for h in events._CHARTS.values()) <= 10
+        with patch.object(events, "_chart_scope", return_value="t0"):
+            assert stashed_chart(first) is None                # the oldest in the process went first
+
+
+def test_global_eviction_never_loses_the_chart_being_stashed():
+    # The current thread's only chart is the process's oldest: evicting it must not orphan
+    # the dict the new chart goes into.
+    from unittest.mock import patch
+
+    with patch.object(events, "MAX_STASHED_CHARTS_TOTAL", 2):
+        with patch.object(events, "_chart_scope", return_value="mine"):
+            _held()
+        with patch.object(events, "_chart_scope", return_value="other"):
+            _held()
+        with patch.object(events, "_chart_scope", return_value="mine"):
+            new = _held()
+            assert stashed_chart(new) is not None

@@ -393,7 +393,7 @@ The orchestrator's stack (assembled in `agent.py`, in this order; `SkillUsageMid
 |------------|------|-----|
 | **TriageRouterMiddleware** | `before_model` | First on the stack. On the first step of a fresh user turn, a ~250-token call on the research model decides SIMPLE vs RESEARCH; SIMPLE is answered right there and the turn ends without paying the ~12k-token harness. |
 | **LoopGuardMiddleware** | `before_model` / `after_model` | Shared by every role. Repeated identical tool calls get a nudge, then a hard stop (`loop_detected` / `loop_halt`); runaway repetitive output is cut (`runaway_output` / `runaway_halt`). |
-| **ContextCompactionMiddleware** | `before_model` | On every role, one instance per role: the trigger is `compaction_tokens` or `compaction_window_fraction` of that role's model window, whichever is lower. Above it, older messages are summarized on the compaction model; budget counters carry over. |
+| **ContextCompactionMiddleware** | `before_model` | On every role, one instance per role: the trigger is the role's absolute (`orchestrator_compaction_tokens` 200k, `compaction_tokens` 600k for sub-agents) or `compaction_window_fraction` of that role's model window, whichever is lower. Above it, older messages are summarized on the compaction model; budget counters carry over. |
 | **PromptCacheMiddleware** | `wrap_model_call` | On every role, OpenRouter only: `cache_control` breakpoints on the system prompt and newest messages. |
 | **BudgetMiddleware** | `before_model` | Hard backstop against runaway runs. Three ceilings (cumulative tool calls, cumulative tokens, wall-clock seconds). At **75%** of any it injects a "wrap up and deliver now" nudge (at most `MAX_BUDGET_NUDGES` = 2); at **100%** it jumps straight to `end`. |
 | **ForceCompletionMiddleware** | `after_model` | Prevents premature termination. If the model stops with a bare *"Now I will compare…"* intent message and no tool call mid-research, it nudges the model to act (capped). If the model wrote the whole report as a plain message, one mechanical "resubmit via `submit_report` verbatim" nudge; a raw JSON blob gets a "rewrite as a real report" nudge instead. |
@@ -558,9 +558,10 @@ All overridable per-run (`configurable`) or via env var; defaults shown.
 | `TAVILY_API_KEY` | same | — | web search; unset → search disabled |
 | MCP servers | `DRA_MCP_SERVERS` / `DRA_MCP_URL` | none | data sources |
 | `max_tool_calls` | `DRA_MAX_TOOL_CALLS` | 200 | runaway-run ceiling |
-| `max_total_tokens` | `DRA_MAX_TOTAL_TOKENS` | 4,000,000 | runaway-run ceiling |
-| `compaction_tokens` | `DRA_COMPACTION_TOKENS` | 800,000 | absolute in-flight compaction trigger (est. tokens); older messages summarized on the compaction model, budget counters carry over; 0 = off |
-| `compaction_window_fraction` | `DRA_COMPACTION_WINDOW_FRACTION` | 0.8 | per role, compaction fires at this fraction of the role model's context window (OpenRouter endpoint feed) when lower than the absolute; 0 = window rule off |
+| `max_total_tokens` | `DRA_MAX_TOTAL_TOKENS` | 10,000,000 | runaway-run ceiling; cached prompt input counts at 0.1x |
+| `compaction_tokens` | `DRA_COMPACTION_TOKENS` | 600,000 | sub-agents' absolute in-flight compaction trigger (est. tokens); older messages summarized on the compaction model, budget counters carry over; 0 = off |
+| `orchestrator_compaction_tokens` | `DRA_ORCHESTRATOR_COMPACTION_TOKENS` | 200,000 | the orchestrator's trigger — it holds plans and findings, not data; 0 = off |
+| `compaction_window_fraction` | `DRA_COMPACTION_WINDOW_FRACTION` | 0.8 | per role, compaction fires at this fraction of the role model's context window (OpenRouter endpoint feed) when lower than the absolute; window unknown (no feed) → 170k; 0 = window rule off |
 | `prompt_caching` | `DRA_PROMPT_CACHING` | true | `cache_control` breakpoints on system prompt + newest messages (OpenRouter only) |
 | `web_fetch` | `DRA_WEB_FETCH` | true | full-page reader tool for sub-agents (big pages offload to the sandbox) |
 | `mcp_max_concurrency` | `DRA_MCP_MAX_CONCURRENCY` | 10 | simultaneous MCP calls cap |

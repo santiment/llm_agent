@@ -131,6 +131,43 @@ def test_hard_tokens_jumps_to_end() -> None:
     assert update == {"jump_to": "end"}, update
 
 
+
+def _cached_step(total: int, cached: int) -> AIMessage:
+    return AIMessage("a", usage_metadata={"input_tokens": total - 500, "output_tokens": 500,
+                                          "total_tokens": total,
+                                          "input_token_details": {"cache_read": cached}})
+
+
+def test_cached_input_counts_at_a_discount() -> None:
+    # Every step re-sends the context; the cached prefix is billed at ~0.1x, so it must not
+    # stop a run at full weight. Metering still reports the real total.
+    from deep_research_agent.turn import CACHED_INPUT_WEIGHT, budget_tokens, message_tokens
+
+    step = _cached_step(100_000, 90_000)
+    assert message_tokens(step) == 100_000
+    assert budget_tokens(step) == int(100_000 - (1 - CACHED_INPUT_WEIGHT) * 90_000)  # 19,000
+    # OpenAI-shaped response metadata (no usage_metadata) is read too.
+    raw = AIMessage("a", response_metadata={"token_usage": {
+        "total_tokens": 100_000, "prompt_tokens_details": {"cached_tokens": 90_000}}})
+    assert budget_tokens(raw) == budget_tokens(step)
+    # 20 such steps: 2M real tokens, but well under a 1M budget's hard stop.
+    mw = BudgetMiddleware(max_tool_calls=1_000, max_total_tokens=1_000_000)
+    assert mw.before_model({"messages": [HumanMessage("q"), *[_cached_step(100_000, 90_000)
+                                                            for _ in range(20)]]}, None) is None
+
+
+def test_compacted_spend_keeps_both_units() -> None:
+    from deep_research_agent.compaction import compacted_budget_tokens, compacted_counts, turn_spend
+
+    anchor = HumanMessage("q", id="a1")
+    state = {"messages": [anchor], "compaction_anchor_id": "a1",
+             "compacted_tool_calls": 3, "compacted_tokens": 500_000, "compacted_budget_tokens": 80_000}
+    assert compacted_counts(state) == (3, 500_000)             # metering: real totals
+    assert turn_spend(state) == (3, 80_000)                    # budget: discounted
+    legacy = {k: v for k, v in state.items() if k != "compacted_budget_tokens"}
+    assert compacted_budget_tokens(legacy) == 500_000          # pre-discount thread: count it all
+
+
 if __name__ == "__main__":
     test_cap_result_rows_chars_and_noop()
     test_token_and_call_counters()
@@ -139,4 +176,6 @@ if __name__ == "__main__":
     test_soft_calls_nudges_then_stops_nudging()
     test_hard_calls_jumps_to_end()
     test_hard_tokens_jumps_to_end()
+    test_cached_input_counts_at_a_discount()
+    test_compacted_spend_keeps_both_units()
     print("OK — budget caps + result capping verified.")

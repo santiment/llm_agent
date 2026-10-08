@@ -32,7 +32,7 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from .compaction import compacted_counts
+from .compaction import compacted_counts, turn_spend
 from .events import PROTOCOL_VERSION, emit, engine_version
 from .turn import current_turn, message_tokens, raw_text, text_of, tool_calls_in
 
@@ -57,7 +57,8 @@ def fmt_elapsed(seconds: float | None) -> str:
 
 def sum_usage(messages: list) -> dict[str, Any]:
     """Token / model-call / cost totals over the AIMessages of one agent's transcript.
-    Per-message totals use ``turn.message_tokens``, the same ladder BudgetMiddleware uses."""
+    Per-message totals use ``turn.message_tokens``: real totals. (BudgetMiddleware weighs
+    the same messages with cached input discounted — ``turn.budget_tokens``.)"""
     in_tok = out_tok = total = model_calls = 0
     cost = 0.0
     for m in messages:
@@ -239,6 +240,9 @@ class UsageMeterMiddleware(AgentMiddleware):
             # Sub-agent fleet model usage, per role, + a whole-run token grand total.
             "subagents": self.meter.subagent_usage,
             "total_tokens_all_agents": orch_total + sub_total_tokens,
+            # What max_total_tokens is compared against: the orchestrator's tokens with
+            # cached input discounted (turn.budget_tokens) — below total_tokens on a cached run.
+            "budget_tokens": turn_spend(state, msgs)[1],
             "cost_usd": round(cost, 6),  # lower bound — see module doc
             "elapsed_s": elapsed,  # None only if before_agent never ran
             "elapsed": fmt_elapsed(elapsed),

@@ -14,6 +14,7 @@ vars are deliberately not honored (legacy ones are ignored with a warning).
 from __future__ import annotations
 
 import ipaddress
+import socket
 import json
 import logging
 import os
@@ -52,6 +53,8 @@ def _read_prompt_file(path: str) -> str:
 
 # Cloud-metadata hostnames — never a legitimate outbound target.
 _BLOCKED_HOSTNAMES = {"metadata", "metadata.google.internal"}
+# Metadata services reachable by IP that the link-local check misses (AWS IMDS over IPv6).
+_BLOCKED_IPS = {ipaddress.ip_address("fd00:ec2::254")}
 # Dotted/decimal/hex numeric hosts that ipaddress rejects but the resolver accepts
 # (``127.1``, ``2130706433``, ``0x7f000001``, ``0177.0.0.1``).
 _NUMERIC_HOST = re.compile(r"(?:0x[0-9a-f]+|\d+)(?:\.(?:0x[0-9a-f]+|\d+))*")
@@ -249,7 +252,7 @@ def url_blocked(url: str, *, allow_private: bool) -> str | None:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return f"scheme {parsed.scheme!r} not allowed"
-    host = (parsed.hostname or "").lower()
+    host = (parsed.hostname or "").lower().rstrip(".")   # "metadata.google.internal." resolves too
     if not host:
         return "missing host"
     if host in _BLOCKED_HOSTNAMES:
@@ -259,9 +262,20 @@ def url_blocked(url: str, *, allow_private: bool) -> str | None:
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
-        if not allow_private and _NUMERIC_HOST.fullmatch(host):
+        if not _NUMERIC_HOST.fullmatch(host):
+            return None  # a DNS name — not an IP literal to vet
+        if not allow_private:
             return f"malformed numeric host {host!r} blocked"
-        return None  # a DNS name — not an IP literal to vet
+        # Private hosts are allowed, but the resolver reads "2852039166", "0xA9FEA9FE" or
+        # "169.254.43518" as 169.254.169.254: vet the address it will actually dial.
+        try:
+            ip = ipaddress.IPv4Address(socket.inet_aton(host))
+        except OSError:
+            return f"malformed numeric host {host!r} blocked"
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped                                # [::ffff:169.254.169.254]
+    if ip in _BLOCKED_IPS:
+        return f"blocked metadata address {host}"
     if ip.is_link_local:
         return f"link-local address {host} blocked"
     if not allow_private and (
@@ -464,26 +478,30 @@ class ResearchConfig:
     # scan (e.g. a large cross-entity sweep) doesn't grow the token footprint per call, so the
     # call ceiling can be generous. Without a sandbox these still backstop runaway runs.
     max_tool_calls: int = 200
-    max_total_tokens: int = 4_000_000
+    # Tokens here are BUDGET tokens: cached prompt input counts at turn.CACHED_INPUT_WEIGHT,
+    # since every step re-sends the whole context and the cached prefix is billed at ~0.1x.
+    max_total_tokens: int = 10_000_000
     # Wall-clock ceiling per run (seconds). Calls and tokens do not bound TIME: a fleet of
     # slow sub-agents retrying against a dead sandbox ran 90 minutes under both ceilings.
     # Same two stages (wrap-up nudge at 75%, hard stop at 100%). 0 = no cap.
     # DRA_MAX_RUN_SECONDS.
     max_run_seconds: int = 2_700
     # In-flight context compaction (compaction.py): an estimated context above this many
-    # tokens summarizes older messages on compaction_model. Absolute, since an OpenRouter slug
-    # does not expose its window; 0 disables. DRA_COMPACTION_TOKENS.
-    # 800k = ~80% of the smallest window any tier slot has (every slot model is 1M+ on
-    # OpenRouter's feed, 2026-09-11; re-check when a tier changes). The 200k headroom covers
-    # one step's growth between checks, the response, and the chars/4 estimate's error.
-    # Compacting far below the window (the old 100k) bought nothing: with prompt caching a
-    # re-sent context is billed at the cache-read rate, while each compaction is a
-    # full-price summarizer call that loses detail and, with a fat tail, re-fired every
-    # couple of steps. NOTE max_total_tokens: the budget sums every call's total tokens,
-    # cached or not, so a context near this trigger spends 4M in ~5 steps.
-    compaction_tokens: int = 800_000
+    # tokens summarizes older messages on compaction_model; 0 disables. Absolute per ROLE,
+    # since an OpenRouter slug does not expose its window (the window rule below caps both).
+    # Each compaction is a full-price summarizer call that loses detail and, with a fat
+    # tail, re-fired every couple of steps at the old 100k — so compact rarely, but not so
+    # late that every step re-sends a huge context (latency, and a budget that counts it).
+    # - Sub-agents (research / extract / coding): 600k. Their context IS the data they
+    #   work through; summarizing it early loses the figures the findings are made of.
+    #   DRA_COMPACTION_TOKENS.
+    compaction_tokens: int = 600_000
+    # - Orchestrator: 200k. It holds plans and findings, never raw data, so a context past
+    #   this is mostly spent history — and the expensive model re-reads it on every step.
+    #   DRA_ORCHESTRATOR_COMPACTION_TOKENS.
+    orchestrator_compaction_tokens: int = 200_000
     # ... and never above this fraction of the ROLE model's context window, read per model
-    # from OpenRouter's endpoint feed at graph build (no feed: the absolute alone). So a
+    # from OpenRouter's endpoint feed at graph build (no feed: 170k, conservatively). So a
     # 256k-window model in a tier compacts at ~205k without anyone editing a number. 0 turns
     # the window rule off. DRA_COMPACTION_WINDOW_FRACTION.
     compaction_window_fraction: float = 0.8
@@ -647,7 +665,6 @@ class ResearchConfig:
         # label, attach bearer auth.
         bearer = _env("DRA_MCP_BEARER") if mcp_from_env else ""
         safe_servers: list[dict] = []
-        taken: set[str] = set()
         for s in mcp_servers:
             if s.get("url"):
                 s["url"] = _normalize_mcp_url(s["url"])
@@ -660,21 +677,36 @@ class ResearchConfig:
                     "refusing MCP server %s: %s", s.get("url") or "(none)", blocked
                 )
                 continue
+            if any(s["url"] == kept["url"] for kept in safe_servers):
+                # Listed twice: loading it again would hand the model every tool twice.
+                log.warning("MCP server %s listed twice — loading it once", s["url"])
+                continue
+            safe_servers.append(s)
+
+        # The name is the connection key, so it must be unique: two bare hosts both
+        # normalize to ".../mcp", and a duplicate key silently drops the first server.
+        # Explicit names are reserved first, so a derived name never takes one.
+        taken: set[str] = set()
+
+        def unique(name: str) -> str:
+            base, n = name, 2
+            while name in taken:
+                name, n = f"{base}_{n}", n + 1
+            taken.add(name)
+            return name
+
+        for s in safe_servers:
+            if s.get("name"):
+                s["name"] = unique(s["name"])
+        for s in safe_servers:
             if not s.get("name"):
-                s["name"] = _slug_from_url(s.get("url", "")) or "mcp"
-            # The name is the connection key: two bare hosts both normalize to ".../mcp",
-            # and a duplicate key silently drops the first server.
-            base, n = s["name"], 2
-            while s["name"] in taken:
-                s["name"], n = f"{base}_{n}", n + 1
-            taken.add(s["name"])
+                s["name"] = unique(_slug_from_url(s.get("url", "")) or "mcp")
             if not (s.get("label") or "").strip():
                 # No explicit label → derive a readable one from the slug name
                 # ("data_provider" -> "Data Provider"), never the generic placeholder.
                 s["label"] = s["name"].replace("_", " ").replace("-", " ").title()
             if bearer and not (s.get("headers") or {}).get("Authorization"):
                 s.setdefault("headers", {})["Authorization"] = f"Bearer {bearer}"
-            safe_servers.append(s)
         mcp_servers = safe_servers
 
         # Every remaining field resolves through _pick / _flag: configurable key(s) ->
@@ -866,6 +898,9 @@ class ResearchConfig:
                     default=cls.compaction_tokens,
                 )
             ),
+            orchestrator_compaction_tokens=int(_pick(
+                c, "orchestrator_compaction_tokens", env="DRA_ORCHESTRATOR_COMPACTION_TOKENS",
+                default=cls.orchestrator_compaction_tokens)),
             compaction_window_fraction=min(1.0, max(0.0, float(_pick(
                 c, "compaction_window_fraction", env="DRA_COMPACTION_WINDOW_FRACTION",
                 default=cls.compaction_window_fraction)))),

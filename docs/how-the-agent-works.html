@@ -356,7 +356,7 @@ const STEPS = [
 { phase: "plan", title: "The orchestrator plans",
   text: `Now the real loop starts. Its prompt triages again — COMPUTE runs <code>execute</code> and replies with the number, AMBIGUOUS calls <code>request_clarification</code> — then lays out the angles with <code>write_todos</code>. The narration between steps streams on <code>messages</code>; the todo list arrives with the state updates. Before every model call BudgetMiddleware checks tool calls, tokens and wall-clock against the run ceilings: a wrap-up nudge at 75%, a hard stop at 100%.`,
   open: [["orch", "loop", "ReAct loop · plan → delegate → synthesize"]],
-  guards: [["Budget", "before_model", "200 calls · 4M tokens · 45 min"], ["LoopGuard", "after_model", "repeats"],
+  guards: [["Budget", "before_model", "200 calls · 10M tokens · 45 min"], ["LoopGuard", "after_model", "repeats"],
            ["PromptCache", "wrap_model_call", "OpenRouter"]],
   events: [["status", "{state: \"model_call\", role: \"orchestrator\", model: \"{research}\", step: 1}"]],
   chat: (c) => {
@@ -453,7 +453,7 @@ const STEPS = [
   chat: (c) => { c.push({ k: "finding", unit: "Social & sentiment", text: "Crowd flipped net-short after the drop; social volume +64%", src: "Santiment, coindesk.com" }); c.todo(2); } },
 
 { phase: "synth", title: "Synthesis on the expensive model",
-  text: `The orchestrator reads three findings objects — never raw rows — and writes one report: inline <code>[n]</code> citations reuse each finding's source, and <code>[chart:c1]</code> on its own line places the price chart. Had its context neared the compaction trigger — 800k tokens or 80% of <code>{research}</code>'s context window, whichever is lower — ContextCompactionMiddleware would first summarize older messages on <code>{compaction}</code> (status <code>compacting</code> → <code>compacted</code>).`,
+  text: `The orchestrator reads three findings objects — never raw rows — and writes one report: inline <code>[n]</code> citations reuse each finding's source, and <code>[chart:c1]</code> on its own line places the price chart. Had its context neared the orchestrator's compaction trigger — 200k tokens or 80% of <code>{research}</code>'s context window, whichever is lower (sub-agents compact at 600k) — ContextCompactionMiddleware would first summarize older messages on <code>{compaction}</code> (status <code>compacting</code> → <code>compacted</code>).`,
   guards: [["Budget", "before_model", "well under 75%"], ["ContextCompaction", "before_model", "idle below the trigger"]],
   events: [["status", "{state: \"model_call\", role: \"orchestrator\", model: \"{research}\", step: 7}"]],
   chat: (c) => c.push({ k: "thinking", text: "All three units returned sourced findings. Writing the report with inline citations." }) },
@@ -538,6 +538,7 @@ function renderGrid(animate) {
     const b = place(el("button", "phase", PHASES[STEPS[i].phase]), i + 2, 1, j + 3);
     b.dataset.state = step >= i && step <= j ? "now" : step > j ? "past" : "";
     const target = i;
+    b.dataset.phaseStart = String(i);
     b.addEventListener("click", () => go(target, false));
     grid.appendChild(b);
     i = j + 1;
@@ -744,7 +745,10 @@ function renderChat(animate) {
 /* ------------------------------------------------------------------ transport */
 function render() {
   const animate = !reduced && step === lastRendered + 1;
+  // The grid is rebuilt each step: keep keyboard focus on the same phase button.
+  const focusedPhase = document.activeElement?.dataset?.phaseStart;
   renderGrid(animate);
+  if (focusedPhase != null) grid.querySelector(`[data-phase-start="${focusedPhase}"]`)?.focus();
   renderStory(animate);
   renderEvents(animate);
   renderChat(animate);
@@ -778,12 +782,12 @@ $("#next").addEventListener("click", () => go(step + 1, false));
 $("#prev").addEventListener("click", () => go(step - 1, false));
 $("#speed").addEventListener("change", (e) => { speed = parseFloat(e.target.value); schedule(); });
 addEventListener("keydown", (e) => {
-  if (e.target.closest("select")) return;
-  if (e.key === "ArrowRight") go(step + 1, false);
-  else if (e.key === "ArrowLeft") go(step - 1, false);
+  // Leave browser shortcuts (Alt+← is Back) and form controls alone.
+  if (e.altKey || e.metaKey || e.ctrlKey || e.target.closest("select")) return;
+  const keys = { ArrowRight: () => go(step + 1, false), ArrowLeft: () => go(step - 1, false),
+                 Home: () => go(0, false), End: () => go(STEPS.length - 1, false) };
+  if (keys[e.key]) { e.preventDefault(); keys[e.key](); }
   else if (e.key === " " && !e.target.closest("button")) { e.preventDefault(); $("#play").click(); }
-  else if (e.key === "Home") go(0, false);
-  else if (e.key === "End") go(STEPS.length - 1, false);
 });
 addEventListener("resize", () => drawArrows(false));
 

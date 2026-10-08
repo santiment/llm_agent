@@ -26,13 +26,14 @@ from typing_extensions import NotRequired
 
 from .compaction import turn_spend
 from .completion import MAX_NUDGES
-from .events import domain_of, emit
+from .events import domain_of, emit, stashed_chart
 from .metering import fmt_elapsed
-from .report_hygiene import collapse_data_blocks, lint_citations, scrub_report
+from .report_hygiene import (chart_refs, collapse_data_blocks, drop_chart_refs, lint_citations,
+                             scrub_report)
 from .tools.report import deliver_charts
-from .turn import (NUDGE_NAME, called, count_nudges, current_turn, did_research_work,
-                   is_json_object_dump, looks_delivered, raw_text, text_of,
-                   tool_calls_of)
+from .turn import (NUDGE_NAME, called, count_nudges, current_turn, delivered_report,
+                   did_research_work,
+                   is_json_object_dump, looks_delivered, raw_text, text_of)
 
 log = logging.getLogger("deep_research_agent.citations")
 
@@ -41,17 +42,6 @@ _URL_RE = re.compile(r"https?://[^\s\)\]\}\"'<>]+")
 
 def _clean_url(u: str) -> str:
     return u.rstrip(".,);]'\"")
-
-
-def _report_from_submit(messages: list) -> str:
-    """The argument of the most-recent submit_report tool call, if any."""
-    for m in reversed(messages):
-        for name, args in tool_calls_of(m):
-            if name == "submit_report":
-                rep = args.get("report_markdown")
-                if isinstance(rep, str) and rep.strip():
-                    return rep
-    return ""
 
 
 class ResearchState(AgentState):
@@ -91,8 +81,13 @@ class ResearchOutputMiddleware(AgentMiddleware):
                     seen[url] = len(sources) + 1
                     sources.append({"index": len(sources) + 1, "url": url, "domain": domain_of(url)})
 
-        report = _report_from_submit(messages)
+        report = delivered_report(messages)
         via_tool = bool(report)
+        if via_tool:
+            # Persist what the user got: submit_report already dropped placements of charts
+            # this thread no longer holds from the live report.
+            report = drop_chart_refs(
+                report, [c for c in chart_refs(report) if stashed_chart(c) is None])
         researched = did_research_work(messages)
         salvaged = False
         if not via_tool and researched:

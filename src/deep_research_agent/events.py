@@ -417,12 +417,36 @@ def build_chart(series: dict, *, source_label: str = "", metric: str = "") -> di
 # Charts are HELD at fetch time and reach the UI only when a report places them
 # (`[chart:<id>]` on its own line). A run fetches many series it never shows — baselines,
 # context, a sub-agent's detour — and a UI that renders every chart event on arrival made
-# a card of each (seven for one "why did sentiment peak" question). Bounded by count and
-# age so a run that places nothing leaves nothing behind. Module-level like the other
-# caches: the tool wrapper stashes, the report tool (any run, same process) emits.
-MAX_STASHED_CHARTS = 256
+# a card of each (seven for one "why did sentiment peak" question). Held PER THREAD (the
+# LangGraph thread_id, which sub-agents inherit): one run's fan-out can never evict
+# another's charts, and a report can only place charts its own thread fetched — an id
+# pasted from someone else's report resolves to nothing. Bounded by count per thread and
+# by age, so a thread that places nothing leaves nothing behind.
+MAX_STASHED_CHARTS = 256          # per thread
+MAX_STASHED_CHARTS_TOTAL = 4096   # per process: many busy threads must not grow memory unbounded
 CHART_TTL_S = 4 * 3600
-_CHARTS: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+_CHARTS: "dict[str, OrderedDict[str, tuple[float, dict]]]" = {}
+
+
+def _chart_scope() -> str:
+    """The current run's thread_id; "" outside a LangGraph run (tests, scripts)."""
+    try:
+        from langgraph.config import get_config
+
+        return str((get_config().get("configurable") or {}).get("thread_id") or "")
+    except Exception:  # no runnable context
+        return ""
+
+
+def _expire_charts(now: float) -> None:
+    for scope in list(_CHARTS):
+        held = _CHARTS[scope]
+        for cid, (born, _) in list(held.items()):     # insertion-ordered: oldest first
+            if now - born <= CHART_TTL_S:
+                break
+            del held[cid]
+        if not held:
+            del _CHARTS[scope]
 
 
 def stash_chart(series: dict, *, source_label: str = "", metric: str = "") -> str:
@@ -432,35 +456,43 @@ def stash_chart(series: dict, *, source_label: str = "", metric: str = "") -> st
     if event is None:
         return ""
     now = time.monotonic()
-    for cid, (born, _) in list(_CHARTS.items()):     # insertion-ordered: oldest first
-        if now - born <= CHART_TTL_S:
-            break
-        del _CHARTS[cid]
-    while len(_CHARTS) >= MAX_STASHED_CHARTS:
-        _CHARTS.popitem(last=False)
-    _CHARTS[event["id"]] = (now, event)
+    _expire_charts(now)
+    scope = _chart_scope()
+    held = _CHARTS.setdefault(scope, OrderedDict())
+    while len(held) >= MAX_STASHED_CHARTS:
+        held.popitem(last=False)
+    while sum(len(h) for h in _CHARTS.values()) >= MAX_STASHED_CHARTS_TOTAL:
+        # The oldest chart in the process goes first, whichever thread holds it.
+        oldest = min((s for s in _CHARTS if _CHARTS[s]),
+                     key=lambda s: next(iter(_CHARTS[s].values()))[0])
+        _CHARTS[oldest].popitem(last=False)
+        if not _CHARTS[oldest] and oldest != scope:
+            del _CHARTS[oldest]
+    held[event["id"]] = (now, event)
     return event["id"]
 
 
 def stashed_chart(chart_id: str) -> dict | None:
-    """The held chart event for ``chart_id``, or None when the run no longer holds it."""
-    hit = _CHARTS.get(chart_id)
-    return hit[1] if hit else None
+    """The held chart event for ``chart_id`` in this thread, or None when it holds none."""
+    hit = _CHARTS.get(_chart_scope(), {}).get(chart_id)
+    if hit is None or time.monotonic() - hit[0] > CHART_TTL_S:
+        return None
+    return hit[1]
 
 
 def emit_placed_charts(ids: Iterable[str]) -> tuple[list[str], list[str]]:
     """Emit the held charts a report places, in the report's order, so each precedes the
     ``report`` event that references it. Returns ``(placed, missing)`` — a missing id was
-    evicted, expired or never real, and its placement should leave the text. Held charts
-    stay held: a follow-up turn may place the same one again."""
+    evicted, expired, another thread's or never real, and its placement should leave the
+    text. Held charts stay held: a follow-up turn may place the same one again."""
     placed: list[str] = []
     missing: list[str] = []
     for cid in ids:
-        hit = _CHARTS.get(cid)
-        if hit is None:
+        event = stashed_chart(cid)
+        if event is None:
             missing.append(cid)
             continue
-        emit(hit[1])
+        emit(event)
         placed.append(cid)
     return placed, missing
 

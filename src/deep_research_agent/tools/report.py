@@ -13,6 +13,7 @@ from langchain_core.tools import StructuredTool
 
 from ..events import emit, emit_placed_charts
 from ..report_hygiene import chart_refs, collapse_data_blocks, drop_chart_refs, scrub_report
+from ..turn import REPORT_DELIVERED
 
 log = logging.getLogger("deep_research_agent.report")
 
@@ -68,7 +69,7 @@ def build_submit_report_tool(tool_names=()) -> StructuredTool:
         md = deliver_charts(md)
         emit({"type": "report", "markdown": md})
         return (
-            "Report delivered to the user. You are DONE — end your turn now. Do not "
+            f"{REPORT_DELIVERED} You are DONE — end your turn now. Do not "
             "repeat, restate, or rewrite the report."
         )
 

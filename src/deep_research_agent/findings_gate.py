@@ -35,8 +35,10 @@ from langchain.agents.middleware import AgentMiddleware, hook_config
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from .events import emit
-from .report_hygiene import MAX_QUOTED_POINTS, collapse_data_blocks, dated_points, series_runs
-from .turn import FINDINGS_NUDGE_NAME, count_nudges, final_reply, text_of
+from .report_hygiene import (MAX_QUOTED_POINTS, collapse_data_blocks, dated_points, series_runs,
+                             strip_chart_tokens)
+from .turn import (FINDINGS_NUDGE_NAME, count_nudges, final_reply, text_of,
+                   turn_anchor_index)
 
 log = logging.getLogger("deep_research_agent.findings_gate")
 
@@ -194,39 +196,60 @@ def _data_dump_problems(where: str, obj: dict) -> list[str]:
 # with neither is a skipped question, bounced once. Tags beyond Q3 are not a batch (never more
 # than three per task) and are ignored here — the prompts forbid them.
 MAX_BATCHED_QUESTIONS = 3
-# A tag at the start of a line / field, allowing list markers, bold or brackets before it
-# ("- Q1:", "**Q2**", "(Q3)") but never word characters: "Q1" mid-sentence is not a tag.
-_BRIEF_QUESTION = re.compile(rf"^[^\w\n]*Q([1-{MAX_BATCHED_QUESTIONS}])\b", re.MULTILINE)
-_TAGGED = re.compile(rf"^[^\w\n]*(Q[1-{MAX_BATCHED_QUESTIONS}])\b")
+# A tag starts a line / field — list markers, bold or brackets may precede it ("- Q1:",
+# "**Q2**", "(Q3)"), word characters may not — and is CLOSED by a delimiter. Finance briefs
+# are full of quarters: "Q3 2026 revenue" is a period, not a question, so a bare word
+# boundary is not enough. Several tags may lead one field ("Q1/Q2: …" answers both).
+_Q = rf"Q[1-{MAX_BATCHED_QUESTIONS}]"
+_CLOSE = r"\s*(?:[:.)\]—–]|\*\*|-\s)"   # a hyphen only with a space: "Q1-2026" is a period
+_BRIEF_QUESTION = re.compile(rf"^[^\w\n]*({_Q}){_CLOSE}", re.MULTILINE | re.IGNORECASE)
+_TAGGED = re.compile(rf"^[^\w\n]*((?:{_Q}\s*(?:[,/&+]|and)\s*)*{_Q}){_CLOSE}", re.IGNORECASE)
 
 
 def _brief(messages: list) -> str:
-    """The sub-agent's brief: the first real (non-nudge) human message."""
-    for m in messages:
-        if isinstance(m, HumanMessage) and getattr(m, "name", None) != FINDINGS_NUDGE_NAME:
-            return text_of(m.content)
-    return ""
+    """The sub-agent's brief: the turn's real human message — never a nudge or a compaction
+    summary, which sits FIRST once a long worker run has been compacted."""
+    i = turn_anchor_index(messages)
+    return text_of(messages[i].content) if i >= 0 else ""
 
 
 def brief_questions(messages: list) -> list[str]:
-    """The question tags the brief numbers (``Q1``..``Q3``), in order; [] for a
-    single-question brief."""
-    return list(dict.fromkeys(f"Q{n}" for n in _BRIEF_QUESTION.findall(_brief(messages))))
+    """The question tags a batched brief numbers — ``Q1``, ``Q2`` (, ``Q3``), in sequence —
+    or [] when it is not a batch: a lone tag, or tags that do not run from Q1 (a list of
+    quarters, say), are no batch."""
+    found = sorted({t.upper() for t in _BRIEF_QUESTION.findall(_brief(messages))})
+    expected = [f"Q{n}" for n in range(1, len(found) + 1)]
+    return found if len(found) >= 2 and found == expected else []
+
+
+def _tags_of(text: str) -> set[str]:
+    m = _TAGGED.match(text)
+    return {t.upper() for t in re.findall(_Q, m.group(1), re.IGNORECASE)} if m else set()
+
+
+def _gap_list(obj: dict) -> list:
+    """``gaps`` as a list: a worker that wrote one gap as a plain string keeps it."""
+    gaps = obj.get("gaps")
+    if isinstance(gaps, str):
+        return [gaps] if gaps.strip() else []
+    return gaps if isinstance(gaps, list) else []
+
+
+def _covered(obj: dict) -> set[str]:
+    out: set[str] = set()
+    for f in obj.get("findings") or []:
+        if isinstance(f, dict):
+            out |= _tags_of(str(f.get("finding") or ""))
+    for g in _gap_list(obj):
+        out |= _tags_of(str(g))
+    return out
 
 
 def coverage_problems(obj: dict | None, tags: list[str]) -> list[str]:
     """Every numbered question needs a finding OR a gap that starts with its tag."""
     if not tags or not isinstance(obj, dict):
         return []
-    covered: set[str] = set()
-    for f in obj.get("findings") or []:
-        m = _TAGGED.match(str(f.get("finding") or "")) if isinstance(f, dict) else None
-        if m:
-            covered.add(m.group(1))
-    for g in obj.get("gaps") or []:
-        m = _TAGGED.match(str(g))
-        if m:
-            covered.add(m.group(1))
+    covered = _covered(obj)
     missing = [t for t in tags if t not in covered]
     if not missing:
         return []
@@ -241,22 +264,17 @@ def _gap_skipped_questions(obj: dict, tags: list[str]) -> None:
     tagged gap gets an explicit gap, so the caller re-asks it alone instead of never knowing."""
     if not coverage_problems(obj, tags):
         return
-    covered = {m.group(1) for m in (_TAGGED.match(str(f.get("finding") or ""))
-                                    for f in obj.get("findings") or [] if isinstance(f, dict)) if m}
-    covered |= {m.group(1) for m in (_TAGGED.match(str(g)) for g in obj.get("gaps") or []) if m}
-    gaps = obj.get("gaps") if isinstance(obj.get("gaps"), list) else []
-    gaps.extend(f"{t}: not answered by the extract worker — ask it again in its own task"
+    covered = _covered(obj)
+    gaps = _gap_list(obj)
+    gaps.extend(f"{t}: not answered — ask it again in its own task"
                 for t in tags if t not in covered)
     obj["gaps"] = gaps
 
 
 def _unit_label(messages: list) -> str:
     """A short label for the sub-agent's assigned unit — the orchestrator's task
-    description, i.e. the first real (non-nudge) human message in the sub-agent's state."""
-    for m in messages:
-        if isinstance(m, HumanMessage) and getattr(m, "name", None) != FINDINGS_NUDGE_NAME:
-            return text_of(m.content).strip()[:140]
-    return ""
+    description (see ``_brief``)."""
+    return _brief(messages).strip()[:140]
 
 
 def _replace(last: AIMessage, obj: dict) -> dict[str, Any] | None:
@@ -331,21 +349,36 @@ def _emit_findings_event(messages: list, obj: dict) -> None:
     """Emit the validated findings as a typed ``subagent_findings`` event for the UI to
     render as a folded table. Rides the same ``custom`` stream as the sub-agent's
     mcp_call rows; a host that ignores the type loses nothing."""
+    # Chart tokens stay in what the PARENT reads (so it can place them in the report) but
+    # leave the UI copy: no chart event has reached the client for them.
     findings = obj.get("findings")
+    findings = [{k: strip_chart_tokens(v) for k, v in f.items()} if isinstance(f, dict) else f
+                for f in findings] if isinstance(findings, list) else []
     emit({
         "type": "subagent_findings",
         "unit": _unit_label(messages),
-        "summary": str(obj.get("summary") or ""),
-        "findings": findings if isinstance(findings, list) else [],
-        "gaps": obj.get("gaps") if isinstance(obj.get("gaps"), list) else [],
+        "summary": strip_chart_tokens(str(obj.get("summary") or "")),
+        "findings": findings,
+        "gaps": [strip_chart_tokens(g) for g in _gap_list(obj)],
     })
 
 
 class SubagentFindingsMiddleware(AgentMiddleware):
-    """Attached to the research sub-agent (``subagent_spec["middleware"]``), NOT the
-    orchestrator. Stateless across invocations on purpose — one instance serves every
-    parallel `task` call, so the nudge cap is counted from the sub-agent's own message
-    state, never from instance attributes."""
+    """Attached to the research and extract sub-agents, NOT the orchestrator. Stateless
+    across invocations on purpose — one instance serves every parallel `task` call, so the
+    nudge cap is counted from the sub-agent's own message state, never from instance
+    attributes.
+
+    ``batched_questions``: hold the handoff to a Q1..Q3 brief's tags. Only the extract
+    worker is briefed that way; a research unit is often a reporting PERIOD, and its quarters
+    must never read as questions it skipped."""
+
+    def __init__(self, *, batched_questions: bool = False) -> None:
+        super().__init__()
+        self.batched_questions = batched_questions
+
+    def _questions(self, messages: list) -> list[str]:
+        return brief_questions(messages) if self.batched_questions else []
 
     @hook_config(can_jump_to=["model"])
     def after_model(self, state: dict, runtime) -> dict[str, Any] | None:
@@ -360,7 +393,7 @@ class SubagentFindingsMiddleware(AgentMiddleware):
         obj = extract_findings(content)
         problems = _problems(obj)
         # A batched brief (Q1..Q3): each question answered or explicitly gapped, by tag.
-        problems.extend(coverage_problems(obj, brief_questions(messages)))
+        problems.extend(coverage_problems(obj, self._questions(messages)))
         # The parent gets the WHOLE message, not the parsed object — a series pasted after
         # the closing brace reached an orchestrator that way. Text outside the object is
         # held to the same standard as a field.
@@ -390,7 +423,7 @@ class SubagentFindingsMiddleware(AgentMiddleware):
                 _sanitize(obj)
                 # A batched question still unanswered is a hole the caller must see: name
                 # it as a gap so the question can be re-asked in its own task, not lost.
-                _gap_skipped_questions(obj, brief_questions(messages))
+                _gap_skipped_questions(obj, self._questions(messages))
                 log.warning("FINDINGS GATE: nudges exhausted — accepting the sanitized object "
                             "only: %s", problems)
                 _emit_findings_event(messages, obj)

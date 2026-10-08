@@ -3,9 +3,9 @@
 When the estimated size of the next model call crosses ``trigger_tokens`` (0 disables),
 everything before a recent tail is summarized on the tier's compaction model and the history
 becomes ``[summary, anchor, tail]``. The trigger is per ROLE — ``compaction_trigger``: the
-absolute knob (``compaction_tokens``) or ``compaction_window_fraction`` of the role model's
-context window as OpenRouter's endpoint feed reports it, whichever is lower; no feed, the
-absolute alone. The
+role's absolute knob (``orchestrator_compaction_tokens`` / ``compaction_tokens``) or
+``compaction_window_fraction`` of the role model's context window as OpenRouter's endpoint
+feed reports it, whichever is lower; no feed, a conservative ``UNKNOWN_WINDOW_TRIGGER``. The
 summary is a HumanMessage tagged ``COMPACTION_SUMMARY_NAME`` placed BEFORE the turn's anchor
 (the real user message), so ``current_turn()`` keeps working. The dropped tool calls/tokens
 are kept in state keyed to the anchor id (``compacted_counts``) so budget/metering still see
@@ -24,8 +24,9 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from typing_extensions import NotRequired
 
 from .events import emit
-from .turn import (CHARS_PER_TOKEN, COMPACTION_SUMMARY_NAME, current_turn, raw_text,
-                   text_of, tokens_in, tool_calls_in, tool_calls_of, turn_anchor_index)
+from .turn import (CHARS_PER_TOKEN, COMPACTION_SUMMARY_NAME, budget_tokens_in, current_turn,
+                   raw_text, text_of, tokens_in, tool_calls_in, tool_calls_of,
+                   turn_anchor_index)
 from .model_errors import (ainvoke_with_routing_fallback, invoke_with_routing_fallback,
                            model_slug)
 
@@ -73,31 +74,48 @@ _SUMMARY_PREFIX = (
 class CompactionState(AgentState):
     """What compaction summarized out of the CURRENT turn."""
     compacted_tool_calls: NotRequired[int]
-    compacted_tokens: NotRequired[int]
+    compacted_tokens: NotRequired[int]           # real totals (metering)
+    compacted_budget_tokens: NotRequired[int]    # cached input discounted (budget)
     compaction_anchor_id: NotRequired[str]
 
 
-def compacted_counts(state: dict) -> tuple[int, int]:
-    """``(tool_calls, tokens)`` summarized out of the current turn; ``(0, 0)`` unless the
-    stored anchor id matches the current turn's anchor (stale counters never leak)."""
+def _counters_current(state: dict) -> bool:
+    """The stored counters belong to the current turn (stale counters never leak)."""
     anchor_id = state.get("compaction_anchor_id")
     if not anchor_id:
-        return 0, 0
+        return False
     msgs = state.get("messages") or []
     i = turn_anchor_index(msgs)
-    if i < 0 or getattr(msgs[i], "id", None) != anchor_id:
+    return i >= 0 and getattr(msgs[i], "id", None) == anchor_id
+
+
+def compacted_counts(state: dict) -> tuple[int, int]:
+    """``(tool_calls, tokens)`` summarized out of the current turn, tokens as real totals;
+    ``(0, 0)`` unless the counters belong to the current turn."""
+    if not _counters_current(state):
         return 0, 0
     return int(state.get("compacted_tool_calls") or 0), int(state.get("compacted_tokens") or 0)
 
 
+def compacted_budget_tokens(state: dict) -> int:
+    """The budget weight of what was summarized out of the current turn. A thread
+    compacted before the discount existed has only the real total: count that."""
+    if not _counters_current(state):
+        return 0
+    weighted = state.get("compacted_budget_tokens")
+    return int(weighted if weighted is not None else state.get("compacted_tokens") or 0)
+
+
 def turn_spend(state: dict, turn: list | None = None) -> tuple[int, int]:
-    """The turn's real ``(tool_calls, tokens)``: transcript plus compacted-away spend.
+    """The turn's ``(tool_calls, budget tokens)``: transcript plus compacted-away spend,
+    cached input discounted (``turn.budget_tokens``).
     The one accessor budget.py and citations.py read; they pass the ``current_turn`` slice
     they already hold so the messages are not walked twice."""
     if turn is None:
         turn = current_turn(state.get("messages") or [])
-    compacted_calls, compacted_tokens = compacted_counts(state)
-    return tool_calls_in(turn) + compacted_calls, tokens_in(turn) + compacted_tokens
+    compacted_calls, _ = compacted_counts(state)
+    return (tool_calls_in(turn) + compacted_calls,
+            budget_tokens_in(turn) + compacted_budget_tokens(state))
 
 
 def _short(s: str, n: int) -> str:
@@ -122,7 +140,7 @@ def _context_estimate(messages: list) -> int:
 def _transcript(messages: list, max_chars: int = _MAX_TRANSCRIPT_CHARS) -> str:
     """The summarizer's input: every message as a labeled entry cut to ``_MAX_ENTRY_CHARS``,
     the whole bounded to ``max_chars`` (oldest trimmed). The bound must grow with the
-    trigger — at an 800k-token trigger a fixed 400k chars would hand the summarizer a
+    trigger — at a 600k-token trigger a fixed 400k chars would hand the summarizer a
     fraction of the work and the summary would silently drop the rest."""
     lines: list[str] = []
     for m in messages:
@@ -140,14 +158,25 @@ def _transcript(messages: list, max_chars: int = _MAX_TRANSCRIPT_CHARS) -> str:
     return text
 
 
+# Trigger when the role model's window is UNKNOWN (feed down, off OpenRouter, slug not
+# listed): a 600k trigger on a 200k-window model overflows before it ever fires, and there
+# is no other summarizer behind ours (deepagents' is excluded in agent.py). 170k is the
+# fixed trigger that summarizer applied to these profile-less models, i.e. what these runs
+# had before.
+UNKNOWN_WINDOW_TRIGGER = 170_000
+
+
 def compaction_trigger(absolute: int, window: int | None, fraction: float) -> int:
     """Where compaction fires for one role's model: ``absolute`` (the knob), or ``fraction``
-    of the model's context ``window`` when that is lower. Off (absolute <= 0) stays off; no
-    window, or the window rule off (fraction <= 0), leaves the absolute."""
+    of the model's context ``window`` when that is lower. Off (absolute <= 0) stays off; the
+    window rule off (fraction <= 0) leaves the absolute; an unknown window caps it at
+    ``UNKNOWN_WINDOW_TRIGGER``."""
     if absolute <= 0:
         return 0
-    if not window or window <= 0 or fraction <= 0:
+    if fraction <= 0:
         return int(absolute)
+    if not window or window <= 0:
+        return min(int(absolute), UNKNOWN_WINDOW_TRIGGER)
     return min(int(absolute), int(window * fraction))
 
 
@@ -156,8 +185,9 @@ class ContextCompactionMiddleware(AgentMiddleware):
 
     def __init__(self, model, *, trigger_tokens: int,
                  keep_recent: int = DEFAULT_KEEP_RECENT,
-                 summarizer_window: int | None = None) -> None:
+                 summarizer_window: int | None = None, routing_ttl: float = 300.0) -> None:
         super().__init__()
+        self.routing_ttl = routing_ttl  # how long a routing relax level that worked is remembered
         self.model = model
         self.trigger_tokens = int(trigger_tokens)
         self.keep_recent = max(1, int(keep_recent))
@@ -193,14 +223,21 @@ class ContextCompactionMiddleware(AgentMiddleware):
             "summarized": summarized,
             "dropped_calls": tool_calls_in(zone_current),
             "dropped_tokens": tokens_in(zone_current),
+            "dropped_budget_tokens": budget_tokens_in(zone_current),
         }
 
     def transcript_chars(self) -> int:
         """Summarizer input bound: 2 chars (~half a token) per trigger token — or per token
-        of the compaction model's own window when that is smaller — never below the floor.
-        ~400k tokens at the 800k default, inside every compaction model's window."""
+        of the compaction model's own window when that is smaller — never below the floor
+        (~300k tokens at the 600k sub-agent default), and never past 1.5 chars per token of a known
+        window: JSON and numbers tokenize at ~2 chars/token, and the prompt and the summary
+        need room too — a small-window summarizer must never get more than it can read (it
+        would fail, and fail again every step)."""
         tokens = min(self.trigger_tokens, self.summarizer_window or self.trigger_tokens)
-        return max(_MAX_TRANSCRIPT_CHARS, 2 * tokens)
+        chars = max(_MAX_TRANSCRIPT_CHARS, 2 * tokens)
+        if self.summarizer_window:
+            chars = min(chars, int(1.5 * self.summarizer_window))
+        return chars
 
     def _summary_input(self, plan: dict[str, Any]) -> list:
         transcript = _transcript(plan["summarized"], max_chars=self.transcript_chars())
@@ -226,6 +263,7 @@ class ContextCompactionMiddleware(AgentMiddleware):
                          *plan["tail"]],
             "compacted_tool_calls": prev_calls + plan["dropped_calls"],
             "compacted_tokens": prev_tokens + plan["dropped_tokens"],
+            "compacted_budget_tokens": compacted_budget_tokens(state) + plan["dropped_budget_tokens"],
             "compaction_anchor_id": anchor.id,
         }
 
@@ -250,7 +288,8 @@ class ContextCompactionMiddleware(AgentMiddleware):
             return None
         try:
             response = invoke_with_routing_fallback(self.model, self._summary_input(plan),
-                                                    role="compaction", slug=model_slug(self.model))
+                                                    role="compaction", slug=model_slug(self.model),
+                                                    ttl=self.routing_ttl)
         except Exception as exc:
             log.warning("COMPACTION: summarizer failed (%s) — leaving context as-is", exc)
             return None
@@ -262,7 +301,8 @@ class ContextCompactionMiddleware(AgentMiddleware):
             return None
         try:
             response = await ainvoke_with_routing_fallback(
-                self.model, self._summary_input(plan), role="compaction", slug=model_slug(self.model))
+                self.model, self._summary_input(plan), role="compaction", slug=model_slug(self.model),
+                ttl=self.routing_ttl)
         except Exception as exc:
             log.warning("COMPACTION: summarizer failed (%s) — leaving context as-is", exc)
             return None

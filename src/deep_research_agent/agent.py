@@ -57,9 +57,16 @@ log = logging.getLogger("deep_research_agent.agent")
 # it and got back "the report has been compiled" with nothing behind it. Provider-wide
 # opt-out, merged onto deepagents' built-in openai profile (registrations are additive);
 # every model here is a ChatOpenAI over OpenRouter, so "openai" covers the whole fleet.
+#
+# Same profile: drop deepagents' own SummarizationMiddleware. Our models carry no profile, so
+# it defaults to a fixed 170k-token trigger and summarizes on each ROLE's model — invisible
+# while our compaction fired first at 100k, but with ContextCompactionMiddleware's per-role
+# trigger at up to 600k it would run instead: on the expensive model, without the routing
+# fallback, writing history files into the sandbox. Compaction is ours alone.
 register_harness_profile(
     "openai",
-    HarnessProfile(general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False)),
+    HarnessProfile(general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+                   excluded_middleware=frozenset({"SummarizationMiddleware"})),
 )
 
 
@@ -255,21 +262,25 @@ async def make_graph(config: dict | None = None):
     cache_middleware: list = ([PromptCacheMiddleware()]
                               if cfg.prompt_caching and cfg.is_openrouter else [])
     # Context windows from the same endpoint feed the routing read (cached): the trigger is
-    # compaction_tokens or compaction_window_fraction of the role model's window, whichever
+    # the role's absolute (orchestrator_compaction_tokens for the orchestrator,
+    # compaction_tokens for sub-agents) or compaction_window_fraction of its window, whichever
     # is lower — a smaller-window model in a tier compacts in time without a config edit.
-    # No feed (off OpenRouter, unreachable) -> the absolute alone. Self-disables at 0.
+    # No feed (off OpenRouter, unreachable) -> a conservative 170k. Self-disables at 0.
     windows = await context_windows(cfg, (cfg.research_model, cfg.subagent_model,
                                           cfg.utility_model, cfg.compaction_model,
                                           cfg.coding_model), routing)
 
     def compaction_for(role: str, slug: str) -> ContextCompactionMiddleware:
-        trigger = compaction_trigger(cfg.compaction_tokens, windows.get(slug),
+        absolute = (cfg.orchestrator_compaction_tokens if role == "orchestrator"
+                    else cfg.compaction_tokens)
+        trigger = compaction_trigger(absolute, windows.get(slug),
                                      cfg.compaction_window_fraction)
         log.info("COMPACTION role=%s model=%s window=%s trigger=%s", role, slug,
                  f"{windows[slug]:,}" if windows.get(slug) else "unknown",
                  f"{trigger:,}" if trigger else "off")
         return ContextCompactionMiddleware(compaction_model, trigger_tokens=trigger,
-                                           summarizer_window=windows.get(cfg.compaction_model))
+                                           summarizer_window=windows.get(cfg.compaction_model),
+                                           routing_ttl=cfg.provider_routing_ttl)
 
     # A sub-agent owns ONE UNIT of research (e.g. a single entity / period / segment): it makes
     # ALL the calls that unit needs in its OWN context and returns only consolidated dense
@@ -359,7 +370,7 @@ async def make_graph(config: dict | None = None):
             "system_prompt": extract_prompt(cfg.domain_prompt),
             "tools": [],
             "model": utility_model,
-            "middleware": [SubagentFindingsMiddleware(),
+            "middleware": [SubagentFindingsMiddleware(batched_questions=True),
                            SubagentUsageMiddleware(meter, "extract-subagent",
                                                    model=cfg.utility_model),
                            # Its whole job runs as `execute` heredocs — this is the
@@ -439,7 +450,7 @@ async def make_graph(config: dict | None = None):
     middleware = [
         # First: a ~250-token verdict on the research model. A pure-knowledge question is
         # answered right here and the turn ends, never paying the ~12k-token harness below.
-        TriageRouterMiddleware(research_model),
+        TriageRouterMiddleware(research_model, routing_ttl=cfg.provider_routing_ttl),
         # Compaction must run before BudgetMiddleware so the budget check sees the shrunk
         # transcript plus the compacted_* counters.
         *shared_middleware,

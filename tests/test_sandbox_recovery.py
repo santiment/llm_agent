@@ -78,3 +78,49 @@ def test_parallel_callers_on_a_dead_session_share_one_replacement():
     assert b._reset_session("s1", "first caller") == "s2"
     assert b._reset_session("s1", "second caller, same dead session") == "s2"
     assert [c for c in calls if c == ("POST", "/sessions")] == [("POST", "/sessions")] * 2
+
+
+def test_concurrent_resets_open_one_session_and_announce_one_loss(capture_events):
+    """Many sub-agents hit the same dead session at once: exactly one replacement, one
+    `sandbox_reset` event — the whole reset runs under the lock."""
+    import threading
+
+    b, calls = _backend({"s2": "ok\n"})
+    assert b._ensure_session() == "s1"
+    results, barrier = [], threading.Barrier(8)
+
+    def hit():
+        barrier.wait()
+        results.append(b._reset_session("s1", "session gone"))
+
+    threads = [threading.Thread(target=hit) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert set(results) == {"s2"}
+    assert calls.count(("POST", "/sessions")) == 2
+    assert len([e for e in capture_events if e.get("state") == "sandbox_reset"]) == 1
+
+
+def test_no_session_opens_after_close():
+    """A worker still running when the run ends must not open an orphan session."""
+    import pytest
+
+    b, calls = _backend({"s1": "ok\n"})
+    b._ensure_session()
+    b.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        b._reset_session("s1", "404 after close")
+    with pytest.raises(RuntimeError, match="closed"):
+        b.execute("echo hi")
+    assert calls.count(("POST", "/sessions")) == 1
+
+
+def test_session_id_is_published_only_after_seeding():
+    b, calls = _backend({"s1": "ok\n"})
+    seen = []
+    real = b._upload
+    b._upload = lambda sid, files: (seen.append(b._session_id), real(sid, files))[1]
+    b._ensure_session()
+    assert seen == [None]          # seeding ran before the id became visible to other callers

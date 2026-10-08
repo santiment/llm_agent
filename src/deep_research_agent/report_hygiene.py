@@ -126,6 +126,17 @@ def chart_refs(md: str) -> list[str]:
     return list(dict.fromkeys(CHART_REF.findall(_FENCED.sub("", md or ""))))
 
 
+# Any chart token, own-line or inline — for text shown to the user OUTSIDE the report.
+_ANY_CHART_TOKEN = re.compile(r"[ \t]*\[chart:[0-9a-f]{8}\]")
+
+
+def strip_chart_tokens(text: str) -> str:
+    """``text`` without chart tokens. Only a report places charts; anywhere else (a
+    sub-agent's findings on the event stream) the token resolves to nothing the client
+    holds and would render raw."""
+    return _ANY_CHART_TOKEN.sub("", text) if isinstance(text, str) else text
+
+
 def drop_chart_refs(md: str, ids) -> str:
     """Remove the own-line placements of ``ids`` — charts the run no longer holds — so the
     reader gets no dangling token. Other placements and everything else stay put."""
