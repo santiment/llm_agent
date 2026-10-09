@@ -48,6 +48,15 @@ _TERMINAL_TOOLS = {"submit_report", "request_clarification"}
 _CALC_TOOLS = {"execute"}
 
 
+def final_reply(messages: list) -> AIMessage | None:
+    """The last message when it is an AI reply with no tool calls — the agent stopping
+    (a report, a handoff, a question, or a stall) — else None: the loop continues."""
+    last = messages[-1] if messages else None
+    if not isinstance(last, AIMessage) or getattr(last, "tool_calls", None):
+        return None
+    return last
+
+
 def turn_anchor_index(messages: list) -> int:
     """Index of the current turn's anchor (the last real HumanMessage), or -1."""
     for i in range(len(messages) - 1, -1, -1):
@@ -115,6 +124,26 @@ def tool_names_in(messages: list) -> Iterator[str]:
                 yield name
 
 
+# The submit_report tool's reply when the report reached the user. A call the quality gate
+# bounced never ran the tool and got a different reply, so "submit_report was called" is
+# not "a report was delivered".
+REPORT_DELIVERED = "Report delivered to the user."
+
+
+def delivered_report(messages: list) -> str:
+    """The markdown of the most recent ``submit_report`` call that actually delivered —
+    its tool result is the tool's own ``REPORT_DELIVERED`` reply — else ""."""
+    done = {m.tool_call_id for m in messages
+            if isinstance(m, ToolMessage) and text_of(m.content).startswith(REPORT_DELIVERED)}
+    for m in reversed(messages):
+        for tc in getattr(m, "tool_calls", None) or []:
+            if tc_name(tc) == "submit_report" and tc_id(tc) in done:
+                rep = tc_args(tc).get("report_markdown")
+                if isinstance(rep, str) and rep.strip():
+                    return rep
+    return ""
+
+
 def called(messages: list, name: str) -> bool:
     """True if a tool with ``name`` was invoked anywhere in the given messages."""
     return any(n == name for n in tool_names_in(messages))
@@ -159,7 +188,7 @@ def raw_text(content) -> str:
 
 def message_tokens(m) -> int:
     """One message's tokens: ``usage_metadata`` → ``response_metadata.token_usage`` →
-    chars/4. Budget enforcement and metering both sum this."""
+    chars/4. Metering sums this (real totals); the budget sums ``budget_tokens``."""
     um = getattr(m, "usage_metadata", None)
     t = um.get("total_tokens") if isinstance(um, dict) else None
     if not t:
@@ -170,10 +199,41 @@ def message_tokens(m) -> int:
     return int(t or 0)
 
 
+# What a cached prompt token weighs in the run budget. Every step re-sends the whole
+# context, so a raw total grows with the square of the step count; but a prefix the
+# provider serves from cache is billed at ~0.1x (OpenAI / Gemini cache reads; DeepSeek is
+# cheaper still). Counting it in full stopped long runs on tokens that cost little.
+CACHED_INPUT_WEIGHT = 0.1
+
+
+def cached_input_tokens(m) -> int:
+    """Prompt tokens the provider served from its cache, 0 when not reported."""
+    um = getattr(m, "usage_metadata", None)
+    cached = ((um.get("input_token_details") or {}).get("cache_read")
+              if isinstance(um, dict) else None)
+    if not cached:
+        rm = getattr(m, "response_metadata", None)
+        usage = (rm.get("token_usage") or {}) if isinstance(rm, dict) else {}
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    return int(cached or 0)
+
+
+def budget_tokens(m) -> int:
+    """One message's weight against the run budget: its tokens, with cache-read input
+    discounted to ``CACHED_INPUT_WEIGHT``."""
+    return int(message_tokens(m) - (1 - CACHED_INPUT_WEIGHT) * cached_input_tokens(m))
+
+
 def tokens_in(messages: list) -> int:
     """Cumulative model tokens across the turn's AIMessages (``message_tokens`` each),
     so the count still reflects reality on models that omit usage metadata."""
     return sum(message_tokens(m) for m in messages if isinstance(m, AIMessage))
+
+
+def budget_tokens_in(messages: list) -> int:
+    """The turn's spend against the token budget: ``budget_tokens`` over its AIMessages —
+    chars/4 on models that omit usage metadata, so the ceiling still bites there."""
+    return sum(budget_tokens(m) for m in messages if isinstance(m, AIMessage))
 
 
 def tool_calls_in(messages: list) -> int:

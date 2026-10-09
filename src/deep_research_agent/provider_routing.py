@@ -1,22 +1,24 @@
 """Per-model OpenRouter provider routing from the live endpoint feed.
 
-Rules, all config knobs: among a model's HEALTHY endpoints (status ok, ``uptime_last_30m``
->= ``provider_min_uptime``) the cheapest sets the price baseline; anything above
-``provider_max_price_factor`` x that is refused with ``max_price`` (hard — OpenRouter
-errors rather than falls back, which is why the baseline is re-read every
-``provider_routing_ttl`` seconds), providers with no healthy endpoint go on ``ignore``, and
-the soft ``preferred_*`` thresholds order what is left. The feed
-(``GET /api/v1/models/{slug}/endpoints``, public) unreachable or empty -> soft preferences
-only, logged; nothing here can fail a graph build.
+Rules, all config knobs: a model's providers with no HEALTHY endpoint (status ok,
+``uptime_last_30m`` >= ``provider_min_uptime``) go on ``ignore``, and the soft
+``preferred_*`` thresholds order what is left. The feed (``GET
+/api/v1/models/{slug}/endpoints``, public) is re-read every ``provider_routing_ttl``
+seconds; unreachable or empty -> soft preferences only, logged; nothing here can fail a
+graph build.
 
-A cap OpenRouter cannot satisfy is a 404 on the call, not a fallback: its account-side
-filters (tier, data policy) run BEFORE the price filter and the public feed knows nothing
-of them, so the cheapest endpoint that anchors the cap may be one the account cannot route
-to. ``relax`` is the ladder the model-call fallback climbs on that 404
-(``model_errors.ProviderRoutingFallbackMiddleware``): drop the cap, then the provider
-lists, then the whole object. ``remember_relaxed`` keeps the level that worked per model
-for ``provider_routing_ttl`` seconds, so every role sharing the model and the next graph
-build start there instead of paying a refused call each.
+No price cap. One was here (1.25x the cheapest healthy endpoint) until a near-free FP4
+listing ($0.008 / $0.079 against ~$0.13 / $0.26 for the rest) became the baseline and
+pinned every call of the model to that single endpoint. Price stays OpenRouter's job: its
+default balancing is price-weighted already.
+
+An ignore list OpenRouter cannot satisfy is a 404 on the call, not a fallback: its
+account-side filters (tier, data policy) run first and the public feed knows nothing of
+them. ``relax`` is the ladder the model-call fallback climbs on that 404
+(``model_errors.ProviderRoutingFallbackMiddleware``): drop the provider lists, then the
+whole object. ``remember_relaxed`` keeps the level that worked per model for
+``provider_routing_ttl`` seconds, so every role sharing the model and the next graph build
+start there instead of paying a refused call each.
 """
 
 from __future__ import annotations
@@ -66,14 +68,6 @@ async def fetch_endpoints(slug: str, ttl: float, timeout: float = 5.0) -> list[d
     return eps
 
 
-def _price(ep: dict, key: str) -> float | None:
-    """$/M tokens, the unit ``max_price`` takes; the feed quotes $/token as a string."""
-    try:
-        return float(ep["pricing"][key]) * 1e6
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
 def provider_slug(ep: dict) -> str:
     """The slug ``ignore`` / ``order`` take: the endpoint tag's provider part ("deepinfra/fp8"
     -> "deepinfra"), else the display name lowercased."""
@@ -92,23 +86,16 @@ def is_healthy(ep: dict, min_uptime: float) -> bool:
 
 
 def routing(cfg: ResearchConfig, endpoints: list[dict] | None, slug: str = "") -> dict[str, Any]:
-    """One model's ``provider`` object: soft preferences always; price cap and ignore list
-    when the feed has at least one healthy endpoint to anchor them."""
+    """One model's ``provider`` object: soft preferences always; the ignore list when the
+    feed has at least one healthy endpoint (ignoring every provider would leave nothing)."""
     out = provider_preferences(cfg)
     if not endpoints:
         return out
     healthy = [e for e in endpoints if is_healthy(e, cfg.provider_min_uptime)]
     if not healthy:
-        log.warning("PROVIDER ROUTING %s: no endpoint at >= %.0f%% uptime — no price cap, "
-                    "no ignore list", slug, cfg.provider_min_uptime)
+        log.warning("PROVIDER ROUTING %s: no endpoint at >= %.0f%% uptime — no ignore list",
+                    slug, cfg.provider_min_uptime)
         return out
-    if cfg.provider_max_price_factor > 0:
-        prompts = [p for p in (_price(e, "prompt") for e in healthy) if p is not None]
-        completions = [p for p in (_price(e, "completion") for e in healthy) if p is not None]
-        if prompts and completions:
-            f = cfg.provider_max_price_factor
-            out["max_price"] = {"prompt": round(min(prompts) * f, 4),
-                                "completion": round(min(completions) * f, 4)}
     if cfg.provider_min_uptime > 0:
         ok = {provider_slug(e) for e in healthy}
         bad = sorted({provider_slug(e) for e in endpoints} - ok - {""})
@@ -117,17 +104,16 @@ def routing(cfg: ResearchConfig, endpoints: list[dict] | None, slug: str = "") -
     return out
 
 
-# Hard constraints in the order the fallback gives them up: the price cap first (its
-# baseline is the public feed's cheapest endpoint, which the account may not be allowed to
-# route to), then the provider lists, then the whole object (OpenRouter's own routing).
-_RELAX_STEPS: tuple[tuple[str, ...], ...] = (("max_price",), ("ignore", "order", "only"))
+# Hard constraints in the order the fallback gives them up: the provider lists, then the
+# whole object (OpenRouter's own routing).
+_RELAX_STEPS: tuple[tuple[str, ...], ...] = (("ignore", "order", "only"),)
 MAX_RELAX_LEVEL = len(_RELAX_STEPS) + 1
 
 
 def relax(provider: dict[str, Any] | None, level: int) -> dict[str, Any]:
     """The routing object with its hard constraints relaxed ``level`` steps: 1 drops the
-    price cap, 2 the ignore/order/only lists as well, ``MAX_RELAX_LEVEL`` everything — the
-    bare model, routed by OpenRouter alone. 0 is a copy, unchanged."""
+    ignore/order/only lists, ``MAX_RELAX_LEVEL`` everything — the bare model, routed by
+    OpenRouter alone. 0 is a copy, unchanged."""
     if level >= MAX_RELAX_LEVEL:
         return {}
     out = dict(provider or {})
@@ -171,22 +157,12 @@ def relaxed_level(slug: str) -> int:
 
 def admitted(cfg: ResearchConfig, endpoints: list[dict] | None,
              provider: dict[str, Any] | None) -> list[dict]:
-    """The endpoints a call may land on under ``provider``: healthy, not on ``ignore``, within
-    ``max_price``. When that admits none (a relaxed object, or a cap the feed moved under),
-    every healthy endpoint — the call goes wherever OpenRouter sends it."""
+    """The endpoints a call may land on under ``provider``: healthy and not on ``ignore``.
+    When that admits none, every healthy endpoint — the call goes wherever OpenRouter
+    sends it."""
     healthy = [e for e in endpoints or [] if is_healthy(e, cfg.provider_min_uptime)]
-    provider = provider or {}
-    cap = provider.get("max_price") or {}
-    ignore = set(provider.get("ignore") or [])
-    out = []
-    for e in healthy:
-        if provider_slug(e) in ignore:
-            continue
-        if cap:
-            p, c = _price(e, "prompt"), _price(e, "completion")
-            if p is None or c is None or p > cap.get("prompt", p) or c > cap.get("completion", c):
-                continue
-        out.append(e)
+    ignore = set((provider or {}).get("ignore") or [])
+    out = [e for e in healthy if provider_slug(e) not in ignore]
     return out or healthy
 
 
@@ -222,7 +198,7 @@ async def resolve(cfg: ResearchConfig, slugs: Iterable[str]) -> dict[str, dict[s
     slugs = sorted(set(slugs))
     if not cfg.is_openrouter:
         return {s: {} for s in slugs}
-    live = cfg.provider_max_price_factor > 0 or cfg.provider_min_uptime > 0
+    live = cfg.provider_min_uptime > 0
     feeds = (await asyncio.gather(*(fetch_endpoints(s, cfg.provider_routing_ttl) for s in slugs))
              if live else [None] * len(slugs))
     out: dict[str, dict[str, Any]] = {}
@@ -230,8 +206,8 @@ async def resolve(cfg: ResearchConfig, slugs: Iterable[str]) -> dict[str, dict[s
         out[s] = routing(cfg, eps, s)
         if eps is not None:
             healthy = sum(is_healthy(e, cfg.provider_min_uptime) for e in eps)
-            log.info("PROVIDER ROUTING %s: %d/%d endpoints healthy; max_price=%s ignore=%s",
-                     s, healthy, len(eps), out[s].get("max_price"), out[s].get("ignore") or [])
+            log.info("PROVIDER ROUTING %s: %d/%d endpoints healthy; ignore=%s",
+                     s, healthy, len(eps), out[s].get("ignore") or [])
         level = relaxed_level(s)
         if level and (relaxed := relax(out[s], level)) != out[s]:
             log.warning("PROVIDER ROUTING %s: starting at relax level %d/%d (%s) — OpenRouter "

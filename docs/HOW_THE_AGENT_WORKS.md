@@ -5,7 +5,8 @@
 This document explains the agent end-to-end: what happens when a question comes in, how the work
 is planned and delegated, how data is gathered and turned into analysis, and the guardrails that
 keep a run honest. It is written to be read top-to-bottom by anyone on the team, but each section
-also stands alone.
+also stands alone. To watch one run step through it — lanes per actor, the event stream, and
+what the user sees — open [`how-the-agent-works.html`](how-the-agent-works.html) in a browser.
 
 ---
 
@@ -106,10 +107,10 @@ three that shape a run:
 
 | Tier        | research (orchestrator) | subagent (workers)      | utility (extract)       | Use for |
 |-------------|-------------------------|-------------------------|-------------------------|---------|
-| `extra-low` | deepseek-v4-flash-0731  | deepseek-v4-flash-0731  | deepseek-v4-flash-0731  | demos, smoke tests, high-volume low-stakes |
-| `low`       | deepseek-v4.1-flash     | deepseek-v4-flash-0731  | deepseek-v4-flash-0731  | cheapest sane agent |
-| `mid`       | gemini-3.8-flash        | deepseek-v4.1-flash     | deepseek-v4-flash-0731  | the value sweet spot |
-| `high`      | gpt-5.6-sol             | gemini-3.8-flash        | deepseek-v4-flash-0731  | best quality per dollar |
+| `extra-low` | gpt-6-luna              | gpt-6-luna              | gpt-6-luna              | demos, smoke tests, high-volume low-stakes |
+| `low`       | deepseek-v4.1-flash     | gpt-6-luna              | gpt-6-luna              | cheapest sane agent |
+| `mid`       | gemini-3.8-flash        | deepseek-v4.1-flash     | gpt-6-luna              | the value sweet spot |
+| `high`      | gpt-6.1-sol             | gemini-3.8-flash        | gpt-6-luna              | best quality per dollar |
 
 The default is `extra-low` so a bare checkout can't silently burn money — production callers opt
 **up** explicitly. The core idea of **model tiering**: a strong orchestrator *plans and
@@ -234,12 +235,13 @@ A few important behaviors:
   waits out retryable model errors (429 / 5xx / timeout) within `model_rate_limit_max_wait`
   (`model_errors.py`), and if a sub-agent still dies mid-`task`, the orchestrator receives an error
   tool result — retry the unit or report the gap — rather than the exception ending the run.
-- **A routing preference of ours can never make a model unreachable.** The price cap and ignore
-  list (`provider_routing.py`) are hard on OpenRouter's side, and its account filters run before
-  them on endpoints the public feed lists — a cap anchored on an endpoint the account cannot use
-  leaves nothing and the call 404s (`No endpoints found that satisfy the max price`). The
+- **A routing preference of ours can never make a model unreachable.** The ignore list
+  (`provider_routing.py`) is hard on OpenRouter's side, and its account filters run before it on
+  endpoints the public feed lists — what the list leaves may be endpoints the account cannot use,
+  and the call 404s (`No endpoints found …`). There is no price cap: one anchored on a near-free
+  FP4 listing once pinned a model to that single endpoint. The
   `ProviderRoutingFallbackMiddleware` (`model_errors.py`, right outside the backoff) retries at
-  once with the cap dropped, then the ignore list, then no routing object at all, emits
+  once with the ignore list dropped, then no routing object at all, emits
   `provider_fallback` per step, and remembers the level per model for the routing TTL so parallel
   roles and the next graph build start there. The triage router and the compaction summarizer,
   which call their models outside an agent step, run the same ladder (`invoke_with_routing_fallback`).
@@ -386,19 +388,26 @@ can decide themselves. Hook points:
 - `awrap_tool_call` — wraps a specific tool call (can intercept/replace it).
 - `after_agent` — runs once when the run ends.
 
-The orchestrator's stack (assembled in `agent.py`, in this order):
+The orchestrator's stack (assembled in `agent.py`, in this order; `SkillUsageMiddleware`, the findings gate and the script capture live on the sub-agents):
 
 | Middleware | Hook | Job |
 |------------|------|-----|
-| **BudgetMiddleware** | `before_model` | Hard backstop against runaway runs. Two ceilings (cumulative tool calls, cumulative tokens). At **75%** it injects one "wrap up and deliver now" nudge; at **100%** it jumps straight to `end`. |
+| **TriageRouterMiddleware** | `before_model` | First on the stack. On the first step of a fresh user turn, a ~250-token call on the research model decides SIMPLE vs RESEARCH; SIMPLE is answered right there and the turn ends without paying the ~12k-token harness. |
+| **LoopGuardMiddleware** | `before_model` / `after_model` | Shared by every role. Repeated identical tool calls get a nudge, then a hard stop (`loop_detected` / `loop_halt`); runaway repetitive output is cut (`runaway_output` / `runaway_halt`). |
+| **ContextCompactionMiddleware** | `before_model` | On every role, one instance per role: the trigger is the role's absolute (`orchestrator_compaction_tokens` 200k, `compaction_tokens` 600k for sub-agents) or `compaction_window_fraction` of that role's model window, whichever is lower. Above it, older messages are summarized on the compaction model; budget counters carry over. |
+| **PromptCacheMiddleware** | `wrap_model_call` | On every role, OpenRouter only: `cache_control` breakpoints on the system prompt and newest messages. |
+| **BudgetMiddleware** | `before_model` | Hard backstop against runaway runs. Three ceilings (cumulative tool calls, cumulative tokens, wall-clock seconds). At **75%** of any it injects a "wrap up and deliver now" nudge (at most `MAX_BUDGET_NUDGES` = 2); at **100%** it jumps straight to `end`. |
 | **ForceCompletionMiddleware** | `after_model` | Prevents premature termination. If the model stops with a bare *"Now I will compare…"* intent message and no tool call mid-research, it nudges the model to act (capped). If the model wrote the whole report as a plain message, one mechanical "resubmit via `submit_report` verbatim" nudge; a raw JSON blob gets a "rewrite as a real report" nudge instead. |
 | **ReportQualityGateMiddleware** | `awrap_tool_call` | Intercepts `submit_report` **before** delivery. If the (scrubbed) report still violates the contract — uncited sources, an internal source split across many Sources lines, raw field names, file paths / file names / "offloaded files" / code calls — it bounces it back **once** with specific fixes. Then delivers as-is. |
 | **ResearchOutputMiddleware** | `after_agent` | Harvests sources, persists the final report into state, and authoritatively classifies *why the run ended* (see §13). Also the salvage path: if the model researched but never called `submit_report`, it recovers genuine report-looking prose (never a JSON blob, never a bare intent stub). |
-| **SkillUsageMiddleware** | `after_model` | Emits a `skill` event the first time each skill is read in a turn. |
 | **ClarificationGuardMiddleware** | `awrap_tool_call` | Blocks `request_clarification` *after* research has begun — so a weak model can't pop a nonsensical question card after minutes of work. Tells it to finish instead. |
 | **ClarificationFallbackMiddleware** | `after_model` | If the model *narrates* clarifying questions as plain text (pre-research) instead of calling the tool, this emits the `clarification` card anyway — so the UI behaves the same regardless of model. |
+| **ExecuteArtifactsMiddleware** | `wrap_tool_call` | Code the orchestrator runs inline through `execute` streams as a `script` event with its real output (it has no file tools, so this is the only trace of it). Also on every worker role. |
 | **UsageMeterMiddleware** | `before_agent` / `after_agent` | Starts the run clock and emits `run_start` (`started_at`); at the end emits the per-run `usage` event and the `RESEARCH USAGE` log line (tool calls, errors, rows/bytes, tokens, model calls, run time). `ResearchOutputMiddleware` reads the same clock, so the end `status` carries the run time in the success and the no-report case alike. |
+| **ExecuteResultGuardMiddleware** | `wrap_tool_call` | Collapses raw rows in an orchestrator `execute` result, as the report scrub does — the one remaining route for data into the expensive context. |
+| **ExcludeToolsMiddleware** | `wrap_model_call` / `wrap_tool_call` | Hides the file tools from the orchestrator (and per-role tools from the workers) and refuses them by name if called anyway. |
 | **SubagentFailureMiddleware** | `awrap_tool_call` | A sub-agent that dies mid-`task` (its model provider throttled past the backoff budget, say) comes back as an **error tool result** naming the sub-agent and the cause — the orchestrator retries the unit once or reports the gap — instead of the exception unwinding the whole run. Also on the research-subagent, which nests the extract / coding workers through its own `task`. |
+| **ProviderRoutingFallbackMiddleware** | `awrap_model_call` | On every role, right outside the backoff. When OpenRouter refuses a call because our routing object (provider lists) leaves no endpoint the account may use, it retries at once with less of it — provider lists, then the whole object — and remembers the level that worked per model. |
 | **ModelBackoffMiddleware** | `awrap_model_call` | Last on **every** role (one instance per role, so its `status` events name role + model). A retryable model error (429 / 5xx / timeout / connection) is waited out — `Retry-After`, else capped exponential backoff — and the call repeated until cumulative waiting would exceed `model_rate_limit_max_wait`; then the error stands. The SDK's own `max_retries` only covers sub-second blips; this is what survives a shared provider pool throttling for tens of seconds. |
 | **SandboxCleanupMiddleware** | `after_agent` | Destroys the run's sandbox session (only present when a sandbox is configured). |
 
@@ -430,7 +439,7 @@ That's what keeps the agent portable.
 | `subagent_findings` | a folded findings table from a worker |
 | `script` | a collapsed "view script" tab holding code an agent ran: a FILE script (basename + `language` + final source, at the worker's handoff) or INLINE code from an `execute` heredoc / `python3 -c` (`inline.py` + its real `output`, as the call returns, for every role including the orchestrator). The only place a script surfaces: no role names a script path in prose, and the coder's handoff is scrubbed of paths before the orchestrator reads it (`script_artifacts.py`) |
 | `clarification` | the question card (re-enables input) |
-| `status` | lifecycle: `mcp_ready` / `mcp_error` (tool loading), `budget_soft` / `budget_halt` (ceilings), `revising` (a gate bounced a deliverable back), `compacting` / `compacted` (context compaction), `loop_detected` / `loop_halt` (repeated-identical-call guard), `subagent_start` / `subagent_done` (a sub-agent run, with `role` + `model`), `rate_limited` / `model_unavailable` (a throttled or erroring model provider being waited out within `model_rate_limit_max_wait`, then given up on), `provider_fallback` (OpenRouter refused a call over our routing object — price cap / ignore list — and it is retried with less of it; `step`, `level`, `dropped`), `subagent_failed` (a sub-agent died mid-`task`; its caller got a tool error and the run continues), then exactly one end-state — `done` or `error`, with a `reason` code and the run time (`elapsed_s` / `elapsed`, also appended to `detail`: "… Run time 4m 12s.") |
+| `status` | lifecycle: `mcp_ready` / `mcp_error` (tool loading), `budget_soft` / `budget_halt` (ceilings), `revising` (a gate bounced a deliverable back), `compacting` / `compacted` (context compaction), `loop_detected` / `loop_halt` (repeated-identical-call guard), `subagent_start` / `subagent_done` (a sub-agent run, with `role` + `model`), `rate_limited` / `model_unavailable` (a throttled or erroring model provider being waited out within `model_rate_limit_max_wait`, then given up on), `provider_fallback` (OpenRouter refused a call over our routing object — the ignore list — and it is retried with less of it; `step`, `level`, `dropped`), `subagent_failed` (a sub-agent died mid-`task`; its caller got a tool error and the run continues), then exactly one end-state — `done` or `error`, with a `reason` code and the run time (`elapsed_s` / `elapsed`, also appended to `detail`: "… Run time 4m 12s.") |
 | `usage` | the per-run usage summary, incl. run time (`elapsed_s`, `elapsed`, `started_at`, `finished_at`) |
 | `report` | the final markdown answer (also persisted in state) |
 
@@ -550,9 +559,10 @@ All overridable per-run (`configurable`) or via env var; defaults shown.
 | `TAVILY_API_KEY` | same | — | web search; unset → search disabled |
 | MCP servers | `DRA_MCP_SERVERS` / `DRA_MCP_URL` | none | data sources |
 | `max_tool_calls` | `DRA_MAX_TOOL_CALLS` | 200 | runaway-run ceiling |
-| `max_total_tokens` | `DRA_MAX_TOTAL_TOKENS` | 4,000,000 | runaway-run ceiling |
-| `compaction_tokens` | `DRA_COMPACTION_TOKENS` | 800,000 | absolute in-flight compaction trigger (est. tokens); older messages summarized on the compaction model, budget counters carry over; 0 = off |
-| `compaction_window_fraction` | `DRA_COMPACTION_WINDOW_FRACTION` | 0.8 | per role, compaction fires at this fraction of the role model's context window (OpenRouter endpoint feed) when lower than the absolute; 0 = window rule off |
+| `max_total_tokens` | `DRA_MAX_TOTAL_TOKENS` | 10,000,000 | runaway-run ceiling; cached prompt input counts at 0.1x |
+| `compaction_tokens` | `DRA_COMPACTION_TOKENS` | 600,000 | sub-agents' absolute in-flight compaction trigger (est. tokens); older messages summarized on the compaction model, budget counters carry over; 0 = off |
+| `orchestrator_compaction_tokens` | `DRA_ORCHESTRATOR_COMPACTION_TOKENS` | 200,000 | the orchestrator's trigger — it holds plans and findings, not data; 0 = off |
+| `compaction_window_fraction` | `DRA_COMPACTION_WINDOW_FRACTION` | 0.8 | per role, compaction fires at this fraction of the role model's context window (OpenRouter endpoint feed) when lower than the absolute; window unknown (no feed) → 170k; 0 = window rule off |
 | `prompt_caching` | `DRA_PROMPT_CACHING` | true | `cache_control` breakpoints on system prompt + newest messages (OpenRouter only) |
 | `web_fetch` | `DRA_WEB_FETCH` | true | full-page reader tool for sub-agents (big pages offload to the sandbox) |
 | `mcp_max_concurrency` | `DRA_MCP_MAX_CONCURRENCY` | 10 | simultaneous MCP calls cap |
@@ -561,7 +571,7 @@ All overridable per-run (`configurable`) or via env var; defaults shown.
 | `offload_results` | `DRA_OFFLOAD_RESULTS` | true | offload large results to a file vs truncate |
 | `offload_dir` | `DRA_OFFLOAD_DIR` | `/workspace/data` | where offloaded results land (inside the sandbox) |
 | sandbox | `LLM_SANDBOX_URL` (+ `_TOKEN`) | unset | enables `execute`; unset → no code execution |
-| sandbox network / timeout | `LLM_SANDBOX_NETWORK`, `LLM_SANDBOX_SESSION_TIMEOUT` | false / 900 | outbound network from inside the sandbox; session lifetime (s) |
+| sandbox network / timeout | `LLM_SANDBOX_NETWORK`, `LLM_SANDBOX_SESSION_TIMEOUT` | false / 5400 | outbound network from inside the sandbox; session lifetime (s) — must outlive `max_run_seconds`; the sandbox service clamps it to its `SANDBOX_MAX_SESSION_SECONDS` (default 3600) |
 | skills dir | `DRA_SKILLS_DIR` | `./skills` | read-only skills mount |
 | custom tools dir | `DRA_CUSTOM_TOOLS_DIR` | `./custom_tools` | drop-in tools |
 | `domain_prompt` | `DRA_DOMAIN_PROMPT` / `_FILE` | empty | deployment-specific text appended to both system prompts (§4); the `_FILE` variant reads it from a path |
@@ -572,8 +582,7 @@ All overridable per-run (`configurable`) or via env var; defaults shown.
 | `provider_min_throughput` | `DRA_PROVIDER_MIN_THROUGHPUT` | 50 | OpenRouter routing: deprioritize provider endpoints under this p50 tokens/s (soft — price weighting continues among those that qualify; the cheapest endpoints of one model run 5–10x slower than its fastest); `0` = off |
 | `provider_max_latency` | `DRA_PROVIDER_MAX_LATENCY` | 0 | same, for p50 time-to-first-token in seconds; `0` = off |
 | `provider_sort` | `DRA_PROVIDER_SORT` | — | hard override `price` / `throughput` / `latency`: top endpoint on that axis, OpenRouter load balancing off |
-| `provider_max_price_factor` | `DRA_PROVIDER_MAX_PRICE_FACTOR` | 1.25 | hard cap: refuse endpoints pricier than this x the cheapest healthy one (per axis), read per model from the live endpoint feed at graph start; `0` = off |
-| `provider_min_uptime` | `DRA_PROVIDER_MIN_UPTIME` | 97 | stability floor (% uptime, last 30 min): endpoints below it don't anchor the cap; a provider with no healthy endpoint is skipped via `ignore`; `0` = off |
+| `provider_min_uptime` | `DRA_PROVIDER_MIN_UPTIME` | 97 | stability floor (% uptime, last 30 min): a provider with no healthy endpoint is skipped via `ignore`; `0` = off |
 | `provider_routing_ttl` | `DRA_PROVIDER_ROUTING_TTL` | 300 | seconds the endpoint feed is cached across graph builds; `0` = every run |
 | `recursion_limit` | `DRA_RECURSION_LIMIT` | 4500 | LangGraph super-step ceiling (secondary guard; the budget is primary) |
 

@@ -242,6 +242,43 @@ def test_reasoning_param_reaches_only_capable_models() -> None:
     assert "reasoning" not in (rejecting.extra_body or {})
 
 
+def test_extract_runs_without_reasoning_by_default() -> None:
+    # Extraction is read-a-file-pull-the-fields: thinking was ~3/4 of its output tokens per
+    # step and kept nothing from looping. Every other role keeps the shared effort.
+    from deep_research_agent.models import build_chat_model
+
+    assert ResearchConfig.extract_reasoning_effort == "none"
+    cfg = _cfg(reasoning_effort="low", extract_reasoning_effort="none")
+    slug = MODEL_TIERS["mid"]["utility_model"]
+    extract = build_chat_model(slug, cfg, role="extract-subagent")
+    assert extract.extra_body["reasoning"] == {"enabled": False}
+    for role in ("orchestrator", "research-subagent", "coding-subagent", "compaction", ""):
+        assert build_chat_model(slug, cfg, role=role).extra_body["reasoning"] == {"effort": "low"}, role
+
+
+def test_extract_reasoning_effort_is_configurable_and_validated() -> None:
+    cfg = _cfg(reasoning_effort="medium", extract_reasoning_effort="minimal")
+    assert cfg.reasoning_effort_for("extract-subagent") == "minimal"
+    assert cfg.reasoning_effort_for("orchestrator") == "medium"
+    unknown = _cfg(extract_reasoning_effort="lots")
+    assert unknown.extract_reasoning_effort == ResearchConfig.extract_reasoning_effort
+
+
+def test_the_extract_subagent_is_built_with_its_own_effort(monkeypatch) -> None:
+    from conftest import make_graph_capture
+
+    # The extract-subagent exists only with a sandbox to offload results into.
+    monkeypatch.delenv("LLM_SANDBOX_URL", raising=False)
+    config = {"configurable": {"openai_api_key": "k", "mcp_servers": [], "model_tier": "mid",
+                               "sandbox_url": "http://sandbox.invalid:8080",
+                               "reasoning_effort": "low", "extract_reasoning_effort": "none"}}
+    captured = make_graph_capture(monkeypatch, config)
+    specs = {s["name"]: s for s in captured["subagents"]}
+    assert specs["extract-subagent"]["model"].extra_body["reasoning"] == {"enabled": False}
+    assert specs["research-subagent"]["model"].extra_body["reasoning"] == {"effort": "low"}
+    assert captured["model"].extra_body["reasoning"] == {"effort": "low"}
+
+
 
 def test_no_tier_may_name_a_model_that_cannot_cache() -> None:
     # Every ReAct step re-sends the growing prefix; a model without a cache pays full price
@@ -272,6 +309,17 @@ def test_non_caching_models_are_rejected() -> None:
     assert not cfg.caches_prompts("some/unreleased-model-v9")
     assert cfg.caches_prompts("deepseek/deepseek-v4-flash-0731")
 
+def test_walkthrough_page_mirrors_model_tiers() -> None:
+    # docs/how-the-agent-works.html shows the models per tier from an embedded copy of
+    # MODEL_TIERS (a static page cannot import config.py) — fail when the two drift.
+    import json
+
+    page = (Path(__file__).resolve().parents[1] / "docs" / "how-the-agent-works.html").read_text()
+    block = re.search(r'<script type="application/json" id="model-tiers">(.*?)</script>', page, re.S)
+    assert block, "model-tiers JSON block missing from the walkthrough page"
+    assert json.loads(block.group(1)) == MODEL_TIERS
+
+
 if __name__ == "__main__":
     test_model_tier_package_selects_all_three()
     test_bare_config_defaults_to_cheapest_tier()
@@ -287,6 +335,9 @@ if __name__ == "__main__":
     test_every_tier_model_carries_a_reasoning_flag()
     test_reasoning_is_withheld_from_unflagged_models()
     test_reasoning_param_reaches_only_capable_models()
+    test_extract_runs_without_reasoning_by_default()
+    test_extract_reasoning_effort_is_configurable_and_validated()
     test_no_tier_may_name_a_model_that_cannot_cache()
     test_non_caching_models_are_rejected()
+    test_walkthrough_page_mirrors_model_tiers()
     print("OK — tier-only model selection verified.")

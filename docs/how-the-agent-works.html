@@ -3,1043 +3,808 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>How the Deep Research Agent works — animated run</title>
+<title>Research run walkthrough</title>
+<meta name="description" content="Step-by-step replay of one deep_research_agent run: who calls whom, what streams to the client, and which guardrail fires where.">
 <style>
-  /* One deliberate theme: a dark control room. Every surface paints its own
-     background so the page holds on any host ground. */
+  /* Tokens. Light by default, dark follows the OS (or data-theme). Each lane
+     colour is an actor in the run; the same colour marks its spans, arrows and
+     events everywhere on the page. */
   :root {
-    --bg: #0e131d;
-    --panel: #151c2a;
-    --panel-2: #1b2434;
-    --panel-3: #10182490;
-    --line: #2a3547;
-    --line-soft: #222c3d;
-    --ink: #e7ecf5;
-    --muted: #93a0b4;
-    --faint: #5c6a80;
-    --orch: #e6a53c;      /* orchestrator — the smart, expensive model  */
-    --worker: #6c96e8;    /* sub-agent fleet — the cheap model          */
-    --exec: #43b787;      /* sandbox — code that really ran             */
-    --guard: #d96f5e;     /* guardrails / bounces                       */
-    --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
-    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --bg: #eef1f5; --surface: #ffffff; --surface-2: #f5f7fa;
+    --ink: #18202b; --muted: #556072; --faint: #8b94a3; --line: #d9dfe7;
+    --client: #687385; --orch: #b0721a; --fleet: #2e63c8; --worker: #7a4ec2;
+    --tools: #1c8193; --sandbox: #2a8656; --guard: #c4412d; --ok: #2a8656;
+    --cursor: #18202b0d;
+    --sans: "Avenir Next", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+    --mono: "SF Mono", ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+    --lane-h: 48px; --label-w: 212px; --phase-h: 30px; --axis-h: 22px;
+    color-scheme: light;
   }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1319; --surface: #161b23; --surface-2: #1c222c;
+      --ink: #e5e9ef; --muted: #9ba5b4; --faint: #677284; --line: #2a323e;
+      --client: #9aa5b4; --orch: #e2a649; --fleet: #7ca3f3; --worker: #b38ff0;
+      --tools: #55c3d4; --sandbox: #5cc690; --guard: #f07d6b; --ok: #5cc690;
+      --cursor: #ffffff0c; color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1319; --surface: #161b23; --surface-2: #1c222c;
+    --ink: #e5e9ef; --muted: #9ba5b4; --faint: #677284; --line: #2a323e;
+    --client: #9aa5b4; --orch: #e2a649; --fleet: #7ca3f3; --worker: #b38ff0;
+    --tools: #55c3d4; --sandbox: #5cc690; --guard: #f07d6b; --ok: #5cc690;
+    --cursor: #ffffff0c; color-scheme: dark;
+  }
+
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; }
-  body {
-    background: var(--bg);
-    color: var(--ink);
-    font-family: var(--sans);
-    font-size: 14px;
-    line-height: 1.45;
-  }
-  .app {
-    display: grid;
-    grid-template-rows: auto auto minmax(0,1fr) auto; /* header, caption, viz, ticker */
-    height: 100vh;
-    gap: 10px;
-    padding: 12px 14px;
-  }
+  html, body { margin: 0; }
+  body { background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); }
+  code { font: 12px var(--mono); background: var(--surface-2); border: 1px solid var(--line);
+         border-radius: 4px; padding: 0 4px; }
+  button, select { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--fleet); outline-offset: 2px; }
 
-  /* ---------- header ---------- */
-  header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
-  header h1 { font-size: 19px; font-weight: 750; margin: 0; letter-spacing: -.01em; }
-  header .sub { color: var(--muted); font-size: 12.5px; }
-  header .sub code { font-family: var(--mono); font-size: 11.5px; color: var(--faint); }
-  .transport { margin-left: auto; display: flex; align-items: center; gap: 6px; }
-  .transport button, .transport select {
-    background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
-    border-radius: 6px; font: 600 12px var(--mono); padding: 5px 10px; cursor: pointer;
-  }
-  .transport button:hover { border-color: var(--muted); }
-  .transport button:focus-visible, .phase:focus-visible, .transport select:focus-visible {
-    outline: 2px solid var(--orch); outline-offset: 1px;
-  }
-  .transport button[data-on="true"] { border-color: var(--orch); color: var(--orch); }
-  #stepCount { font: 600 11px var(--mono); color: var(--faint); min-width: 52px; text-align: right; }
+  .page { max-width: 1680px; margin: 0 auto; padding: 18px 20px 20px; display: grid;
+          grid-template-rows: auto auto auto minmax(300px, 1fr); grid-template-columns: minmax(0, 1fr);
+          gap: 14px; height: 100vh; }
 
-  /* ---------- main split ---------- */
-  .viz { position: relative; display: grid; grid-template-columns: 330px minmax(0,1fr); gap: 12px; min-height: 0;
-         overflow: hidden; /* pulse dots must never escape over header/caption */ }
-  /* edges + dots sit UNDER the boxes (z 1 vs node z 2): a line or pulse
-     crossing a panel disappears behind it instead of drawing over text */
-  svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; }
-  /* the moving dot rides ABOVE the boxes (z 3 vs node z 2): the flow must stay
-     visible for its whole trip — only the static dashed lines hide under panels */
-  .pulse-dot { position: absolute; width: 7px; height: 7px; border-radius: 50%; z-index: 3;
-               box-shadow: 0 0 9px 2px currentColor; pointer-events: none; }
-
-  .panel-title {
-    font: 700 10.5px var(--mono); text-transform: uppercase; letter-spacing: .12em;
-    color: var(--faint); padding: 8px 12px; border-bottom: 1px solid var(--line-soft);
-    display: flex; gap: 8px; align-items: center;
+  /* ---------- header */
+  .top { display: flex; gap: 24px; align-items: flex-end; flex-wrap: wrap; }
+  .top h1 { margin: 0; font-size: 22px; font-weight: 650; letter-spacing: -.01em; }
+  .top p { margin: 3px 0 0; color: var(--muted); max-width: 72ch; font-size: 13.5px; }
+  .top a { color: inherit; }
+  .controls { margin-left: auto; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .controls label { color: var(--muted); font-size: 12.5px; display: flex; gap: 6px; align-items: center; }
+  .btn, .controls select {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 7px;
+    padding: 5px 11px; cursor: pointer; font-size: 13px; line-height: 1.3;
   }
-  .panel-title .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
-  .panel-title .dot[data-live="1"] { background: var(--exec); box-shadow: 0 0 6px var(--exec); }
+  .btn:hover, .controls select:hover { border-color: var(--muted); }
+  .btn.primary { min-width: 72px; font-weight: 600; }
+  #count { font: 12px var(--mono); color: var(--muted); min-width: 58px; text-align: right;
+           font-variant-numeric: tabular-nums; }
 
-  /* ---------- chat client ---------- */
-  .chat { position: relative; z-index: 2; /* above the edge/pulse layer */
-          background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-          display: flex; flex-direction: column; min-height: 0; }
-  .chat-body { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
-  .bubble-user {
-    align-self: flex-end; background: #26314a;
-    border: 1px solid #33415f; border-radius: 12px 12px 3px 12px;
-    padding: 8px 11px; max-width: 92%; font-size: 13px;
-  }
-  .thinking {
-    border-left: 2px solid var(--line); padding: 2px 0 2px 10px;
-    color: var(--muted); font-style: italic; font-size: 12.5px;
-    display: flex; flex-direction: column; gap: 5px;
-  }
-  .thinking .t-label { font: 700 9.5px var(--mono); font-style: normal; text-transform: uppercase;
-                       letter-spacing: .1em; color: var(--faint); }
-  .card {
-    background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px;
-    padding: 9px 11px; font-size: 12.5px;
-  }
-  .card .card-eyebrow { font: 700 9.5px var(--mono); text-transform: uppercase; letter-spacing: .1em;
-                        color: var(--faint); margin-bottom: 6px; display: flex; gap: 6px; align-items: center; }
-  .todo-row { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; }
-  .todo-row .tick { font-family: var(--mono); font-size: 11px; color: var(--faint); }
-  .todo-row[data-done="1"] .tick { color: var(--exec); }
-  .todo-row[data-done="1"] .todo-text { color: var(--muted); text-decoration: line-through; text-decoration-color: var(--faint); }
-  .findings-card { border-left: 3px solid var(--worker); }
-  .findings-card .f-row { color: var(--muted); font-size: 12px; padding: 3px 0; border-top: 1px dashed var(--line-soft); }
-  .findings-card .f-row b { color: var(--ink); font-weight: 600; }
-  .src-chip { font: 600 10px var(--mono); color: var(--worker); }
-  .report-card { border-left: 3px solid var(--orch); }
-  .report-card h3 { margin: 2px 0 6px; font-size: 14px; }
-  .report-card p { margin: 5px 0; color: var(--muted); }
-  .report-card p b { color: var(--ink); font-weight: 600; }
-  .cite { font: 600 10px var(--mono); color: var(--orch); }
-  .report-card .sources { border-top: 1px solid var(--line-soft); margin-top: 8px; padding-top: 6px;
-                          font: 11px var(--mono); color: var(--muted); }
-  .usage-line { font: 11px var(--mono); color: var(--faint); text-align: center; }
-  .chat-input { border-top: 1px solid var(--line-soft); padding: 9px 12px; display: flex; gap: 8px; }
-  .chat-input .fake-input {
-    flex: 1; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
-    padding: 7px 10px; font-size: 13px; color: var(--ink); min-height: 33px;
-  }
-  .chat-input .fake-input:empty::before { content: "Ask a research question…"; color: var(--faint); }
-  .chat-input .send { background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
-                      border-radius: 8px; width: 36px; font-size: 15px; display: grid; place-items: center; }
-  .chat-input .send[data-hot="1"] { color: var(--orch); border-color: var(--orch); }
+  /* ---------- trace (swimlanes) */
+  /* min-height: the page grid must never squeeze the timeline (overflow-x would let it clip lanes) */
+  .trace { background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+           overflow-x: auto; overflow-y: hidden; min-height: min-content; }
+  .trace-inner { position: relative; min-width: 920px; }
+  .grid { display: grid; position: relative;
+          grid-template-columns: var(--label-w) repeat(var(--n), minmax(38px, 1fr));
+          grid-template-rows: var(--phase-h) repeat(var(--lanes), var(--lane-h)) var(--axis-h); }
+  .phase { grid-row: 1; display: flex; align-items: center; justify-content: center;
+           font-size: 12px; color: var(--faint); border-bottom: 1px solid var(--line);
+           border-left: 1px solid var(--line); cursor: pointer; background: none; border-top: 0;
+           border-right: 0; padding: 0 4px; white-space: nowrap; overflow: hidden; }
+  .phase:hover { color: var(--ink); }
+  .phase[data-state="past"] { color: var(--muted); }
+  .phase[data-state="now"] { color: var(--ink); font-weight: 650; box-shadow: inset 0 -2px 0 var(--ink); }
+  .lane-label { grid-column: 1; display: flex; flex-direction: column; justify-content: center;
+                padding: 0 12px 0 14px; border-bottom: 1px solid var(--line); min-width: 0;
+                border-left: 3px solid var(--c); }
+  .lane-label b { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .lane-label span { font: 11px var(--mono); color: var(--muted); white-space: nowrap; overflow: hidden;
+                     text-overflow: ellipsis; }
+  .cell { border-bottom: 1px solid var(--line); border-left: 1px dashed var(--line); }
+  .col-hit { grid-row: 2 / -1; cursor: pointer; z-index: 1; }
+  .col-hit[data-now="1"] { background: var(--cursor); }
+  .col-hit[data-future="1"] { background: repeating-linear-gradient(135deg, transparent 0 6px, var(--cursor) 6px 7px); }
+  .axis { grid-row: -2; font: 10.5px var(--mono); color: var(--faint); display: flex;
+          align-items: center; justify-content: center; font-variant-numeric: tabular-nums; }
+  .axis[data-now="1"] { color: var(--ink); font-weight: 700; }
 
-  /* ---------- stage ---------- */
-  .stage {
-    position: relative; border: 1px dashed #35435c; border-radius: 12px; background: var(--panel-3);
-    display: flex; flex-direction: column; gap: 18px; /* wide row gutters double as lanes for the flow dots */
-    padding: 30px 12px 12px; overflow-y: auto; min-height: 0;
-  }
-  .stage-label {
-    position: absolute; top: 8px; left: 14px; font: 700 10.5px var(--mono);
-    letter-spacing: .12em; text-transform: uppercase; color: var(--faint); z-index: 2;
-  }
-  .stage-label b { color: var(--muted); }
+  .span { position: relative; z-index: 2; align-self: center; height: 26px; margin: 0 3px;
+          border-radius: 5px; background: color-mix(in srgb, var(--c) 16%, var(--surface));
+          border: 1px solid color-mix(in srgb, var(--c) 55%, transparent);
+          border-left: 3px solid var(--c); font-size: 11.5px; padding: 0 7px; display: flex;
+          align-items: center; min-width: 0; pointer-events: none; }
+  /* The bar holds an invisible copy of its label (it sizes the bar); the visible label
+     is a separate layer ABOVE the current step's arrows, on the bar's own fill, so an
+     arrow crossing a bar shows on its body and only breaks where it passes the text. */
+  .span > span { white-space: nowrap; visibility: hidden; }
+  .span-label { position: relative; z-index: 4; align-self: center; justify-self: start;
+                margin-left: 11px; padding: 0 2px; height: 16px; line-height: 16px; border-radius: 3px;
+                font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                max-width: calc(100% - 22px); pointer-events: none;
+                background: color-mix(in srgb, var(--c) 16%, var(--surface)); }
+  .span-label[data-edge="1"] { max-width: none; }
+  .span-label.enter { animation: fade .25s .45s both; }
+  @keyframes fade { from { opacity: 0; } }
+  .span[data-open="1"] { border-right-style: dashed; border-top-right-radius: 0; border-bottom-right-radius: 0; }
+  /* A bar that reaches the current step has nothing but empty future columns to its
+     right, so it stretches to fit its label instead of cutting it to "ReAct l…". */
+  .span[data-edge="1"] { justify-self: start; width: max-content; min-width: calc(100% - 6px); }
+  .span.enter { animation: grow .5s ease-out; transform-origin: left; }
+  @keyframes grow { from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0 0 0 0); } }
 
-  .node {
-    position: relative; z-index: 2; /* above the edge/pulse layer */
-    background: var(--panel); border: 1px solid var(--line); border-radius: 9px;
-    padding: 8px 11px; opacity: .5; transition: opacity .35s, border-color .35s, box-shadow .35s;
-  }
-  .node[data-state="active"] { opacity: 1; border-color: var(--node-accent, var(--muted));
-    box-shadow: 0 0 0 1px var(--node-accent, transparent), 0 0 18px -6px var(--node-accent, transparent); }
-  .node[data-state="done"] { opacity: .82; }
-  .node[data-state="done"] .node-name::after { content: " ✓"; color: var(--exec); }
-  .node-kicker { font: 700 9.5px var(--mono); text-transform: uppercase; letter-spacing: .11em;
-                 color: var(--faint); display: flex; gap: 8px; align-items: center; justify-content: space-between; }
-  .node-name { font: 600 13px var(--sans); margin-top: 2px; }
-  .node-desc { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
-  .model-tag { font: 600 10px var(--mono); color: var(--faint); }
+  .mark { position: relative; z-index: 4; align-self: start; justify-self: end; margin: 3px 3px 0 0;
+          font: 600 10px var(--mono); padding: 0 5px; border-radius: 4px; color: var(--surface);
+          background: var(--tone); white-space: nowrap; pointer-events: none; line-height: 15px;
+          border: 1px solid var(--tone); }
+  /* gate outcomes are filled; a failed script is not a gate, so it is only outlined */
+  .mark[data-tone="ok"] { --tone: var(--ok); }
+  .mark[data-tone="bounce"] { --tone: var(--guard); }
+  .mark[data-tone="error"] { --tone: var(--guard); background: var(--surface); color: var(--guard); border-style: dashed; }
+  .mark.enter { animation: pop .4s ease-out; }
+  @keyframes pop { from { transform: scale(.4); opacity: 0; } }
 
-  .row { display: flex; gap: 14px; align-items: stretch; }
-  .row > * { flex: 1; min-width: 0; }
+  /* past arrows under the bars (z 1); current arrows + pills over them (z 3), under bar labels (z 4) */
+  svg.arrows { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 3; overflow: visible; }
+  svg.arrows.past { z-index: 1; }
+  svg.arrows path { fill: none; stroke-width: 1.6; }
+  svg.arrows path.old { opacity: .45; }
+  svg.arrows .pill { fill: var(--surface); stroke-width: 1; }
+  svg.arrows .draw { stroke-dasharray: var(--len); stroke-dashoffset: var(--len); animation: draw .7s ease-out forwards; }
+  @keyframes draw { to { stroke-dashoffset: 0; } }
+  svg.arrows text { font: 600 10.5px var(--mono); }
 
-  #makegraph .chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
-  .chip {
-    font: 600 10.5px var(--mono); padding: 3px 8px; border-radius: 20px;
-    border: 1px solid var(--line); color: var(--faint); background: var(--panel-2);
-    transition: color .3s, border-color .3s;
-  }
-  .chip[data-on="1"] { color: var(--ink); border-color: var(--muted); }
+  /* ---------- details */
+  .details { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr) minmax(0, 1fr);
+             gap: 14px; min-height: 0; }
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+           display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+  .panel h3 { margin: 0; padding: 10px 14px; font-size: 13px; font-weight: 600; color: var(--muted);
+              border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 8px; }
+  .panel h3 small { font-weight: 400; color: var(--faint); }
+  .panel-body { flex: 1; overflow-y: auto; padding: 12px 14px; }
 
-  #orch { --node-accent: var(--orch); flex: 1.6; align-self: flex-start; /* natural height — don't stretch to match the middleware stack */ }
-  .react-loop { display: flex; gap: 6px; margin-top: 8px; align-items: center; font: 600 10.5px var(--mono); color: var(--faint); }
-  .react-loop .ph { padding: 3px 9px; border-radius: 6px; border: 1px solid var(--line); transition: all .3s; }
-  .react-loop .ph[data-on="1"] { color: var(--orch); border-color: var(--orch); background: #e6a53c14; }
-  .react-loop .arrow { color: var(--faint); }
+  .story .where { font-size: 12.5px; color: var(--muted); }
+  .story h2 { margin: 2px 0 8px; font-size: 19px; line-height: 1.3; font-weight: 650; letter-spacing: -.005em; }
+  .story p { margin: 0 0 10px; max-width: 68ch; }
+  .story .enter { animation: rise .35s ease-out; }
+  @keyframes rise { from { opacity: 0; transform: translateY(5px); } }
+  .guards { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+  .guard { font-size: 12px; border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px;
+           background: var(--surface-2); }
+  .guard em { font: 11px var(--mono); font-style: normal; color: var(--muted); margin-left: 4px; }
+  .guard[data-tone="bounce"] { border-color: var(--guard); }
+  .guard[data-tone="bounce"] b { color: var(--guard); }
+  .guards-title { font-size: 12px; color: var(--muted); margin: 12px 0 0; }
 
-  /* guardrails stay ghosted until the run first touches a middleware — opacity
-     (not display) so the layout and edge routing never shift on reveal */
-  #mwstack { flex: 1.1; opacity: .12; transition: opacity .6s ease; }
-  #mwstack.on { opacity: 1; }
-  .mw-list { display: flex; flex-direction: column; gap: 3px; margin-top: 7px; }
-  .mw {
-    display: flex; justify-content: space-between; gap: 8px; align-items: baseline;
-    font: 600 10.5px var(--mono); padding: 2.5px 7px; border-radius: 5px;
-    border: 1px solid transparent; color: var(--faint); transition: all .25s;
-  }
-  .mw .hook { font-weight: 500; font-size: 9px; color: var(--faint); opacity: .8; }
-  .mw[data-used="1"] { color: var(--muted); border-color: var(--line-soft); }
-  .mw.flash { color: var(--guard); border-color: var(--guard); background: #d96f5e14; }
-  .mw.flash-ok { color: var(--exec); border-color: var(--exec); background: #43b78714; }
+  .events { font: 11.5px/1.55 var(--mono); padding: 6px 0; }
+  .ev { display: grid; grid-template-columns: 128px minmax(0, 1fr); gap: 8px; padding: 2px 14px; opacity: .5; }
+  .ev[data-now="1"] { opacity: 1; background: var(--cursor); }
+  .ev[data-now="1"].enter { animation: rise .35s ease-out; }
+  .ev .t { font-weight: 700; color: var(--c, var(--muted)); }
+  .ev .p { color: var(--muted); overflow-wrap: anywhere; }
+  .ev-sep { font: 10.5px var(--sans); color: var(--faint); padding: 6px 14px 0; }
+  .empty { color: var(--faint); font: 13px var(--sans); padding: 8px 14px; }
 
-  .meters { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
-  .meter label { display: flex; justify-content: space-between; font: 600 9.5px var(--mono);
-                 color: var(--faint); margin-bottom: 3px; font-variant-numeric: tabular-nums; }
-  .meter .bar { height: 4px; border-radius: 3px; background: var(--panel-2); overflow: hidden; }
-  .meter .fill { height: 100%; width: 0%; background: var(--orch); border-radius: 3px; transition: width .5s; }
+  /* the client preview: what a frontend built on the events would render */
+  .chat { display: flex; flex-direction: column; gap: 9px; font-size: 13px; }
+  .chat .enter { animation: rise .35s ease-out; }
+  .bubble { align-self: flex-end; max-width: 88%; background: color-mix(in srgb, var(--fleet) 14%, var(--surface));
+            border-radius: 12px 12px 3px 12px; padding: 7px 11px; }
+  .thinking { color: var(--muted); font-style: italic; border-left: 2px solid var(--line); padding-left: 9px; }
+  .card { border: 1px solid var(--line); border-radius: 9px; padding: 8px 10px; background: var(--surface-2); }
+  .card .h { font-size: 11.5px; color: var(--muted); margin-bottom: 4px; display: flex; justify-content: space-between; gap: 8px; }
+  .todo { display: flex; gap: 7px; align-items: baseline; }
+  .todo i { font-style: normal; font: 11px var(--mono); color: var(--faint); width: 12px; }
+  .todo[data-done="1"] { color: var(--muted); text-decoration: line-through; text-decoration-color: var(--faint); }
+  .todo[data-done="1"] i { color: var(--ok); }
+  .spark { width: 100%; height: 46px; display: block; }
+  .script { font: 11.5px var(--mono); display: flex; flex-direction: column; gap: 2px; }
+  .script b { font-weight: 600; }
+  .script .out { color: var(--muted); }
+  .finding { border-left: 3px solid var(--fleet); }
+  .cite { font: 600 10.5px var(--mono); color: var(--fleet); }
+  .report { border-left: 3px solid var(--orch); background: var(--surface); }
+  .report h4 { margin: 0 0 4px; font-size: 14px; }
+  .report p { margin: 4px 0; }
+  .report .src { border-top: 1px solid var(--line); margin-top: 6px; padding-top: 5px; font: 11px var(--mono); color: var(--muted); }
+  .endline { text-align: center; font: 11px var(--mono); color: var(--faint); }
 
-  .sub { --node-accent: var(--worker); }
-  .sub .gate-tag { font: 600 9px var(--mono); color: var(--faint); border: 1px dashed var(--line);
-                   border-radius: 4px; padding: 1px 5px; }
-  .sub .gate-tag[data-mode="bounce"] { color: var(--guard); border-color: var(--guard); }
-  .sub .gate-tag[data-mode="pass"] { color: var(--exec); border-color: var(--exec); }
-
-  .tool { --node-accent: var(--worker); }
-  .tool .node-name { font-family: var(--mono); font-size: 12px; }
-
-  #sandbox { --node-accent: var(--exec); display: flex; gap: 12px; padding: 10px 12px; }
-  #sandbox .sb-meta { width: 218px; flex: none; display: flex; flex-direction: column; gap: 6px; }
-  #sandbox .files { font: 10.5px var(--mono); color: var(--faint); display: flex; flex-direction: column; gap: 3px; }
-  #sandbox .files .file { color: var(--exec); }
-  #sandbox .term {
-    flex: 1; background: #0a0f17; border: 1px solid var(--line-soft); border-radius: 7px;
-    font: 11px/1.55 var(--mono); color: #9fb6a9; padding: 8px 10px; overflow: auto;
-    min-height: 86px; max-height: 130px; white-space: pre; margin: 0;
-  }
-  #sandbox .term .in { color: #cfe3d8; }
-  #sandbox .term .out { color: #7fd0a8; }
-
-  /* ---------- caption + phases ---------- */
-  .caption-bar {
-    display: grid; grid-template-columns: auto minmax(0,1fr); gap: 8px 18px; align-items: start;
-    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px;
-    border-left: 3px solid var(--orch); /* the narration is the story — anchor the eye */
-  }
-  .caption-bar.flash { animation: capflash .8s ease-out; }
-  @keyframes capflash {
-    0%   { border-color: var(--orch); box-shadow: 0 0 0 1px var(--orch) inset, 0 0 22px -8px var(--orch); }
-    100% { border-color: var(--line); border-left-color: var(--orch); box-shadow: none; }
-  }
-  .cap-text-wrap.swap { animation: capswap .35s ease-out; }
-  @keyframes capswap { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
-  .phases { display: flex; gap: 5px; flex-wrap: wrap; align-self: center; }
-  .phase {
-    font: 700 10px var(--mono); text-transform: uppercase; letter-spacing: .09em;
-    border: 1px solid var(--line); background: var(--panel-2); color: var(--faint);
-    border-radius: 6px; padding: 4px 9px; cursor: pointer;
-  }
-  .phase[data-on="1"] { color: var(--orch); border-color: var(--orch); }
-  .phase[data-past="1"] { color: var(--muted); }
-  .cap-text-wrap { min-width: 0; }
-  #capTitle { font-weight: 700; font-size: 13.5px; }
-  #capText { color: var(--muted); font-size: 12.5px; margin-top: 1px; max-width: 88ch; }
-  #capText code { font-family: var(--mono); font-size: 11px; color: var(--ink); background: var(--panel-2);
-                  padding: 1px 5px; border-radius: 4px; }
-
-  /* ---------- event ticker ---------- */
-  .ticker { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-            display: flex; flex-direction: column; min-height: 0; height: 148px; }
-  .ticker-body { flex: 1; overflow-y: auto; padding: 6px 12px; font: 11px/1.7 var(--mono); }
-  .ev { display: flex; gap: 10px; white-space: nowrap; }
-  .ev .ev-type { flex: none; width: 130px; font-weight: 700; }
-  .ev .ev-payload { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
-  .ev[data-kind="life"]   .ev-type { color: var(--faint); }
-  .ev[data-kind="tool"]   .ev-type { color: var(--orch); }
-  .ev[data-kind="data"]   .ev-type { color: var(--worker); }
-  .ev[data-kind="exec"]   .ev-type { color: var(--exec); }
-  .ev[data-kind="guard"]  .ev-type { color: var(--guard); }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--muted); padding: 0 2px; }
+  .legend .lane-key::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 3px;
+                              background: var(--c); margin-right: 6px; vertical-align: -1px; }
+  .legend .marks { margin-left: auto; display: flex; gap: 14px; flex-wrap: wrap; }
+  .legend .mark { display: inline-block; margin: 0 5px 0 0; }
 
   @media (prefers-reduced-motion: reduce) {
-    * { transition: none !important; animation: none !important; }
+    *, *::before, *::after { animation: none !important; transition: none !important; }
   }
-  @media (max-width: 980px) {
-    .app { height: auto; }
-    .viz { grid-template-columns: 1fr; }
-    .chat { height: 420px; }
-    .stage { min-height: 640px; }
-    .row { flex-wrap: wrap; }
-    #sandbox { flex-direction: column; }
-    #sandbox .sb-meta { width: auto; }
+  @media (max-width: 1100px) {
+    .details { grid-template-columns: 1fr 1fr; }
+    .story { grid-column: 1 / -1; }
+  }
+  @media (max-width: 720px) {
+    .page { padding: 14px 16px 20px; height: auto; grid-template-rows: auto; }
+    .details { grid-template-columns: 1fr; }
+    .panel { max-height: 420px; }
+    .controls { margin-left: 0; }
+    :root { --label-w: 150px; }
   }
 </style>
 </head>
 <body>
-<div class="app">
+<div class="page">
 
-  <header>
-    <h1>How the Deep Research Agent works</h1>
-    <div class="sub">a simulated replay of one run — client → LangGraph → orchestrator → sub-agents → sandbox → report
-      &nbsp;·&nbsp; <code>docs/HOW_THE_AGENT_WORKS.md</code> in motion</div>
-    <div class="transport">
-      <span id="stepCount">0 / 0</span>
-      <button id="btnRestart" title="Restart (R)">⟲</button>
-      <button id="btnPrev" title="Previous step (←)">←</button>
-      <button id="btnPlay" title="Play / pause (Space)" data-on="true">Pause</button>
-      <button id="btnNext" title="Next step (→)">→</button>
-      <select id="speed" title="Playback speed">
-        <option value="0.6">0.6×</option>
-        <option value="1" selected>1×</option>
-        <option value="1.6">1.6×</option>
-        <option value="2.4">2.4×</option>
+  <header class="top">
+    <div>
+      <h1>How one research run works</h1>
+      <p>A replay of a single <code>deep_research_agent</code> run: who calls whom, what streams to the client,
+        and where each guardrail fires. Companion to <a href="HOW_THE_AGENT_WORKS.md">HOW_THE_AGENT_WORKS.md</a>.</p>
+    </div>
+    <div class="controls">
+      <label>Model tier <select id="tier" title="Model tier (MODEL_TIERS in config.py)"></select></label>
+      <button class="btn" id="prev" title="Previous step (←)" aria-label="Previous step">←</button>
+      <button class="btn primary" id="play" title="Play / pause (space)">Play</button>
+      <button class="btn" id="next" title="Next step (→)" aria-label="Next step">→</button>
+      <select id="speed" title="Playback speed" aria-label="Playback speed">
+        <option value="0.6">0.6×</option><option value="1" selected>1×</option><option value="1.6">1.6×</option>
       </select>
+      <span id="count" aria-live="polite"></span>
     </div>
   </header>
 
-  <div class="caption-bar">
-    <div class="phases" id="phases"></div>
-    <div class="cap-text-wrap" id="capWrap">
-      <div id="capTitle">Press play</div>
-      <div id="capText">One full research run, step by step.</div>
+  <section class="trace" aria-label="Run timeline: one column per step, one lane per actor">
+    <div class="trace-inner">
+      <div class="grid" id="grid"></div>
+      <svg class="arrows past" id="arrowsPast" aria-hidden="true"></svg>
+      <svg class="arrows" id="arrows" aria-hidden="true"></svg>
     </div>
-  </div>
+  </section>
 
-  <div class="viz" id="viz">
-    <svg class="overlay" id="overlay"></svg>
+  <div class="legend" id="legend"></div>
 
-    <!-- client -->
-    <section class="chat" id="chat">
-      <div class="panel-title"><span class="dot" id="sseDot"></span> Client app — chat UI <span style="margin-left:auto;font-weight:500;letter-spacing:0;text-transform:none">SSE stream</span></div>
-      <div class="chat-body" id="chatBody"></div>
-      <div class="chat-input">
-        <div class="fake-input" id="fakeInput"></div>
-        <div class="send" id="sendBtn">➤</div>
-      </div>
-    </section>
-
-    <!-- stage -->
-    <section class="stage" id="stage">
-      <div class="stage-label">LangGraph server — <b>one research run</b> (thread + SSE)</div>
-
-      <div class="node" id="makegraph">
-        <div class="node-kicker"><span>entry · config factory</span><span class="model-tag">per run, not per deployment</span></div>
-        <div class="node-name">make_graph(config)</div>
-        <div class="chips">
-          <span class="chip" data-k="cfg">ResearchConfig</span>
-          <span class="chip" data-k="meter">RunMeter</span>
-          <span class="chip" data-k="models">tier: high</span>
-          <span class="chip" data-k="tools">tools: 12</span>
-          <span class="chip" data-k="skills">skills: /skills ro</span>
-          <span class="chip" data-k="sbx">sandbox: wired</span>
-          <span class="chip" data-k="mw">middleware ×9</span>
-        </div>
-      </div>
-
-      <div class="row">
-        <div class="node" id="orch">
-          <div class="node-kicker"><span>orchestrator</span><span class="model-tag">claude-sonnet-5 · smart, expensive</span></div>
-          <div class="node-name">ReAct loop — plans, delegates, synthesizes</div>
-          <div class="react-loop">
-            <span class="ph" data-ph="triage">triage</span><span class="arrow">→</span>
-            <span class="ph" data-ph="plan">plan</span><span class="arrow">→</span>
-            <span class="ph" data-ph="gather">gather</span><span class="arrow">→</span>
-            <span class="ph" data-ph="synth">synthesize</span>
-          </div>
-        </div>
-        <div class="node" id="mwstack">
-          <div class="node-kicker"><span>guardrails · middleware</span></div>
-          <div class="mw-list">
-            <span class="mw" data-mw="budget"><span>Budget</span><span class="hook">before_model</span></span>
-            <span class="mw" data-mw="force"><span>ForceCompletion</span><span class="hook">after_model</span></span>
-            <span class="mw" data-mw="gate"><span>ReportQualityGate</span><span class="hook">awrap_tool_call</span></span>
-            <span class="mw" data-mw="clarify"><span>ClarifyGuard + Fallback</span><span class="hook">tool / after_model</span></span>
-            <span class="mw" data-mw="skilluse"><span>SkillUsage</span><span class="hook">after_model</span></span>
-            <span class="mw" data-mw="output"><span>ResearchOutput</span><span class="hook">after_agent</span></span>
-            <span class="mw" data-mw="usage"><span>UsageMeter</span><span class="hook">after_agent</span></span>
-            <span class="mw" data-mw="cleanup"><span>SandboxCleanup</span><span class="hook">after_agent</span></span>
-          </div>
-          <div class="meters">
-            <div class="meter">
-              <label><span>tool calls</span><span id="mCallsVal">0 / 200</span></label>
-              <div class="bar"><div class="fill" id="mCalls"></div></div>
-            </div>
-            <div class="meter">
-              <label><span>tokens</span><span id="mTokVal">0 / 4.0M</span></label>
-              <div class="bar"><div class="fill" id="mTok"></div></div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="row">
-        <div class="node sub" id="sub-a">
-          <div class="node-kicker"><span>research-subagent</span><span class="gate-tag" data-mw="fgate-a">findings gate</span></div>
-          <div class="node-name">unit: market action</div>
-          <div class="node-desc"><span class="model-tag">kimi-k2.6 · cheap fleet · isolated context</span></div>
-        </div>
-        <div class="node sub" id="sub-b">
-          <div class="node-kicker"><span>research-subagent</span><span class="gate-tag" data-mw="fgate-b">findings gate</span></div>
-          <div class="node-name">unit: on-chain activity</div>
-          <div class="node-desc"><span class="model-tag">kimi-k2.6 · cheap fleet · isolated context</span></div>
-        </div>
-        <div class="node sub" id="sub-c">
-          <div class="node-kicker"><span>research-subagent</span><span class="gate-tag" data-mw="fgate-c">findings gate</span></div>
-          <div class="node-name">unit: social &amp; sentiment</div>
-          <div class="node-desc"><span class="model-tag">kimi-k2.6 · cheap fleet · isolated context</span></div>
-        </div>
-      </div>
-
-      <div class="row">
-        <div class="node tool" id="tool-search">
-          <div class="node-kicker"><span>tool · Tavily</span></div>
-          <div class="node-name">web_search</div>
-          <div class="node-desc">numbered [n] sources</div>
-        </div>
-        <div class="node tool" id="tool-mcp">
-          <div class="node-kicker"><span>MCP · Santiment</span></div>
-          <div class="node-name">fetch_metric_data …</div>
-          <div class="node-desc">semaphore: 10 concurrent</div>
-        </div>
-        <div class="node tool" id="tool-custom">
-          <div class="node-kicker"><span>custom tool</span></div>
-          <div class="node-name">social_messages</div>
-          <div class="node-desc">drop-in from custom_tools/</div>
-        </div>
-        <div class="node tool" id="tool-skills">
-          <div class="node-kicker"><span>skills mount · read-only</span></div>
-          <div class="node-name">/skills/crowd-positioning</div>
-          <div class="node-desc">progressive disclosure</div>
-        </div>
-      </div>
-
-      <div class="node" id="sandbox">
-        <div class="sb-meta">
-          <div>
-            <div class="node-kicker"><span>llm-sandbox sidecar</span></div>
-            <div class="node-name">execute — real Python</div>
-            <div class="node-desc" id="sbSession">session: —</div>
-          </div>
-          <div class="files" id="sbFiles">/workspace/data/ <span style="color:var(--faint)">(empty)</span></div>
-        </div>
-        <pre class="term" id="term"></pre>
-      </div>
-    </section>
-  </div>
-
-  <div class="ticker">
-    <div class="panel-title">custom event channel — what any frontend renders (<span style="text-transform:none">events.py · EVENT_SCHEMAS</span>)</div>
-    <div class="ticker-body" id="tickerBody"></div>
-  </div>
-
+  <section class="details">
+    <article class="panel story" aria-live="polite">
+      <h3>What happens <small id="phaseName"></small></h3>
+      <div class="panel-body" id="story"></div>
+    </article>
+    <article class="panel">
+      <h3>Custom event stream <small>events.py · EVENT_SCHEMAS</small></h3>
+      <div class="panel-body events" id="events"></div>
+    </article>
+    <article class="panel">
+      <h3>What the user sees <small>rendered from the stream</small></h3>
+      <div class="panel-body chat" id="chat"></div>
+    </article>
+  </section>
 </div>
+
+<!-- Mirrors MODEL_TIERS in src/deep_research_agent/config.py.
+     tests/test_model_tiering.py fails when the two drift. -->
+<script type="application/json" id="model-tiers">
+{
+  "extra-low": {
+    "research_model": "openai/gpt-6-luna",
+    "subagent_model": "openai/gpt-6-luna",
+    "utility_model": "openai/gpt-6-luna",
+    "compaction_model": "openai/gpt-6-luna",
+    "coding_model": "anthropic/claude-haiku-5.5"
+  },
+  "low": {
+    "research_model": "deepseek/deepseek-v4.1-flash",
+    "subagent_model": "openai/gpt-6-luna",
+    "utility_model": "openai/gpt-6-luna",
+    "compaction_model": "openai/gpt-6-luna",
+    "coding_model": "anthropic/claude-haiku-5.5"
+  },
+  "mid": {
+    "research_model": "google/gemini-3.8-flash",
+    "subagent_model": "deepseek/deepseek-v4.1-flash",
+    "utility_model": "openai/gpt-6-luna",
+    "compaction_model": "openai/gpt-6-luna",
+    "coding_model": "anthropic/claude-haiku-5.5"
+  },
+  "high": {
+    "research_model": "openai/gpt-6.1-sol",
+    "subagent_model": "google/gemini-3.8-flash",
+    "utility_model": "openai/gpt-6-luna",
+    "compaction_model": "google/gemini-3.8-flash",
+    "coding_model": "anthropic/claude-haiku-5.5"
+  }
+}
+</script>
 
 <script>
 "use strict";
-/* ============================================================ helpers */
 const $ = (s) => document.querySelector(s);
-const $$ = (s) => Array.from(document.querySelectorAll(s));
+const TIERS = JSON.parse($("#model-tiers").textContent);
 const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
-const viz = $("#viz"), overlay = $("#overlay"), stage = $("#stage");
-const chatBody = $("#chatBody"), tickerBody = $("#tickerBody"), term = $("#term");
+/* ------------------------------------------------------------------ actors */
+const LANES = [
+  { id: "client",  c: "client",  name: "Client app",         sub: "SSE · custom + messages" },
+  { id: "orch",    c: "orch",    name: "Orchestrator",       sub: "{research}" },
+  { id: "subA",    c: "fleet",   name: "Sub-agent A: market",   sub: "{subagent}" },
+  { id: "subB",    c: "fleet",   name: "Sub-agent B: on-chain", sub: "{subagent}" },
+  { id: "subC",    c: "fleet",   name: "Sub-agent C: social",   sub: "{subagent}" },
+  { id: "extract", c: "worker",  name: "Extract worker",        sub: "{utility}" },
+  { id: "coder",   c: "worker",  name: "Coding worker",         sub: "{coding}" },
+  { id: "tools",   c: "tools",   name: "Data tools",         sub: "MCP · web · custom · skills" },
+  { id: "sandbox", c: "sandbox", name: "llm-sandbox",        sub: "one session per run" },
+];
+const LANE_INDEX = Object.fromEntries(LANES.map((l, i) => [l.id, i]));
+const LANE_COLOR = Object.fromEntries(LANES.map((l) => [l.id, `var(--${l.c})`]));
+const EVENT_COLOR = {
+  run_start: "client", status: "client", usage: "client", report: "orch",
+  mcp_call: "tools", mcp_result: "tools", tool_call: "tools", tool_result: "tools",
+  search_query: "tools", search_results: "tools", source: "tools", skill: "tools",
+  chart: "tools", script: "worker", subagent_findings: "fleet", clarification: "guard",
+};
+const PHASES = { send: "Send", build: "Build", triage: "Triage", plan: "Plan",
+                 gather: "Gather", synth: "Synthesize", deliver: "Deliver" };
 
-let speed = 1;
-let animating = true;          // false during instant replay
-let calls = 0, tokens = 0;     // meters, recomputed on every replay
+/* ------------------------------------------------------------------ the run
+   One entry per column. Spans open with `open` and stay open until `close`
+   names them (or the run ends); `once` spans live for this column only.
+   `{research}`-style placeholders resolve against the selected tier. */
+const STEPS = [
+{ phase: "send", title: "The question goes out",
+  text: `The client starts a run with <code>POST /threads/{id}/runs/stream</code> and keeps the SSE response open. It renders two channels: typed events on <code>custom</code> (the middle column) and the orchestrator's narration tokens on <code>messages</code>.`,
+  open: [["client", "cl", "SSE stream open"]],
+  arrows: [["client", "orch", "runs/stream"]],
+  chat: (c) => c.push({ k: "bubble", text: "Analyze Bitcoin's last 30 days — price, on-chain and social." }) },
 
+{ phase: "build", title: "make_graph builds this run",
+  text: `LangGraph calls the async factory <code>make_graph(config)</code> once per run, so keys, model tier, MCP servers, sandbox and skills come from the request, not from globals. The <b>{tier}</b> tier fills five model slots; provider routing picks OpenRouter endpoints per model by price and throughput, and if those preferences ever leave no endpoint, the call retries with fewer of them instead of failing. MCP tools load per server, and three sub-agent specs are registered. The sandbox session is not opened yet — that happens on first use.`,
+  once: [["orch", "build"]],
+  guards: [["UsageMeter", "before_agent", "emits run_start"]],
+  events: [["run_start", "{protocol_version: 1, engine_version: \"0.1.0\", started_at}"],
+           ["status", "{state: \"mcp_ready\", tool_count, tools: [\"fetch_metric_data\", …]}"]] },
+
+{ phase: "triage", title: "A 250-token call decides if this is research",
+  text: `Before the full harness runs (about 12k tokens of prompt and tool schemas), TriageRouterMiddleware asks <code>{research}</code> one question: SIMPLE or RESEARCH? A greeting or a definition is answered right here and the turn ends. Anything involving data, current figures or analysis — and any calculation at all — falls through.`,
+  once: [["orch", "triage"]],
+  guards: [["TriageRouter", "before_model", "verdict: RESEARCH"]],
+  events: [["status", "{state: \"triage\", detail: \"research\"}"]] },
+
+{ phase: "plan", title: "The orchestrator plans",
+  text: `Now the real loop starts. Its prompt triages again — COMPUTE runs <code>execute</code> and replies with the number, AMBIGUOUS calls <code>request_clarification</code> — then lays out the angles with <code>write_todos</code>. The narration between steps streams on <code>messages</code>; the todo list arrives with the state updates. Before every model call BudgetMiddleware checks tool calls, tokens and wall-clock against the run ceilings: a wrap-up nudge at 75%, a hard stop at 100%.`,
+  open: [["orch", "loop", "ReAct loop · plan → delegate → synthesize"]],
+  guards: [["Budget", "before_model", "200 calls · 10M tokens · 45 min"], ["LoopGuard", "after_model", "repeats"],
+           ["PromptCache", "wrap_model_call", "OpenRouter"]],
+  events: [["status", "{state: \"model_call\", role: \"orchestrator\", model: \"{research}\", step: 1}"]],
+  chat: (c) => {
+    c.push({ k: "thinking", text: "This needs live price, on-chain and social data — research, not a quick answer." });
+    c.push({ k: "todos", items: ["Market action", "On-chain activity", "Social & sentiment", "Write the report"], done: [] });
+  } },
+
+{ phase: "gather", title: "Fan out: one sub-agent per unit",
+  text: `The orchestrator holds no data tools — ExcludeToolsMiddleware hides the file tools and refuses them by name — so every lookup goes through <code>task</code>. It spawns one <code>research-subagent</code> per unit, in parallel, on the cheaper <code>{subagent}</code>. Raw tool output stays in each sub-agent's own context; only findings come back up.`,
+  arrows: [["orch", "subA", "task"], ["orch", "subB", "task"], ["orch", "subC", "task"]],
+  open: [["subA", "a", "market action"], ["subB", "b", "on-chain activity"], ["subC", "c", "social & sentiment"]],
+  guards: [["ExcludeTools", "wrap_model_call", "no file tools upstairs"]],
+  events: [["status", "{state: \"subagent_start\", role: \"research-subagent\", model: \"{subagent}\"}"],
+           ["status", "{state: \"subagent_start\", role: \"research-subagent\", …}"],
+           ["status", "{state: \"subagent_start\", role: \"research-subagent\", …}"]],
+  chat: (c) => c.push({ k: "thinking", text: "Splitting this into three units that can run in parallel." }) },
+
+{ phase: "gather", title: "A time series becomes a held chart, not context",
+  text: `Sub-agent A calls <code>fetch_metric_data</code> on the Santiment MCP server — at most 10 MCP calls in flight across the whole fleet, and 429s back off instead of failing. The result is a time series, so its rows leave the model's context: the tool wrapper holds a downsampled chart of it, and the model sees only <code>chart: c1</code>. Fetching is not showing — nothing reaches the client yet. The chart is sent only if the report places it.`,
+  arrows: [["subA", "tools", "fetch_metric_data"], ["tools", "subA", ""]],
+  once: [["tools", "MCP"]],
+  events: [["mcp_call", "{tool: \"fetch_metric_data\", args: {slug: \"bitcoin\", metric: \"price_usd\"}}"],
+           ["mcp_result", "{tool: \"fetch_metric_data\", ok: true}  → chart c1 held, not sent"]] },
+
+{ phase: "gather", title: "A big result is offloaded to the sandbox",
+  text: `Sub-agent B's daily active addresses come back over the threshold (60k chars or 1,000 rows). The tool wrapper writes the result to <code>/workspace/data/</code> in this run's sandbox session — opened lazily right now and seeded with the skills' helper modules — and only a stub enters the context: path, row count, columns, first rows. Without a sandbox the same threshold truncates.`,
+  arrows: [["subB", "tools", "fetch_metric_data"], ["tools", "sandbox", "offload"]],
+  once: [["tools", "MCP"]],
+  open: [["sandbox", "sb", "session · /workspace"]],
+  events: [["mcp_call", "{tool: \"fetch_metric_data\", args: {metric: \"active_addresses_24h\"}}"],
+           ["mcp_result", "{tool: \"fetch_metric_data\", ok: true}  → stub, rows offloaded"]] },
+
+{ phase: "gather", title: "Reading the file is delegated again",
+  text: `B doesn't load the file itself. It passes the path to the <code>extract-subagent</code>, which runs on <code>{utility}</code> — the cheapest slot — and may only use <code>execute</code>: bounded Python over the file, run in the sandbox. Code run inline is emitted as a <code>script</code> event with its real output, so the user sees the evidence, not just the claim.`,
+  arrows: [["subB", "extract", "task"], ["extract", "sandbox", "execute"], ["extract", "subB", ""]],
+  once: [["extract", "extract"]],
+  guards: [["ExecuteArtifacts", "wrap_tool_call", "inline code → script"]],
+  events: [["status", "{state: \"subagent_start\", role: \"extract-subagent\", model: \"{utility}\"}"],
+           ["script", "{name: \"inline.py\", agent: \"extract-subagent\", language: \"python\", output}"],
+           ["status", "{state: \"subagent_done\", role: \"extract-subagent\"}"]],
+  chat: (c) => c.push({ k: "script", name: "inline.py", who: "extract-subagent", out: "mean 91,213 · last 7d −11.8%" }) },
+
+{ phase: "gather", title: "A failed script goes to the coding model",
+  text: `Sub-agent A tries to compute realized volatility and its first <code>execute</code> fails. The rule is to never retry shell-quoting variants: it hands the goal, the input path and the exact error to the <code>coding-subagent</code> on <code>{coding}</code>, which writes the script, runs it, fixes it and returns the real output. The finished code ships as a <code>script</code> event; file paths are scrubbed from the reply.`,
+  arrows: [["subA", "sandbox", "execute"], ["subA", "coder", "task"], ["coder", "sandbox", "write · run"], ["coder", "subA", ""]],
+  once: [["coder", "coder"]],
+  marks: [["subA", "✗ exit 1", "error"]],
+  guards: [["ScriptArtifacts", "after_model", "code → script event, paths scrubbed"]],
+  events: [["status", "{state: \"subagent_start\", role: \"coding-subagent\", model: \"{coding}\"}"],
+           ["script", "{name: \"volatility.py\", agent: \"coding-subagent\", language: \"python\", code}"],
+           ["status", "{state: \"subagent_done\", role: \"coding-subagent\"}"]],
+  chat: (c) => c.push({ k: "script", name: "volatility.py", who: "coding-subagent", out: "30d realized vol 41.7%" }) },
+
+{ phase: "gather", title: "A skill, a custom tool and web search",
+  text: `Sub-agent C's brief names the <code>crowd-positioning</code> skill, so it reads <code>/skills/crowd-positioning/SKILL.md</code> from the read-only mount — the orchestrator only ever saw the one-line description. Then it calls the drop-in custom tool <code>social_messages</code> and <code>web_search</code> (Tavily). Search results register as numbered sources for <code>[n]</code> citations.`,
+  arrows: [["subC", "tools", "skill · tools · search"], ["tools", "subC", ""]],
+  once: [["tools", "web"]],
+  guards: [["SkillUsage", "after_model", "skill event"]],
+  events: [["skill", "{name: \"crowd-positioning\", path: \"/skills/crowd-positioning/SKILL.md\", state: \"loaded\"}"],
+           ["tool_call", "{tool: \"social_messages\", args: {slug: \"bitcoin\", days: 30}}"],
+           ["tool_result", "{tool: \"social_messages\", ok: true}"],
+           ["search_query", "{query: \"bitcoin price drop august 2026\"}"],
+           ["search_results", "{ok: true, results: [7]}"],
+           ["source", "{title, url, domain: \"coindesk.com\"}"],
+           ["source", "{title, url, domain: \"theblock.co\"}"]],
+  chat: (c) => c.push({ k: "search", q: "bitcoin price drop august 2026", n: 7 }) },
+
+{ phase: "gather", title: "The handoff is checked by code, not by a model",
+  text: `A sub-agent's final message is the only thing the orchestrator sees of its work: one JSON object with a summary, findings as <code>{finding, evidence, source}</code>, and honest gaps. SubagentFindingsMiddleware validates it deterministically. A's passes and streams as <code>subagent_findings</code>.`,
+  arrows: [["subA", "orch", "findings"]],
+  close: ["a"], marks: [["subA", "✓ findings", "ok"]],
+  guards: [["SubagentFindings", "after_model", "pass"]],
+  events: [["subagent_findings", "{unit: \"market action\", summary, findings: [4], gaps: []}"],
+           ["status", "{state: \"subagent_done\", role: \"research-subagent\"}"]],
+  chat: (c) => { c.push({ k: "finding", unit: "Market action", text: "BTC −8.4% over 30 days; sharpest drop Aug 2 (−5.1%)", src: "Santiment" }); c.todo(0); } },
+
+{ phase: "gather", title: "A bad handoff bounces — once",
+  text: `B's draft has a finding with no source and one attributed to a file path. The gate sends it back once with the exact problems. Empty findings would pass — an honest "nothing found" beats an invented one — and after one bounce whatever comes back is accepted, so formatting can never fail a run.`,
+  arrows: [["subB", "orch", "findings"]],
+  close: ["b"], marks: [["subB", "↩ findings", "bounce"]],
+  guards: [["SubagentFindings", "after_model", "bounce ×1", "bounce"]],
+  events: [["status", "{state: \"revising\", reason: \"subagent_findings\", detail: \"findings[2] is missing \\\"source\\\"…\"}"],
+           ["subagent_findings", "{unit: \"on-chain activity\", summary, findings: [3], gaps: []}"],
+           ["status", "{state: \"subagent_done\", role: \"research-subagent\"}"]],
+  chat: (c) => { c.push({ k: "finding", unit: "On-chain activity", text: "Active addresses averaged 91.2k/day; last week −11.8% vs the first", src: "Santiment" }); c.todo(1); } },
+
+{ phase: "gather", title: "All units are back",
+  text: `C passes cleanly. Had any unit reported non-empty <code>gaps</code>, the orchestrator would spawn follow-up sub-agents for exactly those. Note who made the calls: almost all of them ran on the fleet's cheaper models — that is what model tiering buys.`,
+  arrows: [["subC", "orch", "findings"]],
+  close: ["c"], marks: [["subC", "✓ findings", "ok"]],
+  guards: [["SubagentFindings", "after_model", "pass"]],
+  events: [["subagent_findings", "{unit: \"social & sentiment\", summary, findings: [5], gaps: []}"],
+           ["status", "{state: \"subagent_done\", role: \"research-subagent\"}"]],
+  chat: (c) => { c.push({ k: "finding", unit: "Social & sentiment", text: "Crowd flipped net-short after the drop; social volume +64%", src: "Santiment, coindesk.com" }); c.todo(2); } },
+
+{ phase: "synth", title: "Synthesis on the expensive model",
+  text: `The orchestrator reads three findings objects — never raw rows — and writes one report: inline <code>[n]</code> citations reuse each finding's source, and <code>[chart:c1]</code> on its own line places the price chart. Had its context neared the orchestrator's compaction trigger — 200k tokens or 80% of <code>{research}</code>'s context window, whichever is lower (sub-agents compact at 600k) — ContextCompactionMiddleware would first summarize older messages on <code>{compaction}</code> (status <code>compacting</code> → <code>compacted</code>).`,
+  guards: [["Budget", "before_model", "well under 75%"], ["ContextCompaction", "before_model", "idle below the trigger"]],
+  events: [["status", "{state: \"model_call\", role: \"orchestrator\", model: \"{research}\", step: 7}"]],
+  chat: (c) => c.push({ k: "thinking", text: "All three units returned sourced findings. Writing the report with inline citations." }) },
+
+{ phase: "synth", title: "submit_report, then the quality gate",
+  text: `The deliverable is a <code>submit_report</code> call, not whatever the last message happens to say — ForceCompletionMiddleware nudges a model that writes the report as plain prose or stops at "Now I will…". ReportQualityGateMiddleware wraps the call: <code>scrub_report</code> strips leaked plumbing (tool names, file paths) and <code>lint_citations</code> finds uncited or dangling sources. Problems only the author can fix bounce back once; then the report ships as-is.`,
+  marks: [["orch", "↩ report", "bounce"]],
+  guards: [["ForceCompletion", "after_model", "no nudge needed"], ["ReportQualityGate", "wrap_tool_call", "bounce ×1", "bounce"]],
+  events: [["status", "{state: \"revising\", reason: \"report_quality\", detail: \"[5] is listed in Sources but never cited\"}"]] },
+
+{ phase: "deliver", title: "The report lands",
+  text: `The report places <code>[chart:c1]</code> on its own line, so <code>submit_report</code> first sends that held chart as a <code>chart</code> event, then the <code>report</code> event with the markdown; the client renders the chart at its placement. That is how data reaches the reader — rows never do. A placement the run no longer holds is dropped from the text. ResearchOutputMiddleware also persists the report into thread state, so a follow-up question can be answered from it.`,
+  arrows: [["orch", "client", "report"]],
+  guards: [["ResearchOutput", "after_agent", "persist + classify"]],
+  events: [["chart", "{id: \"c1\", label: \"Price USD — bitcoin\", source: \"Santiment\", series: [1]}"],
+           ["report", "{markdown: \"# Bitcoin, last 30 days\\n…\\n[chart:c1]\\n…\"}"]],
+  chat: (c) => { c.push({ k: "report" }); c.todo(3); } },
+
+{ phase: "deliver", title: "The run accounts for itself and cleans up",
+  text: `After-agent hooks close the run. UsageMeterMiddleware emits <code>usage</code>: tool calls, tokens per role, cost, elapsed time. ResearchOutputMiddleware names why the run ended — here <code>done / report_delivered</code>; the others are <code>direct_answer</code>, <code>awaiting_clarification</code>, <code>report_salvaged</code>, <code>budget_exhausted</code>, <code>stalled_after_nudges</code> and <code>ended_without_report</code>. SandboxCleanupMiddleware deletes the session and every file in it.`,
+  close: ["loop", "sb", "cl"],
+  guards: [["UsageMeter", "after_agent", "usage event"], ["SandboxCleanup", "after_agent", "session deleted"]],
+  events: [["usage", "{tool_calls: 14, input_tokens, output_tokens, total_tokens, limits, elapsed_s: 214}"],
+           ["status", "{state: \"done\", reason: \"report_delivered\", elapsed: \"3m 34s\"}"]],
+  chat: (c) => c.push({ k: "end", text: "done · report_delivered · 14 tool calls · 3m 34s" }) },
+];
+
+/* ------------------------------------------------------------------ state */
+let tier = "mid", step = 0, playing = false, timer = null, speed = 1, lastRendered = -1;
+
+function fill(s) {
+  const t = TIERS[tier] || {};
+  const short = (m) => (m || "").split("/").pop();
+  return s.replace(/\{tier\}/g, tier)
+          .replace(/\{(research|subagent|utility|compaction|coding)\}/g, (_, k) => short(t[k + "_model"]));
+}
+
+/* Replays steps 0..upto into spans, marks and chat — every render is derived
+   from scratch, so stepping backwards can never leave stale state behind. */
+function derive(upto) {
+  const spans = [], openById = {}, marks = [], chat = [], events = [];
+  chat.todo = (i) => { const t = chat.find((x) => x.k === "todos"); if (t) t.done.push(i); };
+  STEPS.slice(0, upto + 1).forEach((s, i) => {
+    (s.open || []).forEach(([lane, id, label]) => {
+      const sp = { lane, label, from: i, to: null };
+      spans.push(sp); openById[id] = sp;
+    });
+    (s.once || []).forEach(([lane, label]) => spans.push({ lane, label, from: i, to: i }));
+    (s.close || []).forEach((id) => { if (openById[id]) openById[id].to = i; });
+    (s.marks || []).forEach(([lane, label, tone]) => marks.push({ lane, label, tone, at: i }));
+    (s.events || []).forEach(([t, p]) => events.push({ t, p, at: i }));
+    if (s.chat) s.chat(chat);
+  });
+  return { spans, marks, chat, events };
+}
+
+/* ------------------------------------------------------------------ timeline */
+const grid = $("#grid"), svg = $("#arrows"), svgPast = $("#arrowsPast");
+grid.style.setProperty("--n", STEPS.length);
+grid.style.setProperty("--lanes", LANES.length);
+
+function place(node, col, row, colEnd) {
+  node.style.gridColumn = colEnd ? `${col} / ${colEnd}` : `${col}`;
+  node.style.gridRow = `${row}`;
+  return node;
+}
 function el(tag, cls, html) {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
-  if (html !== undefined) e.innerHTML = html;
+  if (html != null) e.innerHTML = html;
   return e;
 }
-/* -------- edges: drawn lazily the first time a pulse travels them.
-   Manhattan (elbow) routing between the facing borders of the two boxes:
-   the middle segment lands in the gap between rows / the gutter between
-   panels, so lines run around content instead of through it. */
-const edges = new Map(); // "a:b" -> {a, b, path}
-function vizRect(id) {
-  const r = $("#" + id).getBoundingClientRect(), v = viz.getBoundingClientRect();
-  return { x: r.left - v.left, y: r.top - v.top, w: r.width, h: r.height };
+
+function renderGrid(animate) {
+  const d = derive(step);
+  grid.innerHTML = "";
+  // phase band: consecutive steps sharing a phase merge into one header cell
+  let i = 0;
+  while (i < STEPS.length) {
+    let j = i;
+    while (j + 1 < STEPS.length && STEPS[j + 1].phase === STEPS[i].phase) j++;
+    const b = place(el("button", "phase", PHASES[STEPS[i].phase]), i + 2, 1, j + 3);
+    b.dataset.state = step >= i && step <= j ? "now" : step > j ? "past" : "";
+    const target = i;
+    b.dataset.phaseStart = String(i);
+    b.addEventListener("click", () => go(target, false));
+    grid.appendChild(b);
+    i = j + 1;
+  }
+  LANES.forEach((l, r) => {
+    const lab = place(el("div", "lane-label", `<b>${esc(l.name)}</b><span>${esc(fill(l.sub))}</span>`), 1, r + 2);
+    lab.style.setProperty("--c", `var(--${l.c})`);
+    lab.title = `${l.name} — ${fill(l.sub)}`;
+    grid.appendChild(lab);
+    for (let k = 0; k < STEPS.length; k++) grid.appendChild(place(el("div", "cell"), k + 2, r + 2));
+  });
+  for (let k = 0; k < STEPS.length; k++) {
+    const hit = place(el("div", "col-hit"), k + 2, 2);
+    hit.style.gridRow = `2 / ${LANES.length + 2}`;
+    hit.dataset.now = k === step ? "1" : "0";
+    hit.dataset.future = k > step ? "1" : "0";
+    hit.title = `Step ${k + 1}: ${STEPS[k].title}`;
+    hit.addEventListener("click", () => go(k, false));
+    grid.appendChild(hit);
+    const ax = place(el("div", "axis", String(k + 1)), k + 2, LANES.length + 2);
+    ax.dataset.now = k === step ? "1" : "0";
+    grid.appendChild(ax);
+  }
+  d.spans.forEach((s) => {
+    const to = s.to == null ? step : s.to;
+    const lane = LANES[LANE_INDEX[s.lane]];
+    const sp = place(el("div", "span", `<span>${esc(fill(s.label))}</span>`), s.from + 2, LANE_INDEX[s.lane] + 2, to + 3);
+    sp.style.setProperty("--c", `var(--${lane.c})`);
+    sp.dataset.open = s.to == null && step < STEPS.length - 1 ? "1" : "0";
+    sp.dataset.edge = to === step ? "1" : "0";
+    const lb = place(el("div", "span-label", esc(fill(s.label))), s.from + 2, LANE_INDEX[s.lane] + 2, to + 3);
+    lb.style.setProperty("--c", `var(--${lane.c})`);
+    lb.dataset.edge = sp.dataset.edge;
+    if (animate && s.from === step) { sp.classList.add("enter"); lb.classList.add("enter"); }
+    grid.append(sp, lb);
+  });
+  d.marks.forEach((m) => {
+    const mk = place(el("div", "mark", esc(m.label)), m.at + 2, LANE_INDEX[m.lane] + 2);
+    mk.dataset.tone = m.tone;
+    if (animate && m.at === step) mk.classList.add("enter");
+    grid.appendChild(mk);
+  });
+  drawArrows(animate, d.spans);
 }
-function nodeRects(a, b) {
-  // every box except the two endpoints, inflated 3px, in viz coordinates
-  const ea = $("#" + a), eb = $("#" + b), v = viz.getBoundingClientRect(), out = [];
-  $$(".node, .chat").forEach(n => {
-    if (n === ea || n === eb) return;
-    const r = n.getBoundingClientRect();
-    out.push({ x: r.left - v.left - 3, y: r.top - v.top - 3, w: r.width + 6, h: r.height + 6 });
+
+/* Connectors. A call that CREATES a bar in this step is drawn Gantt-style: down a
+   trunk just left of the new bar (where that lane is still empty), then right into the
+   bar's left edge — a fan-out shares one trunk. A call into a bar that already runs is a
+   straight vertical line in the step's column. A call and its return in the same step
+   are one connector with a head at each end. The current step draws over the bars (bar
+   labels sit one layer higher); past steps fade behind them. Labels are pills in the
+   gaps between lanes. */
+const SVG_NS = "http://www.w3.org/2000/svg";
+function svgEl(tag, attrs) {
+  const e = document.createElementNS(SVG_NS, tag);
+  Object.entries(attrs).forEach(([k, v]) => e.setAttribute(k, v));
+  return e;
+}
+function connectors(arrows) {
+  const out = [], used = new Set();
+  arrows.forEach(([from, to, label], k) => {
+    if (used.has(k)) return;
+    const back = arrows.findIndex(([f, t], j) => j !== k && !used.has(j) && f === to && t === from);
+    if (back >= 0) used.add(back);
+    used.add(k);
+    out.push({ from, to, label: label || (back >= 0 ? arrows[back][2] : ""), both: back >= 0 });
   });
   return out;
 }
-function segClear(x1, y1, x2, y2, obs) { // axis-aligned segments only
-  for (const r of obs) {
-    if (x1 === x2) {
-      if (x1 > r.x && x1 < r.x + r.w && Math.max(y1, y2) > r.y && Math.min(y1, y2) < r.y + r.h) return false;
-    } else {
-      if (y1 > r.y && y1 < r.y + r.h && Math.max(x1, x2) > r.x && Math.min(x1, x2) < r.x + r.w) return false;
+function drawArrows(animate, spans = derive(step).spans) {
+  svg.innerHTML = ""; svgPast.innerHTML = "";
+  const g = grid.getBoundingClientRect();
+  const css = getComputedStyle(grid);
+  const labelW = parseFloat(css.getPropertyValue("--label-w")) || 212;
+  const laneH = parseFloat(css.getPropertyValue("--lane-h")) || 48;
+  const phaseH = parseFloat(css.getPropertyValue("--phase-h")) || 30;
+  const barHalf = 13, margin = 3;  // .span: height 26px, margin 0 3px
+  const colW = (g.width - labelW) / STEPS.length;
+  const colLeft = (i) => labelW + colW * i;
+  const center = (lane) => phaseH + LANE_INDEX[lane] * laneH + laneH / 2;
+  const startsAt = (lane, i) => spans.some((s) => s.lane === lane && s.from === i);
+  const runsInto = (lane, i) => spans.some((s) => s.lane === lane && s.from < i && (s.to == null ? step : s.to) >= i);
+  const defs = svgEl("defs", {});
+  svgPast.appendChild(defs);
+  LANES.forEach((l) => defs.insertAdjacentHTML("beforeend",
+    `<marker id="head-${l.id}" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">` +
+    `<path d="M0 0 L8 4 L0 8 z" fill="${LANE_COLOR[l.id]}"/></marker>`));
+
+  STEPS.slice(0, step + 1).forEach((s, i) => {
+    const conns = connectors(s.arrows || []);
+    const straight = conns.filter((c) => !(startsAt(c.to, i) && runsInto(c.from, i)));
+    const trunks = [...new Set(conns.filter((c) => !straight.includes(c)).map((c) => c.from))];
+    const pills = [];
+    conns.forEach((c) => {
+      const ya = center(c.from), yb = center(c.to), dir = yb > ya ? 1 : -1;
+      const y1 = ya + dir * barHalf;
+      let d, x;
+      if (straight.includes(c)) {
+        x = colLeft(i) + colW * (straight.indexOf(c) + 1) / (straight.length + 1);
+        d = `M ${x} ${y1 + (c.both ? dir : 0)} V ${yb - dir * (barHalf + 1)}`;
+      } else {
+        x = colLeft(i) - 12 - 5 * trunks.indexOf(c.from);  // room for a visible head on the branch
+        d = `M ${x} ${y1 + (c.both ? dir : 0)} V ${yb} H ${colLeft(i) + margin - 1}`;
+      }
+      const p = svgEl("path", { d, stroke: LANE_COLOR[c.from], "marker-end": `url(#head-${c.from})` });
+      if (c.both) p.setAttribute("marker-start", `url(#head-${c.from})`);
+      if (i < step) p.classList.add("old");
+      (i < step ? svgPast : svg).appendChild(p);
+      if (i === step && animate && !reduced) {
+        p.style.setProperty("--len", p.getTotalLength());
+        p.classList.add("draw");
+      }
+      if (i === step && c.label) pills.push({ ...c, x });
+    });
+    if (i !== step) return;
+    // One pill per distinct label ("task ×3"), in the first free lane gap along its line.
+    const usedGaps = new Set(), byLabel = new Map();
+    pills.forEach((c) => byLabel.has(c.label) ? byLabel.get(c.label).n++ : byLabel.set(c.label, { ...c, n: 1 }));
+    byLabel.forEach((c) => {
+      const a = LANE_INDEX[c.from], b = LANE_INDEX[c.to];
+      const gaps = a < b ? Array.from({ length: b - a }, (_, j) => a + 1 + j)
+                         : Array.from({ length: a - b }, (_, j) => a - j);
+      const gap = gaps.find((x) => !usedGaps.has(x)) ?? gaps[0];
+      usedGaps.add(gap);
+      const flip = c.x > g.width - 150;  // near the right edge: put the pill left of the line
+      const text = svgEl("text", { x: c.x + (flip ? -8 : 8), y: phaseH + gap * laneH, fill: LANE_COLOR[c.from],
+                                   "text-anchor": flip ? "end" : "start", "dominant-baseline": "central" });
+      text.textContent = c.n > 1 ? `${c.label} ×${c.n}` : c.label;
+      svg.appendChild(text);
+      const bb = text.getBBox();
+      svg.insertBefore(svgEl("rect", { x: bb.x - 5, y: bb.y - 2, width: bb.width + 10, height: bb.height + 4,
+                                       rx: 4, stroke: LANE_COLOR[c.from], class: "pill" }), text);
+    });
+  });
+}
+
+/* ------------------------------------------------------------------ panels */
+function renderStory(animate) {
+  const s = STEPS[step];
+  $("#phaseName").textContent = `${PHASES[s.phase]} · step ${step + 1} of ${STEPS.length}`;
+  const guards = (s.guards || []).map(([name, hook, note, tone]) =>
+    `<span class="guard" data-tone="${tone || ""}"><b>${esc(name)}</b><em>${esc(hook)}</em>` +
+    `${note ? ` — ${esc(fill(note))}` : ""}</span>`).join("");
+  $("#story").innerHTML =
+    `<div class="${animate ? "enter" : ""}"><h2>${esc(s.title)}</h2><p>${fill(s.text)}</p>` +
+    (guards ? `<p class="guards-title">Middleware involved</p><div class="guards">${guards}</div>` : "") + `</div>`;
+}
+
+function renderEvents(animate) {
+  const { events } = derive(step);
+  const box = $("#events");
+  if (!events.length) { box.innerHTML = `<div class="empty">No custom events yet — the stream opens when the run builds.</div>`; return; }
+  let html = "", last = -1;
+  events.forEach((e) => {
+    if (e.at !== last) { html += `<div class="ev-sep">step ${e.at + 1} · ${esc(STEPS[e.at].title)}</div>`; last = e.at; }
+    const now = e.at === step;
+    html += `<div class="ev${now && animate ? " enter" : ""}" data-now="${now ? 1 : 0}" style="--c: var(--${EVENT_COLOR[e.t] || "muted"})">` +
+            `<span class="t">${esc(e.t)}</span><span class="p" title="${esc(fill(e.p))}">${esc(fill(e.p))}</span></div>`;
+  });
+  box.innerHTML = html;
+  box.scrollTop = box.scrollHeight;
+}
+
+const SPARK = [109.2, 108.4, 110.1, 109.6, 111.2, 110.4, 108.9, 104.1, 103.2, 104.8, 103.9, 102.7,
+               103.5, 102.2, 101.4, 102.9, 101.8, 100.6, 101.2, 99.8, 100.9, 101.6, 100.2, 99.4,
+               100.8, 101.1, 99.9, 100.4, 99.6, 100.0];
+function sparkline() {
+  const w = 300, h = 46, lo = Math.min(...SPARK), hi = Math.max(...SPARK);
+  const pts = SPARK.map((v, i) => `${(i / (SPARK.length - 1) * w).toFixed(1)},${(h - 4 - (v - lo) / (hi - lo) * (h - 8)).toFixed(1)}`);
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="Bitcoin price, falling from 109k to 100k over 30 days">` +
+         `<polyline points="${pts.join(" ")}" fill="none" stroke="var(--tools)" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg>`;
+}
+function chartCard() {
+  return `<div class="card"><div class="h"><span>Price USD — bitcoin</span><span>Santiment</span></div>${sparkline()}</div>`;
+}
+function renderChat(animate) {
+  const { chat } = derive(step);
+  const prev = derive(Math.max(0, step - 1)).chat.length;
+  const html = chat.map((it, i) => {
+    const cls = animate && step > 0 && i >= prev ? " enter" : "";
+    switch (it.k) {
+      case "bubble": return `<div class="bubble${cls}">${esc(it.text)}</div>`;
+      case "thinking": return `<div class="thinking${cls}">${esc(it.text)}</div>`;
+      case "todos": return `<div class="card${cls}"><div class="h"><span>Plan</span></div>` +
+        it.items.map((t, j) => `<div class="todo" data-done="${it.done.includes(j) ? 1 : 0}"><i>${it.done.includes(j) ? "✓" : "○"}</i>${esc(t)}</div>`).join("") + `</div>`;
+      case "script": return `<div class="card script${cls}"><span>▸ <b>${esc(it.name)}</b> · ${esc(it.who)}</span><span class="out">${esc(it.out)}</span></div>`;
+      case "search": return `<div class="card${cls}"><div class="h"><span>Searched the web</span><span>${it.n} results</span></div>${esc(it.q)}</div>`;
+      case "finding": return `<div class="card finding${cls}"><div class="h"><span>${esc(it.unit)}</span><span>sourced</span></div>${esc(it.text)} <span class="cite">${esc(it.src)}</span></div>`;
+      case "report": return `<div class="card report${cls}"><h4>Bitcoin, last 30 days</h4>` +
+        `<p>Price fell 8.4% ($109.2k → $100.0k), the sharpest day on Aug 2 <span class="cite">[1]</span>.</p>` +
+        chartCard() +
+        `<p>Active addresses averaged 91.2k a day and cooled 11.8% into the final week <span class="cite">[2]</span>; ` +
+        `the crowd turned net-short as social volume rose 64% <span class="cite">[3][4]</span>.</p>` +
+        `<div class="src">Sources<br>[1][2][3] Santiment<br>[4] coindesk.com/markets/…</div></div>`;
+      case "end": return `<div class="endline${cls}">${esc(it.text)}</div>`;
     }
-  }
-  return true;
-}
-/* An elbow route along one axis: the cross segment starts at the midpoint of
-   the gap and slides to the first lane where all three segments clear every
-   other box. Candidates and ordering depend only on the box pair, never on
-   direction, so a→b and b→a always produce the same corridor (the flow back
-   retraces the path). */
-function routeV(ra, rb, obs) {
-  const cax = ra.x + ra.w / 2, cbx = rb.x + rb.w / 2;
-  const down = rb.y + rb.h / 2 >= ra.y + ra.h / 2;
-  const ay = down ? ra.y + ra.h : ra.y;
-  const by = down ? rb.y : rb.y + rb.h;
-  const lo = Math.min(ay, by), hi = Math.max(ay, by), mid = (ay + by) / 2;
-  const cand = [mid];
-  obs.forEach(r => cand.push(r.y - 6, r.y + r.h + 6));
-  let my = mid, clear = false;
-  for (const y of cand.filter(y => y > lo + 4 && y < hi - 4)
-                      .sort((p, q) => Math.abs(p - mid) - Math.abs(q - mid))) {
-    if (segClear(cax, ay, cax, y, obs) && segClear(cax, y, cbx, y, obs) && segClear(cbx, y, cbx, by, obs)) { my = y; clear = true; break; }
-  }
-  return { d: `M ${cax} ${ay} L ${cax} ${my} L ${cbx} ${my} L ${cbx} ${by}`, clear };
-}
-function routeH(ra, rb, obs) {
-  const cay = ra.y + ra.h / 2, cby = rb.y + rb.h / 2;
-  const right = rb.x + rb.w / 2 >= ra.x + ra.w / 2;
-  const ax = right ? ra.x + ra.w : ra.x;
-  const bx = right ? rb.x : rb.x + rb.w;
-  const lo = Math.min(ax, bx), hi = Math.max(ax, bx), mid = (ax + bx) / 2;
-  const cand = [mid];
-  obs.forEach(r => cand.push(r.x - 6, r.x + r.w + 6));
-  let mx = mid, clear = false;
-  for (const x of cand.filter(x => x > lo + 4 && x < hi - 4)
-                      .sort((p, q) => Math.abs(p - mid) - Math.abs(q - mid))) {
-    if (segClear(ax, cay, x, cay, obs) && segClear(x, cay, x, cby, obs) && segClear(x, cby, bx, cby, obs)) { mx = x; clear = true; break; }
-  }
-  return { d: `M ${ax} ${cay} L ${mx} ${cay} L ${mx} ${cby} L ${bx} ${cby}`, clear };
-}
-function edgeD(a, b) {
-  const ra = vizRect(a), rb = vizRect(b);
-  // preferred axis has the bigger clear gap between the boxes' BORDERS (center
-  // distance lies when a wide box faces a narrow one) — but for diagonal pairs
-  // the preferred axis can be walled off by a box in between, so if its route
-  // still crosses something and the other axis is clean, take the other axis
-  const gapY = Math.max(rb.y - (ra.y + ra.h), ra.y - (rb.y + rb.h));
-  const gapX = Math.max(rb.x - (ra.x + ra.w), ra.x - (rb.x + rb.w));
-  const obs = nodeRects(a, b);
-  const first = gapY >= gapX ? routeV(ra, rb, obs) : routeH(ra, rb, obs);
-  if (first.clear) return first.d;
-  const second = gapY >= gapX ? routeH(ra, rb, obs) : routeV(ra, rb, obs);
-  return second.clear ? second.d : first.d;
-}
-function ensureEdge(a, b) {
-  const key = a < b ? a + ":" + b : b + ":" + a;
-  let e = edges.get(key);
-  if (!e) {
-    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    path.setAttribute("fill", "none");
-    path.setAttribute("stroke", "#394a63");
-    path.setAttribute("stroke-width", "1");
-    path.setAttribute("stroke-dasharray", "3 4");
-    path.setAttribute("opacity", "0.55");
-    overlay.appendChild(path);
-    e = { a, b, path };
-    edges.set(key, e);
-  }
-  e.path.setAttribute("d", edgeD(a, b));
-  return e;
-}
-function redrawEdges() { edges.forEach(e => e.path.setAttribute("d", edgeD(e.a, e.b))); }
-addEventListener("resize", redrawEdges);
-stage.addEventListener("scroll", redrawEdges);
-
-function pulse(a, b, color) {
-  ensureEdge(a, b);
-  if (!animating || reduced) return;
-  // a short stream of dots, not a single shot: the flow reads like a hose —
-  // ~2.5s of traffic on the edge, one dot every ~300ms
-  const myGen = gen;
-  const streamMs = 2500 / speed, gapMs = 300 / speed;
-  const t0 = performance.now();
-  (function emit() {
-    if (gen !== myGen) return; // a replay/reset ends the stream
-    launchDot(a, b, color);
-    if (performance.now() - t0 + gapMs < streamMs) setTimeout(emit, gapMs);
-  })();
+    return "";
+  }).join("");
+  const box = $("#chat");
+  box.innerHTML = html;
+  box.scrollTop = box.scrollHeight;
 }
 
-function launchDot(a, b, color) {
-  const probe = document.createElementNS("http://www.w3.org/2000/svg", "path");
-  probe.setAttribute("fill", "none");
-  probe.setAttribute("stroke", "none");
-  probe.setAttribute("d", edgeD(a, b));
-  overlay.appendChild(probe); // getTotalLength needs the path in the document
-  const dot = el("div", "pulse-dot");
-  dot.style.color = color; dot.style.background = color;
-  viz.appendChild(dot);
-  const dur = Math.max(320, Math.min(950, probe.getTotalLength() * 2.2)) / speed;
-  const t0 = performance.now();
-  const cleanup = () => { dot.remove(); probe.remove(); };
-  (function frame(now) {
-    // A replay (resetAll) detaches the dot; the stage may also be smooth-scrolling
-    // right now, so the path is recomputed every frame to track live node positions.
-    if (!dot.isConnected || !probe.isConnected) { cleanup(); return; }
-    const t = Math.min(1, (now - t0) / dur);
-    probe.setAttribute("d", edgeD(a, b));
-    const len = probe.getTotalLength();
-    const pt = probe.getPointAtLength(len * t);
-    dot.style.left = (pt.x - 4.5) + "px";
-    dot.style.top = (pt.y - 4.5) + "px";
-    if (t < 1) requestAnimationFrame(frame); else cleanup();
-  })(t0);
-  setTimeout(cleanup, dur + 3000); // backstop if rAF stalls (hidden tab, etc.)
+/* ------------------------------------------------------------------ transport */
+function render() {
+  const animate = !reduced && step === lastRendered + 1;
+  // The grid is rebuilt each step: keep keyboard focus on the same phase button.
+  const focusedPhase = document.activeElement?.dataset?.phaseStart;
+  renderGrid(animate);
+  if (focusedPhase != null) grid.querySelector(`[data-phase-start="${focusedPhase}"]`)?.focus();
+  renderStory(animate);
+  renderEvents(animate);
+  renderChat(animate);
+  $("#count").textContent = `${step + 1} / ${STEPS.length}`;
+  lastRendered = step;
 }
-
-/* -------- node / middleware state */
-function setNode(id, state) {
-  const n = $("#" + id);
-  n.dataset.state = state;
-  if (state === "active" && animating && !reduced) {
-    const nr = n.getBoundingClientRect(), sr = stage.getBoundingClientRect();
-    if (nr.top < sr.top || nr.bottom > sr.bottom) {
-      // instant, not smooth: a smooth scroll drags every in-flight pulse dot
-      // across the screen while nodes move under it
-      n.scrollIntoView({ block: "nearest", behavior: "auto" });
-      redrawEdges();
-    }
-  }
-}
-function reactPhase(ph) {
-  $$(".react-loop .ph").forEach(x => x.dataset.on = (x.dataset.ph === ph) ? "1" : "0");
-}
-function mwFlash(key, ok) {
-  const m = document.querySelector(`[data-mw="${key}"]`);
-  if (!m) return;
-  m.dataset.used = "1";
-  // first middleware event reveals the ghosted guardrails panel (gate-tags
-  // live in the subagent cards, so they don't trigger it)
-  if (m.closest("#mwstack")) $("#mwstack").classList.add("on");
-  if (animating && !reduced) {
-    const cls = ok ? "flash-ok" : "flash";
-    m.classList.add(cls);
-    setTimeout(() => m.classList.remove(cls), 1400 / speed);
-  }
-}
-function chip(k) { const c = document.querySelector(`.chip[data-k="${k}"]`); if (c) c.dataset.on = "1"; }
-
-/* -------- meters */
-function fmtTok(n) { return n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : Math.round(n / 1e3) + "k"; }
-function addUsage(dc, dt) {
-  calls += dc; tokens += dt;
-  $("#mCalls").style.width = Math.min(100, calls / 200 * 100) + "%";
-  $("#mTok").style.width = Math.min(100, tokens / 4e6 * 100) + "%";
-  $("#mCallsVal").textContent = `${calls} / 200`;
-  $("#mTokVal").textContent = `${fmtTok(tokens)} / 4.0M`;
-}
-
-/* -------- chat + ticker + terminal */
-function chatAdd(node) { chatBody.appendChild(node); chatBody.scrollTop = chatBody.scrollHeight; return node; }
-function think(text) {
-  let t = chatBody.querySelector(".thinking:last-child");
-  if (!t || t !== chatBody.lastElementChild) {
-    t = chatAdd(el("div", "thinking", '<span class="t-label">thinking · messages channel</span>'));
-  }
-  t.appendChild(el("div", "", text));
-  chatBody.scrollTop = chatBody.scrollHeight;
-}
-const KIND = {
-  run_start: "life", status: "life", usage: "life",
-  tool_call: "tool", tool_result: "tool",
-  mcp_call: "data", mcp_result: "data", search_query: "data", search_results: "data", source: "data",
-  skill: "exec", subagent_findings: "data", clarification: "guard", report: "tool"
-};
-function ev(type, payload) {
-  const row = el("div", "ev");
-  row.dataset.kind = KIND[type] || "life";
-  row.appendChild(el("span", "ev-type", type));
-  row.appendChild(el("span", "ev-payload", payload));
-  tickerBody.appendChild(row);
-  tickerBody.scrollTop = tickerBody.scrollHeight;
-}
-function termLine(text, cls) {
-  term.appendChild(el("span", cls, text + "\n"));
-  term.scrollTop = term.scrollHeight;
-}
-
-/* -------- cards */
-const TODOS = ["Market action — price & volatility", "On-chain activity", "Social & sentiment", "Synthesis"];
-function todoCard() {
-  const c = el("div", "card");
-  c.id = "todoCard";
-  c.appendChild(el("div", "card-eyebrow", "write_todos — the plan"));
-  TODOS.forEach((t, i) => {
-    const r = el("div", "todo-row");
-    r.dataset.i = i;
-    r.appendChild(el("span", "tick", "◻"));
-    r.appendChild(el("span", "todo-text", t));
-    c.appendChild(r);
-  });
-  chatAdd(c);
-}
-function todoDone(i) {
-  const r = document.querySelector(`#todoCard .todo-row[data-i="${i}"]`);
-  if (r) { r.dataset.done = "1"; r.querySelector(".tick").textContent = "✓"; }
-}
-function findingsCard(unit, n, sample, src) {
-  const c = el("div", "card findings-card");
-  c.appendChild(el("div", "card-eyebrow", `subagent_findings · ${unit} · ${n} findings, all sourced`));
-  c.appendChild(el("div", "f-row", `<b>${sample}</b> <span class="src-chip">→ ${src}</span>`));
-  c.appendChild(el("div", "f-row", `+ ${n - 1} more · gaps: []`));
-  chatAdd(c);
-}
-function reportCard() {
-  const c = el("div", "card report-card");
-  c.appendChild(el("div", "card-eyebrow", "report — via submit_report"));
-  c.innerHTML += `
-    <h3>Bitcoin, last 30 days: price, on-chain, social</h3>
-    <p><b>Price</b> fell 8.4% over the window ($109.2k → $100.0k), with the sharpest single-day
-       drop on Aug&nbsp;2 <span class="cite">[1]</span>.</p>
-    <p><b>On-chain</b>: daily active addresses averaged 91.2k, and the final week ran 11.8% below
-       the first — activity cooled alongside price <span class="cite">[2][3]</span>.</p>
-    <p><b>Social</b>: crowd positioning flipped net-short after the drop; funding and social
-       volume diverged from chain activity <span class="cite">[3][4][5]</span>.</p>
-    <div class="sources">## Sources<br>
-      - [1][2][3] Santiment<br>
-      - [4] coindesk.com/markets/2026/08/02/bitcoin-slides…<br>
-      - [5] theblock.co/post/…-funding-rates</div>`;
-  chatAdd(c);
-}
-
-/* ============================================================ the script */
-/* Each step: { phase, title, text, run() }. run() must be safe to execute
-   with animating=false — that is how instant replay / stepping back works. */
-const PHASES = [
-  ["send", "Send"], ["build", "Build"], ["triage", "Triage"], ["plan", "Plan"],
-  ["gather", "Gather"], ["synth", "Synthesize"], ["deliver", "Deliver"]
-];
-
-const STEPS = [
-
-{ phase: "send", title: "The user asks a question",
-  text: `The client app posts the message to the LangGraph server (<code>POST /threads/…/runs/stream</code>) and keeps the response open as an SSE stream. Everything the UI will render from here on arrives as typed events on the <code>custom</code> channel, plus plain thinking tokens on <code>messages</code>.`,
-  run() {
-    $("#fakeInput").textContent = "Analyze Bitcoin's last 30 days — price, on-chain, and social.";
-    $("#sendBtn").dataset.hot = "1";
-    chatAdd(el("div", "bubble-user", "Analyze Bitcoin's last 30 days — price, on-chain, and social."));
-    $("#fakeInput").textContent = "";
-    $("#sseDot").dataset.live = "1";
-    pulse("chat", "makegraph", "#93a0b4");
-  } },
-
-{ phase: "build", title: "make_graph builds this run from its config",
-  text: `An async config factory runs per request — models, API keys, MCP servers, sandbox and skills come from the run config, not import-time globals. It resolves <code>ResearchConfig</code>, creates the <code>RunMeter</code>, builds both models from the tier (<code>high</code>: claude-sonnet-5 plans, kimi-k2.6 grinds), loads tools, mounts <code>/skills</code> read-only, wires the sandbox, and stacks the middleware.`,
-  run() {
-    setNode("makegraph", "active");
-    ["cfg", "meter", "models", "tools", "skills", "sbx", "mw"].forEach(chip);
-    ev("run_start", '{protocol_version: 3, engine_version: "1.9.0"}');
-    ev("status", '{stage: "mcp_ready", server: "santiment", tools: 8}');
-    pulse("makegraph", "orch", "#e6a53c");
-  } },
-
-{ phase: "triage", title: "Every turn starts with triage",
-  text: `First model call. Three outcomes: <b>SIMPLE</b> → answer in plain text, no tools, stop. <b>AMBIGUOUS</b> → <code>request_clarification</code> (allowed only here, before research, max twice). <b>NEEDS RESEARCH</b> → continue. Before every model call, BudgetMiddleware checks the two run ceilings — 75% injects a "wrap up now" nudge, 100% halts.`,
-  run() {
-    setNode("makegraph", "done");
-    setNode("orch", "active");
-    reactPhase("triage");
-    mwFlash("budget", true);
-    addUsage(0, 6200);
-    think("Live price, chain and social data across a 30-day window — this needs research, not a quick answer.");
-  } },
-
-{ phase: "plan", title: "write_todos lays out the investigation",
-  text: `The orchestrator names its angles with the built-in <code>write_todos</code> tool and narrates brief reasoning between steps. That narration streams as ordinary tokens on the <code>messages</code> channel — it is the live "thinking" view, not a custom event.`,
-  run() {
-    reactPhase("plan");
-    ev("tool_call", '{name: "write_todos", todos: 4}');
-    todoCard();
-    addUsage(1, 4800);
-    think("Splitting into three independent units so each can run in parallel.");
-  } },
-
-{ phase: "gather", title: "Delegate — don't grind raw data upstairs",
-  text: `The orchestrator partitions the question into independent units and spawns one <code>research-subagent</code> per unit via the <code>task</code> tool, in parallel. This is context isolation: a sub-agent's raw tool output stays trapped in its own (cheaper) context; the smart model's context is reserved for planning and synthesis.`,
-  run() {
-    reactPhase("gather");
-    ["sub-a", "sub-b", "sub-c"].forEach(id => setNode(id, "active"));
-    ev("tool_call", '{name: "task", unit: "market action"}');
-    ev("tool_call", '{name: "task", unit: "on-chain activity"}');
-    ev("tool_call", '{name: "task", unit: "social & sentiment"}');
-    addUsage(3, 9400);
-    pulse("orch", "sub-a", "#e6a53c");
-    pulse("orch", "sub-b", "#e6a53c");
-    pulse("orch", "sub-c", "#e6a53c");
-    think("Delegating each dimension to a research sub-agent.");
-  } },
-
-{ phase: "gather", title: "Sub-agent A pulls market data over MCP",
-  text: `MCP tools are loaded per server so every tool carries a friendly source label ("Santiment") for citations. A shared semaphore caps simultaneous MCP calls at 10 across the orchestrator and all sub-agents; 429s back off instead of failing. A failed call never kills the run — the error text goes back to the model as the tool result.`,
-  run() {
-    setNode("tool-mcp", "active");
-    pulse("sub-a", "tool-mcp", "#6c96e8");
-    ev("mcp_call", '{name: "fetch_metric_data", asset: "bitcoin", metric: "price_usd", days: 30}');
-    ev("mcp_result", '{rows: 30, chars: 4.1k}');
-    ev("source", '{n: 1, label: "Santiment"}');
-    addUsage(2, 14000);
-    pulse("tool-mcp", "sub-a", "#6c96e8");
-  } },
-
-{ phase: "gather", title: "A result too big for context gets offloaded",
-  text: `Any result over 60k chars or 1,000 rows is too big for context. With a sandbox wired, it is written to a file under <code>/workspace/data</code> and only a compact stub enters the model's context — path, row count, columns, preview. Without a sandbox the same threshold becomes hard truncation. Raw rows never pile into anyone's context.`,
-  run() {
-    pulse("sub-b", "tool-mcp", "#6c96e8");
-    ev("mcp_call", '{name: "fetch_metric_data", asset: "bitcoin", metric: "active_addresses_24h"}');
-    ev("mcp_result", '{chars: 82k → offloaded, stub: "/workspace/data/aa_7f3a.json"}');
-    setNode("sandbox", "active");
-    $("#sbSession").textContent = "session: sbx_41c9 · pandas/numpy image";
-    $("#sbFiles").innerHTML = '/workspace/data/<br><span class="file">aa_7f3a.json · 30 rows · [ts, value]</span>';
-    addUsage(1, 2600);
-    pulse("tool-mcp", "sandbox", "#43b787");
-  } },
-
-{ phase: "gather", title: "execute — real code in the llm-sandbox",
-  text: `<code>execute</code> runs actual Python in the llm-sandbox sidecar (an HTTP service; the session is created lazily and reused for the whole run). The sub-agent loads the offloaded file with pandas and computes aggregates <em>there</em>. The prompt is strict: run code for real or not at all — "output" is only ever the verbatim result of a real call.`,
-  run() {
-    pulse("sub-b", "sandbox", "#43b787");
-    ev("tool_call", '{name: "execute", lang: "python"}');
-    termLine("$ python", "in");
-    termLine('>>> df = pd.read_json("/workspace/data/aa_7f3a.json")', "in");
-    termLine('>>> df.value.agg(["mean","min","max"]).round(0)', "in");
-    termLine("mean     91213    min  78411    max  112480", "out");
-    termLine(">>> (df.value[-7:].mean() / df.value[:7].mean() - 1).round(3)", "in");
-    termLine("-0.118", "out");
-    ev("tool_result", '{stdout: "mean 91213 …  -0.118"}');
-    addUsage(1, 5200);
-    pulse("sandbox", "sub-b", "#43b787");
-  } },
-
-{ phase: "gather", title: "Skills: progressive disclosure",
-  text: `Sub-agent C's task matches the <code>crowd-positioning</code> skill's description, so it reads the full <code>SKILL.md</code> from the read-only <code>/skills</code> mount — instructions are cheap to advertise in the system prompt and loaded only on demand. SkillUsageMiddleware emits a <code>skill</code> event so the UI can show it.`,
-  run() {
-    setNode("tool-skills", "active");
-    pulse("sub-c", "tool-skills", "#6c96e8");
-    mwFlash("skilluse", true);
-    ev("skill", '{name: "crowd-positioning"}');
-    setNode("tool-custom", "active");
-    pulse("sub-c", "tool-custom", "#6c96e8");
-    ev("tool_call", '{name: "social_messages", asset: "bitcoin", days: 30}');
-    ev("source", '{n: 3, label: "Santiment social data"}');
-    addUsage(2, 11800);
-  } },
-
-{ phase: "gather", title: "Web search rounds out the picture",
-  text: `<code>web_search</code> (Tavily) returns numbered sources for inline <code>[n]</code> citation and emits <code>search_query</code> / <code>search_results</code> events — the globe row and the favicon grid a research UI shows while working.`,
-  run() {
-    setNode("tool-search", "active");
-    pulse("sub-c", "tool-search", "#6c96e8");
-    ev("search_query", '{q: "bitcoin drop august 2 2026 cause"}');
-    ev("search_results", '{count: 7}');
-    ev("source", '{n: 4, url: "coindesk.com/markets/…"}');
-    ev("source", '{n: 5, url: "theblock.co/post/…"}');
-    addUsage(1, 7400);
-    pulse("tool-search", "sub-c", "#6c96e8");
-  } },
-
-{ phase: "gather", title: "The findings contract — a checkable handoff",
-  text: `A sub-agent's final message is the <em>only</em> thing the orchestrator ever sees of its work, so it must be exactly one JSON object: a dense summary, findings each carrying <code>{finding, evidence, source}</code>, and honest gaps. Sub-agent A's passes the deterministic gate — no model in the loop — and streams as a <code>subagent_findings</code> event.`,
-  run() {
-    document.querySelector('[data-mw="fgate-a"]').dataset.mode = "pass";
-    setNode("sub-a", "done");
-    todoDone(0);
-    ev("subagent_findings", '{unit: "market action", findings: 4, gaps: 0}');
-    findingsCard("market action", 4, "BTC −8.4% over 30d; sharpest drop Aug 2 (−5.1%)", "[1] Santiment");
-    addUsage(0, 3800);
-    pulse("sub-a", "orch", "#6c96e8");
-  } },
-
-{ phase: "gather", title: "A bad handoff bounces — once",
-  text: `Sub-agent B returns a finding with no source, so the gate bounces it back with the specific problems. The same gate also checks provenance: non-empty findings with zero tool calls means the model answered from memory — bounced. Empty findings are allowed (an honest "nothing found" beats a fabricated one). One bounce max; then whatever comes back is accepted, because the gate must never fail a run over formatting.`,
-  run() {
-    const g = document.querySelector('[data-mw="fgate-b"]');
-    g.dataset.mode = "bounce";
-    ev("status", '{stage: "revising", target: "findings", unit: "on-chain"}');
-    if (animating && !reduced) {
-      const myGen = gen;
-      setTimeout(() => { if (gen === myGen) { g.dataset.mode = "pass"; } }, 1600 / speed);
-    } else { g.dataset.mode = "pass"; }
-    setNode("sub-b", "done");
-    todoDone(1);
-    ev("subagent_findings", '{unit: "on-chain activity", findings: 3, gaps: 0}');
-    findingsCard("on-chain activity", 3, "Active addresses avg 91.2k/d; last week −11.8% vs first", "[2] Santiment");
-    addUsage(0, 4600);
-    pulse("sub-b", "orch", "#6c96e8");
-  } },
-
-{ phase: "gather", title: "All units are home",
-  text: `Sub-agent C passes cleanly. Had any unit reported non-empty <code>gaps</code>, the orchestrator would spawn follow-up sub-agents for exactly those gaps. Note the meters: most tool calls were made by the cheap fleet — that is model tiering doing its job.`,
-  run() {
-    document.querySelector('[data-mw="fgate-c"]').dataset.mode = "pass";
-    setNode("sub-c", "done");
-    todoDone(2);
-    ["tool-search", "tool-mcp", "tool-custom", "tool-skills"].forEach(id => setNode(id, "done"));
-    ev("subagent_findings", '{unit: "social & sentiment", findings: 5, gaps: 0}');
-    findingsCard("social & sentiment", 5, "Crowd flipped net-short post-drop; social vol +64%", "[3] Santiment social data");
-    addUsage(0, 5200);
-    pulse("sub-c", "orch", "#6c96e8");
-  } },
-
-{ phase: "synth", title: "Synthesize: one report from three findings objects",
-  text: `The orchestrator reads the findings JSONs — summaries, claims, and each claim's source — and weaves one markdown report, reusing those sources for its inline <code>[n]</code> citations. This is where the expensive model earns its keep: tokens spent on synthesis, never on re-reading raw rows.`,
-  run() {
-    reactPhase("synth");
-    mwFlash("budget", true);
-    addUsage(0, 38000);
-    think("All three units returned sourced findings. Writing the synthesis with inline citations.");
-  } },
-
-{ phase: "synth", title: "submit_report is the deliverable",
-  text: `The report is delivered by calling <code>submit_report</code> — not by whatever the last chat message happened to be. If a model writes the whole report as plain prose instead, ForceCompletionMiddleware nudges one mechanical resubmit; if it stops mid-research with a bare "Now I will…" and no tool call, it gets nudged to act (capped).`,
-  run() {
-    ev("tool_call", '{name: "submit_report", chars: 18.2k}');
-    mwFlash("force", true);
-    addUsage(1, 2400);
-  } },
-
-{ phase: "deliver", title: "The quality gate intercepts before delivery",
-  text: `ReportQualityGateMiddleware wraps the <code>submit_report</code> call itself. Uncited sources, split internal source lines, raw field names → one bounce back with specific fixes, then deliver as-is. <code>scrub_report</code> deterministically strips leaked plumbing (this run's own tool names, "server-side") and <code>lint_citations</code> reports orphans and danglers.`,
-  run() {
-    mwFlash("gate", true);
-    ev("status", '{stage: "revising", target: "report"}');
-    ev("tool_call", '{name: "submit_report", chars: 18.4k, attempt: 2}');
-    addUsage(1, 6800);
-  } },
-
-{ phase: "deliver", title: "The report lands in the UI",
-  text: `The <code>report</code> event carries the final markdown — claims cited inline with <code>[n]</code>, a <code>## Sources</code> list where web sources get one line per URL and internal data sources get one grouped line. The report is also persisted into thread state by ResearchOutputMiddleware.`,
-  run() {
-    todoDone(3);
-    mwFlash("output", true);
-    ev("report", '{markdown: "# Bitcoin, last 30 days…", sources: 5}');
-    reportCard();
-    pulse("orch", "chat", "#e6a53c");
-    addUsage(0, 1200);
-  } },
-
-{ phase: "deliver", title: "The run accounts for itself, then cleans up",
-  text: `after_agent hooks close the run: UsageMeterMiddleware emits the <code>usage</code> event (the observability surface), SandboxCleanupMiddleware destroys the sandbox session, and ResearchOutputMiddleware classifies why the run ended — here the happy path, <code>done / report_delivered</code>. Other endings it can name: direct_answer, awaiting_clarification, report_salvaged, budget_exhausted, stalled_after_nudges.`,
-  run() {
-    reactPhase("");
-    setNode("orch", "done");
-    setNode("sandbox", "done");
-    $("#sbSession").textContent = "session: sbx_41c9 · destroyed";
-    mwFlash("usage", true);
-    mwFlash("cleanup", true);
-    ev("usage", '{tool_calls: 13, tokens: 123k, model_calls: 9, rows: 4.2k}');
-    ev("status", '{stage: "done", reason: "report_delivered"}');
-    chatAdd(el("div", "usage-line", "run done · report_delivered · 13 tool calls · 123k tokens"));
-    $("#sseDot").dataset.live = "0";
-    $("#sendBtn").dataset.hot = "0";
-  } },
-];
-
-/* ============================================================ engine */
-const capTitle = $("#capTitle"), capText = $("#capText"), stepCount = $("#stepCount");
-const phasesEl = $("#phases");
-PHASES.forEach(([key, label]) => {
-  const b = el("button", "phase", label);
-  b.dataset.key = key;
-  b.addEventListener("click", () => {
-    const i = STEPS.findIndex(s => s.phase === key);
-    if (i >= 0) goTo(i, true);
-  });
-  phasesEl.appendChild(b);
-});
-
-let stepIndex = -1, playing = true, timer = null, gen = 0;
-
-function resetAll() {
-  gen++; // invalidates any pending per-step timeouts from a previous replay
-  chatBody.innerHTML = ""; tickerBody.innerHTML = ""; term.innerHTML = "";
-  overlay.innerHTML = ""; edges.clear();
-  $$(".pulse-dot").forEach(d => d.remove());
-  calls = 0; tokens = 0; addUsage(0, 0);
-  $$(".node").forEach(n => n.dataset.state = "");
-  $$(".chip").forEach(c => c.dataset.on = "0");
-  $$(".mw").forEach(m => { m.dataset.used = "0"; m.classList.remove("flash", "flash-ok"); });
-  $("#mwstack").classList.remove("on"); // re-ghost the guardrails for the next run
-  $$(".gate-tag").forEach(g => g.dataset.mode = "");
-  reactPhase("");
-  $("#sbSession").textContent = "session: —";
-  $("#sbFiles").innerHTML = '/workspace/data/ <span style="color:var(--faint)">(empty)</span>';
-  $("#sseDot").dataset.live = "0";
-  $("#sendBtn").dataset.hot = "0";
-  $("#fakeInput").textContent = "";
-}
-
-function renderCaption() {
-  const s = STEPS[stepIndex];
-  const changed = s && capTitle.textContent !== s.title;
-  capTitle.textContent = s ? s.title : "Press play";
-  capText.innerHTML = s ? s.text : "";
-  if (changed) {
-    const bar = capTitle.closest(".caption-bar"), wrap = $("#capWrap");
-    bar.classList.remove("flash"); wrap.classList.remove("swap");
-    void bar.offsetWidth; // restart both animations
-    bar.classList.add("flash"); wrap.classList.add("swap");
-  }
-  stepCount.textContent = `${stepIndex + 1} / ${STEPS.length}`;
-  const seen = new Set(STEPS.slice(0, stepIndex + 1).map(x => x.phase));
-  $$(".phase").forEach(p => {
-    p.dataset.on = (s && s.phase === p.dataset.key) ? "1" : "0";
-    p.dataset.past = (seen.has(p.dataset.key) && (!s || s.phase !== p.dataset.key)) ? "1" : "0";
-  });
-}
-
-function goTo(i, pause) {
-  clearTimeout(timer);
-  i = Math.max(0, Math.min(STEPS.length - 1, i));
-  resetAll();
-  animating = false;
-  for (let k = 0; k < i; k++) STEPS[k].run();
-  animating = true;
-  stepIndex = i;
-  STEPS[i].run();
-  redrawEdges();
-  renderCaption();
-  if (pause) setPlaying(false); else schedule();
-}
-
-function advance() {
-  if (stepIndex >= STEPS.length - 1) { setPlaying(false); return; }
-  stepIndex++;
-  STEPS[stepIndex].run();
-  redrawEdges();
-  renderCaption();
+function go(i, keepPlaying) {
+  step = Math.max(0, Math.min(STEPS.length - 1, i));
+  if (!keepPlaying) setPlaying(false);
+  render();
   schedule();
 }
-
 function schedule() {
   clearTimeout(timer);
   if (!playing) return;
-  if (stepIndex >= STEPS.length - 1) { setPlaying(false); return; }
-  timer = setTimeout(advance, 5600 / speed);
+  if (step >= STEPS.length - 1) { setPlaying(false); return; }
+  timer = setTimeout(() => go(step + 1, true), 6000 / speed);
 }
-
 function setPlaying(on) {
   playing = on;
-  $("#btnPlay").textContent = on ? "Pause" : "Play";
-  $("#btnPlay").dataset.on = on ? "true" : "false";
-  if (on) {
-    if (stepIndex >= STEPS.length - 1) goTo(0); else schedule();
-  } else clearTimeout(timer);
+  $("#play").textContent = on ? "Pause" : step >= STEPS.length - 1 ? "Replay" : "Play";
+  if (!on) clearTimeout(timer);
 }
 
-$("#btnPlay").addEventListener("click", () => setPlaying(!playing));
-$("#btnNext").addEventListener("click", () => { setPlaying(false); goTo(stepIndex + 1, true); });
-$("#btnPrev").addEventListener("click", () => { setPlaying(false); goTo(Math.max(0, stepIndex - 1), true); });
-$("#btnRestart").addEventListener("click", () => { goTo(0); setPlaying(true); });
+$("#play").addEventListener("click", () => {
+  if (playing) { setPlaying(false); return; }
+  setPlaying(true);
+  if (step >= STEPS.length - 1) { lastRendered = -1; go(0, true); } else schedule();
+});
+$("#next").addEventListener("click", () => go(step + 1, false));
+$("#prev").addEventListener("click", () => go(step - 1, false));
 $("#speed").addEventListener("change", (e) => { speed = parseFloat(e.target.value); schedule(); });
 addEventListener("keydown", (e) => {
-  if (e.target.tagName === "SELECT") return;
-  if (e.code === "Space") { e.preventDefault(); setPlaying(!playing); }
-  else if (e.key === "ArrowRight") { setPlaying(false); goTo(stepIndex + 1, true); }
-  else if (e.key === "ArrowLeft") { setPlaying(false); goTo(Math.max(0, stepIndex - 1), true); }
-  else if (e.key.toLowerCase() === "r") { goTo(0); setPlaying(true); }
+  // Leave browser shortcuts (Alt+← is Back) and form controls alone.
+  if (e.altKey || e.metaKey || e.ctrlKey || e.target.closest("select")) return;
+  const keys = { ArrowRight: () => go(step + 1, false), ArrowLeft: () => go(step - 1, false),
+                 Home: () => go(0, false), End: () => go(STEPS.length - 1, false) };
+  if (keys[e.key]) { e.preventDefault(); keys[e.key](); }
+  else if (e.key === " " && !e.target.closest("button")) { e.preventDefault(); $("#play").click(); }
 });
+addEventListener("resize", () => drawArrows(false));
 
-/* go */
-goTo(0);
+const tierSel = $("#tier");
+Object.keys(TIERS).forEach((t) => tierSel.add(new Option(t, t, false, t === tier)));
+tierSel.addEventListener("change", (e) => { tier = e.target.value; lastRendered = step; render(); });
+
+const legend = [["orch", "orchestrator"], ["fleet", "research sub-agents"], ["worker", "extract / coding workers"],
+                ["tools", "data tools"], ["sandbox", "sandbox"]];
+const markKey = [["ok", "✓", "gate passed the handoff"], ["bounce", "↩", "gate sent it back once to fix"],
+                 ["error", "✗", "script failed (not a gate)"]];
+$("#legend").innerHTML =
+  legend.map(([c, t]) => `<span class="lane-key" style="--c: var(--${c})">${t}</span>`).join("") +
+  `<span class="marks">${markKey.map(([tone, sym, t]) => `<span><b class="mark" data-tone="${tone}">${sym}</b>${t}</span>`).join("")}</span>`;
+
+render();
+if (!reduced) { setPlaying(true); schedule(); }
 </script>
 </body>
 </html>

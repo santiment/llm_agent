@@ -334,9 +334,47 @@ def test_brief_questions_reads_the_numbered_tags_from_the_brief_only() -> None:
     assert brief_questions([brief, ToolMessage("rows", tool_call_id="1")]) == ["Q1", "Q2", "Q3"]
     assert brief_questions([HumanMessage("QUESTION: themes only")]) == []
     nudge = HumanMessage("Q1: this is a nudge, not the brief", name=FINDINGS_NUDGE_NAME)
-    assert brief_questions([nudge, HumanMessage("Q2: real brief")]) == ["Q2"]
-    assert brief_questions([HumanMessage("Q1: a\nQ4: beyond the batch cap\nQ1: again")]) == ["Q1"]
+    assert brief_questions([HumanMessage("Q1: real\nQ2: brief"), nudge]) == ["Q1", "Q2"]
+    assert brief_questions([HumanMessage("Q1: a\nQ4: beyond the batch cap\nQ1: again")]) == []  # one tag: no batch
     assert brief_questions([HumanMessage("- **Q1**: bold\n(Q2) bracketed\nsee Q3 mid-sentence")]) == ["Q1", "Q2"]
+    assert brief_questions([HumanMessage("q1: lower\nq2: case")]) == ["Q1", "Q2"]
+
+
+def test_quarters_in_a_brief_are_periods_not_questions() -> None:
+    # A research unit is often a reporting period: "Q3 2026" must never read as a question tag.
+    from deep_research_agent.findings_gate import brief_questions
+
+    periods = HumanMessage("Research Coinbase quarterly results.\nPERIODS:\n- Q2 2026 revenue\n- Q3 2026 revenue")
+    assert brief_questions([periods]) == []
+    gapped = HumanMessage("Q2: $1.2B revenue\nQ3: $1.5B revenue")          # delimited, but not from Q1
+    assert brief_questions([gapped]) == []
+
+
+def test_the_brief_survives_compaction() -> None:
+    # Compaction puts its summary FIRST; the brief is the turn's real human message.
+    from deep_research_agent.findings_gate import brief_questions
+    from deep_research_agent.turn import COMPACTION_SUMMARY_NAME
+
+    summary = HumanMessage("Summary of earlier work: Q3 2026 data read.", name=COMPACTION_SUMMARY_NAME)
+    assert brief_questions([summary, HumanMessage("Q1: themes\nQ2: claims")]) == ["Q1", "Q2"]
+
+
+def test_one_finding_may_answer_several_questions() -> None:
+    from deep_research_agent.findings_gate import coverage_problems
+
+    obj = {"summary": "s", "findings": [{"finding": "Q1/Q2: ETF theme, BlackRock flows", "source": "S"}],
+           "gaps": "Q3: not determinable — no rows"}
+    assert coverage_problems(obj, ["Q1", "Q2", "Q3"]) == []
+    assert coverage_problems({"summary": "s", "findings": [{"finding": "Q3 2026 revenue rose", "source": "S"}]},
+                             ["Q1", "Q2", "Q3"])                           # a period is not a tag
+
+
+def test_research_subagent_never_checks_question_tags() -> None:
+    mw = SubagentFindingsMiddleware()                                     # the research-subagent's gate
+    brief = HumanMessage("Q1: themes\nQ2: claims")
+    ok = AIMessage('{"summary": "s", "findings": [{"finding": "ETF talk (41 msgs)",'
+                   ' "evidence": "41 of 200", "source": "S"}], "gaps": []}')
+    assert mw.after_model(make_state(brief, ToolMessage("rows", tool_call_id="1"), ok), None) is None
 
 
 def test_coverage_needs_a_tagged_finding_or_gap_per_question() -> None:
@@ -357,7 +395,7 @@ def test_coverage_needs_a_tagged_finding_or_gap_per_question() -> None:
 
 
 def test_batched_brief_bounces_a_skipped_question_once_then_accepts_when_gapped() -> None:
-    mw = SubagentFindingsMiddleware()
+    mw = SubagentFindingsMiddleware(batched_questions=True)
     brief = HumanMessage("FILE: /workspace/x.json\nQUESTIONS:\nQ1: themes\nQ2: claims\nSOURCE LABEL: S")
     work = [brief, ToolMessage("rows", tool_call_id="1")]
     partial = AIMessage('{"summary": "themes read", "findings": [{"finding": "Q1: ETF talk (41 msgs)",'
@@ -388,7 +426,7 @@ def test_prompts_and_skill_batch_only_closely_related_questions() -> None:
 
 
 def test_after_the_nudge_a_still_skipped_question_becomes_an_explicit_gap() -> None:
-    mw = SubagentFindingsMiddleware()
+    mw = SubagentFindingsMiddleware(batched_questions=True)
     brief = HumanMessage("QUESTIONS:\nQ1: themes\nQ2: claims\nQ3: split\nSOURCE LABEL: S")
     nudge = HumanMessage("fix it", name=FINDINGS_NUDGE_NAME)
     still_partial = AIMessage('{"summary": "s", "findings": [{"finding": "Q1: ETF talk (41 msgs)",'
@@ -398,5 +436,5 @@ def test_after_the_nudge_a_still_skipped_question_becomes_an_explicit_gap() -> N
     assert update and update.get("jump_to") is None                      # accepted, not bounced again
     handed = json.loads(update["messages"][0].content.strip("`json\n"))
     assert handed["gaps"] == ["Q3: not determinable — too few messages",
-                              "Q2: not answered by the extract worker — ask it again in its own task"]
+                              "Q2: not answered — ask it again in its own task"]
     assert events[0]["type"] == "subagent_findings" and events[0]["gaps"] == handed["gaps"]

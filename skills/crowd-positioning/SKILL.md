@@ -152,9 +152,10 @@ say so in the findings. Never write your own version.
      one line of "what's actually being said" per theme, the concrete *checkable* claims (named
      actors, flows, events, targets) for signal 3, verbatim quotes, and where the crowd splits in
      `head`/`poles` — goes to `extract-subagent` via `task`. Never print message text into your own
-     context. Send **exactly three** `task`s, in parallel: (a) themes + what's said, (b) checkable
-     claims, (c) disagreement + quotes. Only for a monster file (over ~5,000 sampled messages)
-     split a question by `source`, and never exceed six tasks in total. Do not re-ask a question
+     context. Send **one** `task` with the three questions numbered `Q1:`–`Q3:` — (Q1) themes +
+     what's said, (Q2) checkable claims, (Q3) disagreement + quotes — one reading pass answers
+     them all. Only for a monster file (over ~5,000 sampled messages) split by `source`, and
+     never exceed two tasks per file. Do not re-ask a question
      because the answer was thin — a thin answer is the finding. Task template + the three
      questions are in `signals.md` § *Text extraction*. Exception: if the result arrived inline
      (small window, no file path), it is small enough to read directly.
@@ -181,7 +182,7 @@ say so in the findings. Never write your own version.
 - One window inference at most; zero matches ends the analysis with "no crowd data".
 - Recipe import fallback: once. Longer baseline for `unbaselined`: once. Price re-fetch for
   `unaligned`: once. After that, report the limitation in one clause.
-- `extract-subagent`: three tasks; six absolute maximum. No re-asking.
+- `extract-subagent`: one task (Q1–Q3) per file; two at most, split by `source`. No re-asking.
 - Chain checks: at most five claims; web corroboration: at most two searches.
 - A failed `execute` goes to `coding-subagent` once; its output is final.
 

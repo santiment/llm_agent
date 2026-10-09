@@ -38,7 +38,7 @@ from .provider_routing import resolve as resolve_routing
 from .report_gate import ReportQualityGateMiddleware
 from .script_artifacts import ExecuteArtifactsMiddleware, ScriptArtifactsMiddleware
 from .skill_usage import SkillUsageMiddleware
-from .tool_filter import (CODING_EXCLUDED_TOOLS, EXTRACT_EXCLUDED_TOOLS,
+from .tool_filter import (CODING_EXCLUDED_TOOLS, EXECUTE_HINT, EXTRACT_EXCLUDED_TOOLS,
                           ORCHESTRATOR_EXCLUDED_TOOLS, ExcludeToolsMiddleware)
 from .triage import TriageRouterMiddleware
 from .events import instrument_tool, result_handling
@@ -57,9 +57,16 @@ log = logging.getLogger("deep_research_agent.agent")
 # it and got back "the report has been compiled" with nothing behind it. Provider-wide
 # opt-out, merged onto deepagents' built-in openai profile (registrations are additive);
 # every model here is a ChatOpenAI over OpenRouter, so "openai" covers the whole fleet.
+#
+# Same profile: drop deepagents' own SummarizationMiddleware. Our models carry no profile, so
+# it defaults to a fixed 170k-token trigger and summarizes on each ROLE's model — invisible
+# while our compaction fired first at 100k, but with ContextCompactionMiddleware's per-role
+# trigger at up to 600k it would run instead: on the expensive model, without the routing
+# fallback, writing history files into the sandbox. Compaction is ours alone.
 register_harness_profile(
     "openai",
-    HarnessProfile(general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False)),
+    HarnessProfile(general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+                   excluded_middleware=frozenset({"SummarizationMiddleware"})),
 )
 
 
@@ -167,7 +174,7 @@ async def make_graph(config: dict | None = None):
     # Both must be tool-capable. report_model is reserved for a future dedicated
     # synthesis step — using it (often a cheap "nano") for the tool loop makes the
     # agent skip tools and terminate early.
-    # Per-model OpenRouter provider routing (price cap, ignore list, speed preference) from
+    # Per-model OpenRouter provider routing (ignore list, speed preference) from
     # the live endpoint feed — see provider_routing.py. Cached; unreachable = soft prefs only.
     routing = await resolve_routing(cfg, (cfg.research_model, cfg.subagent_model,
                                           cfg.utility_model, cfg.compaction_model,
@@ -255,21 +262,25 @@ async def make_graph(config: dict | None = None):
     cache_middleware: list = ([PromptCacheMiddleware()]
                               if cfg.prompt_caching and cfg.is_openrouter else [])
     # Context windows from the same endpoint feed the routing read (cached): the trigger is
-    # compaction_tokens or compaction_window_fraction of the role model's window, whichever
+    # the role's absolute (orchestrator_compaction_tokens for the orchestrator,
+    # compaction_tokens for sub-agents) or compaction_window_fraction of its window, whichever
     # is lower — a smaller-window model in a tier compacts in time without a config edit.
-    # No feed (off OpenRouter, unreachable) -> the absolute alone. Self-disables at 0.
+    # No feed (off OpenRouter, unreachable) -> a conservative 170k. Self-disables at 0.
     windows = await context_windows(cfg, (cfg.research_model, cfg.subagent_model,
                                           cfg.utility_model, cfg.compaction_model,
                                           cfg.coding_model), routing)
 
     def compaction_for(role: str, slug: str) -> ContextCompactionMiddleware:
-        trigger = compaction_trigger(cfg.compaction_tokens, windows.get(slug),
+        absolute = (cfg.orchestrator_compaction_tokens if role == "orchestrator"
+                    else cfg.compaction_tokens)
+        trigger = compaction_trigger(absolute, windows.get(slug),
                                      cfg.compaction_window_fraction)
         log.info("COMPACTION role=%s model=%s window=%s trigger=%s", role, slug,
                  f"{windows[slug]:,}" if windows.get(slug) else "unknown",
                  f"{trigger:,}" if trigger else "off")
         return ContextCompactionMiddleware(compaction_model, trigger_tokens=trigger,
-                                           summarizer_window=windows.get(cfg.compaction_model))
+                                           summarizer_window=windows.get(cfg.compaction_model),
+                                           routing_ttl=cfg.provider_routing_ttl)
 
     # A sub-agent owns ONE UNIT of research (e.g. a single entity / period / segment): it makes
     # ALL the calls that unit needs in its OWN context and returns only consolidated dense
@@ -301,9 +312,9 @@ async def make_graph(config: dict | None = None):
                        # It delegates to the extract / coding sub-agents through its own
                        # `task`: one of those dying must not take this unit down.
                        SubagentFailureMiddleware(),
-                       # A call OpenRouter refuses over our own routing object (price cap,
-                       # ignore list) is retried with less of it — a model we name can be
-                       # slow or pricey for a while, never unreachable by our preference.
+                       # A call OpenRouter refuses over our own routing object (the ignore
+                       # list) is retried with less of it — a model we name can be slow for
+                       # a while, never unreachable by our preference.
                        ProviderRoutingFallbackMiddleware("research-subagent", cfg.subagent_model,
                                                          ttl=cfg.provider_routing_ttl),
                        # LAST on every role: a throttled provider is waited out (budgeted)
@@ -326,23 +337,21 @@ async def make_graph(config: dict | None = None):
     # direct path skips deepagents' default stack, so a nested spec carries its own
     # filesystem stack, then the same middleware as the top-level spec.
     nested_specs: list[dict] = []
-    if sandbox is not None:
+
+    def nested(spec: dict, files_prompt: str) -> dict:
+        # The default filesystem prompt advertises read_file/grep, which the tool filter
+        # may remove — so each nested spec states its own file rules.
         from deepagents.middleware.filesystem import FilesystemMiddleware
         from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
-        from deepagents.middleware.subagents import SubAgentMiddleware
 
-
-        def nested(spec: dict, files_prompt: str) -> dict:
-            # The default filesystem prompt advertises read_file/grep, which the tool filter
-            # may remove — so each nested spec states its own file rules.
-            return {
-                **spec,
-                "middleware": [
-                    FilesystemMiddleware(backend=backend, system_prompt=files_prompt),
-                    PatchToolCallsMiddleware(),
-                    *spec["middleware"],
-                ],
-            }
+        return {
+            **spec,
+            "middleware": [
+                FilesystemMiddleware(backend=backend, system_prompt=files_prompt),
+                PatchToolCallsMiddleware(),
+                *spec["middleware"],
+            ],
+        }
 
     # Utility-model consumer: reads offloaded /workspace result files on the cheapest
     # model. Registered only when offloading is live; the filter hides every built-in
@@ -361,7 +370,7 @@ async def make_graph(config: dict | None = None):
             "system_prompt": extract_prompt(cfg.domain_prompt),
             "tools": [],
             "model": utility_model,
-            "middleware": [SubagentFindingsMiddleware(),
+            "middleware": [SubagentFindingsMiddleware(batched_questions=True),
                            SubagentUsageMiddleware(meter, "extract-subagent",
                                                    model=cfg.utility_model),
                            # Its whole job runs as `execute` heredocs — this is the
@@ -370,7 +379,7 @@ async def make_graph(config: dict | None = None):
                            *shared_middleware,
                            compaction_for("extract-subagent", cfg.utility_model),
                            *cache_middleware,
-                           ExcludeToolsMiddleware(EXTRACT_EXCLUDED_TOOLS),
+                           ExcludeToolsMiddleware(EXTRACT_EXCLUDED_TOOLS, hint=EXECUTE_HINT),
                            ProviderRoutingFallbackMiddleware("extract-subagent", cfg.utility_model,
                                                              ttl=cfg.provider_routing_ttl),
                            ModelBackoffMiddleware("extract-subagent", cfg.utility_model,
@@ -391,6 +400,8 @@ async def make_graph(config: dict | None = None):
     # ScriptArtifactsMiddleware carries the code itself to the UI out of band. Keeps the
     # file tools (it writes and edits scripts); loses grep/write_todos.
     if sandbox is not None:
+        from deepagents.middleware.subagents import SubAgentMiddleware
+
         coding_spec = {
             "name": "coding-subagent",
             "description": (
@@ -414,7 +425,7 @@ async def make_graph(config: dict | None = None):
                            *shared_middleware,
                            compaction_for("coding-subagent", cfg.coding_model),
                            *cache_middleware,
-                           ExcludeToolsMiddleware(CODING_EXCLUDED_TOOLS),
+                           ExcludeToolsMiddleware(CODING_EXCLUDED_TOOLS, hint=EXECUTE_HINT),
                            ProviderRoutingFallbackMiddleware("coding-subagent", cfg.coding_model,
                                                              ttl=cfg.provider_routing_ttl),
                            ModelBackoffMiddleware("coding-subagent", cfg.coding_model,
@@ -439,7 +450,7 @@ async def make_graph(config: dict | None = None):
     middleware = [
         # First: a ~250-token verdict on the research model. A pure-knowledge question is
         # answered right here and the turn ends, never paying the ~12k-token harness below.
-        TriageRouterMiddleware(research_model),
+        TriageRouterMiddleware(research_model, routing_ttl=cfg.provider_routing_ttl),
         # Compaction must run before BudgetMiddleware so the budget check sees the shrunk
         # transcript plus the compacted_* counters.
         *shared_middleware,

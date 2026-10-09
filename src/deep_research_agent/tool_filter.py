@@ -26,11 +26,15 @@ from .turn import tool_call_of
 
 log = logging.getLogger("deep_research_agent.tool_filter")
 
-_REFUSED = (
-    "`{name}` is not available to this role, so this call did nothing. Files are read and "
-    "written by sub-agents: delegate with the `task` tool (extract-subagent for a data file, "
-    "coding-subagent for a script) and work from what it returns. Do not call `{name}` again."
-)
+_REFUSED = "`{name}` is not available to this role, so this call did nothing. {hint} " \
+           "Do not call `{name}` again."
+# What to do instead, per role. Only the orchestrator has a `task` tool to delegate with;
+# the workers must be pointed at what they DO hold.
+DELEGATE_HINT = ("Files are read and written by sub-agents: delegate with the `task` tool "
+                 "(extract-subagent for a data file, coding-subagent for a script) and work "
+                 "from what it returns.")
+EXECUTE_HINT = ("Work on files only through the `execute` tool: bounded Python that prints "
+                "just what you need.")
 
 EXTRACT_EXCLUDED_TOOLS: frozenset[str] = frozenset({
     "ls", "read_file", "write_file", "edit_file", "glob", "grep", "write_todos",
@@ -54,9 +58,10 @@ def filter_tools(tools: list, excluded: frozenset[str]) -> list:
 
 
 class ExcludeToolsMiddleware(AgentMiddleware):
-    def __init__(self, excluded: frozenset[str] | set[str]) -> None:
+    def __init__(self, excluded: frozenset[str] | set[str], hint: str = DELEGATE_HINT) -> None:
         super().__init__()
         self.excluded = frozenset(excluded)
+        self.hint = hint
 
     def wrap_model_call(self, request, handler):
         return handler(request.override(tools=filter_tools(request.tools, self.excluded)))
@@ -77,5 +82,5 @@ class ExcludeToolsMiddleware(AgentMiddleware):
         if name not in self.excluded:
             return None
         log.warning("TOOL FILTER: refused %r (hidden from this role); nothing was executed", name)
-        return ToolMessage(content=_REFUSED.format(name=name), tool_call_id=call_id or "",
+        return ToolMessage(content=_REFUSED.format(name=name, hint=self.hint), tool_call_id=call_id or "",
                            name=name)

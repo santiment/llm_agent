@@ -19,7 +19,7 @@ import logging
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware, hook_config
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import HumanMessage
 
 from .turn import (
     NUDGE_NAME,
@@ -27,7 +27,9 @@ from .turn import (
     called,
     count_nudges,
     current_turn,
+    delivered_report,
     did_research_work,
+    final_reply,
     is_json_object_dump,
     looks_delivered,
     text_of,
@@ -72,16 +74,15 @@ class ForceCompletionMiddleware(AgentMiddleware):
     @hook_config(can_jump_to=["model"])
     def after_model(self, state: dict, runtime) -> dict[str, Any] | None:
         messages = state.get("messages") or []
-        last = messages[-1] if messages else None
-        if not isinstance(last, AIMessage):
-            return None
-        # Model is calling tools → the loop continues on its own.
-        if getattr(last, "tool_calls", None):
-            return None
+        last = final_reply(messages)
+        if last is None:
+            return None  # calling tools → the loop continues on its own
         # Scope to the current turn: a prior turn's submit_report must NOT count here,
         # or a follow-up would terminate immediately and inherit the old report.
         turn = current_turn(messages)
-        if called(turn, "submit_report") or called(turn, "request_clarification"):
+        # A report the quality gate bounced was NOT delivered: a model that answers the
+        # bounce with prose still gets the resubmit nudge below.
+        if delivered_report(turn) or called(turn, "request_clarification"):
             return None
         content = text_of(last.content)
         if not content.strip():

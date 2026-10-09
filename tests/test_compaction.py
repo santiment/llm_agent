@@ -84,6 +84,7 @@ def test_compacts_summary_before_anchor_and_counts_dropped_work() -> None:
     kept_tool_msgs = sum(1 for m in tail if isinstance(m, ToolMessage))
     assert update["compacted_tool_calls"] == 10 - kept_tool_msgs
     assert update["compacted_tokens"] > 0
+    assert 0 < update["compacted_budget_tokens"] <= update["compacted_tokens"]   # budget units
 
 
 def test_tail_never_splits_an_ai_tool_pair() -> None:
@@ -100,6 +101,7 @@ def test_counters_accumulate_across_compactions() -> None:
     update = _mw().before_model(state, None)
     assert update["compacted_tool_calls"] > 7      # previous + newly dropped
     assert update["compacted_tokens"] > 9_000
+    assert update["compacted_budget_tokens"] > 9_000   # legacy state: its real total carries over
 
 
 def test_stale_counters_from_a_previous_turn_are_discarded() -> None:
@@ -168,7 +170,11 @@ def test_default_trigger_is_near_the_window_and_transcript_bound_follows() -> No
     from deep_research_agent.compaction import _MAX_TRANSCRIPT_CHARS, _transcript
     from deep_research_agent.config import ResearchConfig
 
-    assert ResearchConfig.compaction_tokens == 800_000       # ~80% of the 1M every tier model has
+    assert ResearchConfig.compaction_tokens == 600_000              # sub-agents: their context is their data
+    assert ResearchConfig.orchestrator_compaction_tokens == 200_000 # orchestrator: plans + findings only
+    cfg = ResearchConfig.from_runnable_config({"configurable": {"orchestrator_compaction_tokens": 0,
+                                                                "compaction_tokens": 300_000}})
+    assert (cfg.orchestrator_compaction_tokens, cfg.compaction_tokens) == (0, 300_000)   # per run
     assert _mw(trigger=800_000).transcript_chars() == 1_600_000
     assert _mw(trigger=5_000).transcript_chars() == _MAX_TRANSCRIPT_CHARS   # never below the floor
     long = [HumanMessage(content="x" * 1_500) for _ in range(10)]   # ~15k chars of entries
@@ -184,19 +190,18 @@ def test_compaction_trigger_is_the_lower_of_absolute_and_window_fraction() -> No
 
     assert compaction_trigger(800_000, 1_048_576, 0.8) == 800_000       # 1M window: absolute wins
     assert compaction_trigger(800_000, 262_144, 0.8) == 209_715         # 256k window: 80% of it
-    assert compaction_trigger(800_000, None, 0.8) == 800_000            # no feed: absolute alone
+    assert compaction_trigger(800_000, None, 0.8) == 170_000            # no feed: conservative
+    assert compaction_trigger(100_000, None, 0.8) == 100_000            # ... unless the knob is lower
     assert compaction_trigger(800_000, 262_144, 0) == 800_000           # window rule off
     assert compaction_trigger(0, 262_144, 0.8) == 0                     # off stays off
 
 
 def test_summarizer_bound_respects_the_compaction_models_window() -> None:
-    from deep_research_agent.compaction import _MAX_TRANSCRIPT_CHARS
-
     assert _mw(trigger=800_000).transcript_chars() == 1_600_000
     mw = ContextCompactionMiddleware(_FakeModel(), trigger_tokens=800_000, summarizer_window=262_144)
-    assert mw.transcript_chars() == 2 * 262_144                          # the summarizer's window binds
+    assert mw.transcript_chars() == int(1.5 * 262_144)                   # the summarizer's window binds
     mw = ContextCompactionMiddleware(_FakeModel(), trigger_tokens=800_000, summarizer_window=100_000)
-    assert mw.transcript_chars() == _MAX_TRANSCRIPT_CHARS                 # never below the floor
+    assert mw.transcript_chars() == 150_000      # the floor would overflow a 100k window: 1.5 chars/token cap
 
 
 def test_window_is_the_smallest_the_routing_admits() -> None:
@@ -212,12 +217,13 @@ def test_window_is_the_smallest_the_routing_admits() -> None:
 
     feed = [ep("Cheap", 0.05, 0.16, 1_048_576), ep("Small", 0.06, 0.18, 262_144),
             ep("Pricey", 0.44, 1.32, 1_310_720), ep("Down", 0.05, 0.16, 131_072, uptime=50, status=-2)]
-    cap = {"max_price": {"prompt": 0.0625, "completion": 0.2}}
-    assert pr.context_window(cfg, feed, cap) == 262_144                   # Cheap + Small admitted
-    assert pr.context_window(cfg, feed, {**cap, "ignore": ["small"]}) == 1_048_576
+    routed = {"ignore": ["down"]}
+    assert pr.context_window(cfg, feed, routed) == 262_144                # every healthy one; Small binds
+    assert pr.context_window(cfg, feed, {"ignore": ["small"]}) == 1_048_576
     assert pr.context_window(cfg, feed, {}) == 262_144                    # relaxed: every healthy one
-    assert pr.context_window(cfg, feed, {"max_price": {"prompt": 0.01, "completion": 0.01}}) == 262_144  # admits none -> all healthy
-    assert pr.context_window(cfg, [], cap) is None and pr.context_window(cfg, None, cap) is None
+    everyone = {"ignore": ["cheap", "small", "pricey"]}
+    assert pr.context_window(cfg, feed, everyone) == 262_144              # admits none -> all healthy
+    assert pr.context_window(cfg, [], routed) is None and pr.context_window(cfg, None, routed) is None
     assert pr.context_window(cfg, [ep("NoCtx", 0.05, 0.16, None)], {}) is None
 
 
@@ -266,12 +272,12 @@ def test_every_role_gets_its_own_trigger_from_its_models_window(monkeypatch) -> 
         return found[0]
 
     orch = compactor(captured["middleware"])
-    assert orch.trigger_tokens == 800_000                                # 1.05M window: absolute wins
+    assert orch.trigger_tokens == 200_000                                # the orchestrator's own absolute
     assert orch.summarizer_window == 262_144                             # the compaction model's own window
     specs = {s["name"]: compactor(s["middleware"]) for s in captured["subagents"]}
     assert specs["research-subagent"].trigger_tokens == 209_715           # 80% of its 256k window
-    assert specs["extract-subagent"].trigger_tokens == 800_000
-    assert specs["coding-subagent"].trigger_tokens == 800_000
+    assert specs["extract-subagent"].trigger_tokens == 600_000           # 1.05M window: absolute wins
+    assert specs["coding-subagent"].trigger_tokens == 600_000
     assert all(c.model.model_name == cfg.compaction_model for c in specs.values())  # summarizer stays the tier's
     # Budget still runs after compaction on the orchestrator (it must see the shrunk transcript).
     mws = captured["middleware"]

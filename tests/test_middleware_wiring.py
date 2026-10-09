@@ -162,3 +162,11 @@ def test_execute_guard_ignores_other_tools_and_non_text_results():
         return blocks
     same = asyncio.run(ExecuteResultGuardMiddleware().awrap_tool_call(_req("execute", {}, {}), handler))
     assert same is blocks                                          # block content: left alone
+
+
+def test_worker_refusal_points_at_execute_not_task():
+    # The extract worker has no `task` tool: telling it to delegate sent it in circles.
+    from deep_research_agent.tool_filter import EXECUTE_HINT, EXTRACT_EXCLUDED_TOOLS
+    mw = ExcludeToolsMiddleware(EXTRACT_EXCLUDED_TOOLS, hint=EXECUTE_HINT)
+    out = _run(mw, _req("read_file", {"file_path": "/workspace/data/x.json"}, {}))
+    assert "`execute`" in out.content and "`task`" not in out.content

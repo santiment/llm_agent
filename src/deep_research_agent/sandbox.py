@@ -82,6 +82,7 @@ class HttpSandboxBackend(BaseSandbox):
         import uuid
         self._id = "sbx-" + uuid.uuid4().hex[:12]
         self._session_id: str | None = None
+        self._closed = False  # the run ended: no new session may open (it would be orphaned)
         self._lock = threading.Lock()
 
     def _http(self, method: str, path: str, body: dict | None = None, *,
@@ -100,22 +101,30 @@ class HttpSandboxBackend(BaseSandbox):
             raise RuntimeError(f"sandbox unreachable at {self._base}: {exc.reason}") from exc
 
     def _ensure_session(self) -> str:
-        if self._session_id is None:
-            with self._lock:
-                if self._session_id is None:
-                    data = self._http("POST", "/sessions", {
-                        "network": self._network, "timeout_seconds": self._session_timeout})
-                    self._session_id = data["session_id"]
-                    log.info("sandbox session %s opened (%s)", self._session_id, self._base)
-                    self._seed(self._session_id)
-        return self._session_id
+        sid = self._session_id
+        if sid is not None:
+            return sid
+        with self._lock:
+            return self._session_id or self._open_locked()
+
+    def _open_locked(self) -> str:
+        """Open, seed, THEN publish a session (caller holds ``_lock``): a concurrent caller on
+        the lock-free fast path never sees an id whose helper modules are not uploaded yet."""
+        if self._closed:
+            raise RuntimeError("sandbox session closed — the run has ended")
+        data = self._http("POST", "/sessions", {
+            "network": self._network, "timeout_seconds": self._session_timeout})
+        sid = data["session_id"]
+        log.info("sandbox session %s opened (%s)", sid, self._base)
+        self._seed(sid)
+        self._session_id = sid
+        return sid
 
     def _seed(self, sid: str) -> None:
-        """Upload seed files into the just-created session. Failures are logged, not raised.
-        ``_session_id`` is already set, so ``upload_files`` does not reopen a session."""
+        """Upload seed files into the just-created session. Failures are logged, not raised."""
         if not self._seed_files:
             return
-        for r in self.upload_files(self._seed_files):
+        for r in self._upload(sid, self._seed_files):
             if r.error:
                 log.warning("sandbox seed %s failed: %s", r.path, r.error)
         log.info("sandbox session %s seeded with %d file(s): %s", sid, len(self._seed_files),
@@ -125,15 +134,21 @@ class HttpSandboxBackend(BaseSandbox):
     def id(self) -> str:
         return self._id
 
-    def _reset_session(self, why: str) -> str:
-        """Forget a dead session and open (and re-seed) a fresh one. Files are lost; the
-        caller tells the model so via ``_RESET_NOTE``."""
+    def _reset_session(self, dead: str, why: str) -> str:
+        """Forget the dead session ``dead`` and open (and re-seed) a fresh one. Files are
+        lost; the caller tells the model so via ``_RESET_NOTE``. Parallel sub-agents hit a
+        dead session together: only the first resets, the rest reuse its replacement
+        instead of discarding it (and whatever was already written there)."""
         with self._lock:
-            old, self._session_id = self._session_id, None
-        log.warning("sandbox session %s is gone (%s) — opening a fresh one; files written "
-                    "earlier in this run are lost", old, why[:200])
-        emit({"type": "status", "state": "sandbox_reset", "detail": why[:200]})
-        return self._ensure_session()
+            current = self._session_id
+            if current is not None and current != dead:
+                return current                     # another caller already replaced it
+            self._session_id = None
+            if current == dead:                    # announce a real loss exactly once
+                log.warning("sandbox session %s is gone (%s) — opening a fresh one; files "
+                            "written earlier in this run are lost", dead, why[:200])
+                emit({"type": "status", "state": "sandbox_reset", "detail": why[:200]})
+            return self._open_locked()
 
     def _exec_once(self, sid: str, command: str, secs: int) -> ExecuteResponse:
         data = self._http("POST", f"/sessions/{sid}/exec",
@@ -157,13 +172,15 @@ class HttpSandboxBackend(BaseSandbox):
                 raise
             why = str(exc)
         # Dead session: one fresh session, one retry, and the model is told what happened.
-        sid = self._reset_session(why)
+        sid = self._reset_session(sid, why)
         res = self._exec_once(sid, command, secs)
         return ExecuteResponse(output=_RESET_NOTE + res.output, exit_code=res.exit_code,
                                truncated=res.truncated)
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
-        sid = self._ensure_session()
+        return self._upload(self._ensure_session(), files)
+
+    def _upload(self, sid: str, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         out: list[FileUploadResponse] = []
         for path, content in files:
             try:
@@ -191,6 +208,7 @@ class HttpSandboxBackend(BaseSandbox):
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
             sid, self._session_id = self._session_id, None
         if sid is not None:
             try:

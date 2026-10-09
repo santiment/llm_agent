@@ -14,6 +14,7 @@ vars are deliberately not honored (legacy ones are ignored with a warning).
 from __future__ import annotations
 
 import ipaddress
+import socket
 import json
 import logging
 import os
@@ -52,6 +53,8 @@ def _read_prompt_file(path: str) -> str:
 
 # Cloud-metadata hostnames — never a legitimate outbound target.
 _BLOCKED_HOSTNAMES = {"metadata", "metadata.google.internal"}
+# Metadata services reachable by IP that the link-local check misses (AWS IMDS over IPv6).
+_BLOCKED_IPS = {ipaddress.ip_address("fd00:ec2::254")}
 # Dotted/decimal/hex numeric hosts that ipaddress rejects but the resolver accepts
 # (``127.1``, ``2130706433``, ``0x7f000001``, ``0177.0.0.1``).
 _NUMERIC_HOST = re.compile(r"(?:0x[0-9a-f]+|\d+)(?:\.(?:0x[0-9a-f]+|\d+))*")
@@ -66,7 +69,7 @@ _DEFAULT_STREAMING_DENYLIST = ["deepseek-v4-flash", "deepseek-v4.1-flash"]
 # Named model packages ("price tiers") — the ONLY place models are chosen; callers pick a
 # package by name (``model_tier`` / ``DRA_MODEL_TIER``), never a model. See README for what
 # each tier is for and which benchmark picked each slot. Inline $in/$out per 1M tokens,
-# verified against the OpenRouter model index 2026-09-10 (they drift);
+# verified against the OpenRouter model index 2026-09-10, new slugs 2026-10-09 (they drift);
 # tests/test_model_tiering.py parses them and fails if a fleet outprices its planner, if the
 # utility outprices the fleet, if a tier undercuts the one below it, if a tier's fleet is
 # cheaper than the planner of the tier below, or if a slug carries no price.
@@ -80,56 +83,61 @@ _DEFAULT_STREAMING_DENYLIST = ["deepseek-v4-flash", "deepseek-v4.1-flash"]
 # coding_model and compaction_model sit outside the fleet-price invariant: both get a SMALL or
 # rare input, so their per-token price barely shows in a run — pick them for quality.
 MODEL_TIERS: dict[str, dict[str, str]] = {
-    # Rock bottom: one model family end to end, so delegation pays off only via context
-    # isolation. Every slot is a _DEFAULT_STREAMING_DENYLIST match (`deepseek-v4-flash` covers
-    # the -0731 build, `deepseek-v4.1-flash` the coder), so nothing here streams. 0731 is the
-    # current V4 Flash build: the bare `deepseek/deepseek-v4-flash` slug is the older 0423 one
-    # — pricier in, 1.0M ctx vs 1.31M — so no slot should use it. The coder is `low`'s
-    # planner (V4.1 Flash); its input is tiny, so the 4x price barely registers.
+    # Rock bottom: one model end to end, so delegation pays off only via context isolation.
+    # gpt-6-luna (2026-09-22) replaced deepseek-v4-flash-0731 here on 2026-10-09: 0731 kept
+    # failing at tool calls (truncated JSON args, plans narrated instead of called, calls
+    # typed as text, `ls` loops of 100+ steps) — a few cents a run buys runs that finish.
+    # Luna's Intelligence Index matches gpt-5.6-luna's (38.1 vs 37.3) at under half its
+    # price. The coder is claude-haiku-5.5, as in every tier (see `low`).
     "extra-low": {
-        "research_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
-        "subagent_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
-        "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
-        "compaction_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
-        "coding_model": "deepseek/deepseek-v4.1-flash",  # $0.30 / $1.20
+        "research_model": "openai/gpt-6-luna",  # $0.10 / $0.50
+        "subagent_model": "openai/gpt-6-luna",  # $0.10 / $0.50
+        "utility_model": "openai/gpt-6-luna",  # $0.10 / $0.50
+        "compaction_model": "openai/gpt-6-luna",  # $0.10 / $0.50
+        "coding_model": "anthropic/claude-haiku-5.5",  # $0.10 / $0.50
     },
     # deepseek-v4.1-flash (GA 2026-09-10): τ² airline 76.7% (#16), above 0731 (73.2%) and
     # everything near its price; 1.0M ctx, 0.02x cache read, 9 endpoints on 09-11 (4 on
     # launch day, when a 429 from all of them killed a run). Per-provider speed spans 12 to
     # 127 tok/s — routing, not the model, sets it (provider_min_throughput). Unpinned slug.
+    # The coder, in every tier, is claude-haiku-5.5 (2026-10-07): Terminal-Bench 4.0 ~33%
+    # (Artificial Analysis) against Luna's 12.6%, V4.1 Flash's 27% and Gemini 3.8 Flash's
+    # 19.7%, at the price floor; DeepSeek's own evals put V4 Pro below V4.1 Flash, at under
+    # half Haiku's speed. It writes ~3x the output tokens, which a coder's small input
+    # absorbs; claude-sonnet-5.5 codes better still but costs ~20x per output token.
     "low": {
         "research_model": "deepseek/deepseek-v4.1-flash",  # $0.30 / $1.20
-        "subagent_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
-        "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
-        "compaction_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
-        "coding_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
+        "subagent_model": "openai/gpt-6-luna",  # $0.10 / $0.50
+        "utility_model": "openai/gpt-6-luna",  # $0.10 / $0.50
+        "compaction_model": "openai/gpt-6-luna",  # $0.10 / $0.50
+        "coding_model": "anthropic/claude-haiku-5.5",  # $0.10 / $0.50
     },
     # gemini-3.8-flash (2026-09-02, not on the benchmarks yet): newest Gemini Flash at the
     # same price as the 3.7 build it replaced, which held τ² #2 overall (80.6%) and GPQA #2
     # (94.3%). The fleet is `low`'s planner: each tier's fleet is the planner of the tier
     # below (asserted), so stepping up upgrades the gathering, not just the plan. Utility is
-    # the floor everywhere.
+    # gpt-6-luna, the floor: 0731 looped 115 steps (~23 min) in this slot on 2026-10-09.
     "mid": {
         "research_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
         "subagent_model": "deepseek/deepseek-v4.1-flash",  # $0.30 / $1.20
-        "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
-        "compaction_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
-        "coding_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
+        "utility_model": "openai/gpt-6-luna",  # $0.10 / $0.50
+        "compaction_model": "openai/gpt-6-luna",  # $0.10 / $0.50
+        "coding_model": "anthropic/claude-haiku-5.5",  # $0.10 / $0.50
     },
-    # gpt-5.6-sol over claude-sonnet-5: same price and τ², +8.7pp GPQA, half the latency.
-    # The fleet (3.8-flash; its 3.7 predecessor out-scored the planner on τ²) is a stronger
-    # tool-caller than the planner — intended: it makes the calls. Compaction on the fleet
-    # model rather than luna: the summary must keep every number and source for the planner
-    # and every sub-agent, and at a few compactions per run the price barely shows. Coder
-    # pinned to the GA `-0813` Pro build (first-party at $0.66/$1.98; the index lists a
-    # reseller's price): the bare `deepseek-v4-pro` slug is the 0423 build on degraded
-    # third-party hosts.
+    # gpt-6.1-sol (2026-09-29) over gpt-5.6-sol: same price, half the cache-read price, and
+    # ahead of gpt-6-sol on OpenAI's agentic and coding evals. claude-sonnet-5.5 scores higher
+    # on independent agentic runs (Intelligence Index 56 vs 52) but costs ~10x per task
+    # through its output volume, which a planner pays on every step. The fleet (3.8-flash;
+    # its 3.7 predecessor out-scored the planner on τ²) is a stronger tool-caller than the
+    # planner — intended: it makes the calls. Compaction on the fleet model rather than
+    # luna: the summary must keep every number and source for the planner and every
+    # sub-agent, and at a few compactions per run the price barely shows. Coder as in `low`.
     "high": {
-        "research_model": "openai/gpt-5.6-sol",  # $2.00 / $10.00
+        "research_model": "openai/gpt-6.1-sol",  # $2.00 / $10.00
         "subagent_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
-        "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
+        "utility_model": "openai/gpt-6-luna",  # $0.10 / $0.50
         "compaction_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
-        "coding_model": "deepseek/deepseek-v4-pro-0813",  # $1.05 / $3.15
+        "coding_model": "anthropic/claude-haiku-5.5",  # $0.10 / $0.50
     },
 }
 
@@ -141,12 +149,15 @@ DEFAULT_MODEL_TIER = "extra-low"
 # rejecting model is recorded as False, and an unlisted one is treated the same: it just runs
 # at the provider default. tests/test_model_tiering.py requires a flag for every tier slug.
 MODEL_REASONING: dict[str, bool] = {
+    "anthropic/claude-haiku-5.5": True,          # 2026-10-09
     "deepseek/deepseek-v4-flash-0731": True,
     "deepseek/deepseek-v4-pro-0813": True,
     "deepseek/deepseek-v4.1-flash": True,
     "google/gemini-3.8-flash": True,
     "openai/gpt-5.6-luna": True,
     "openai/gpt-5.6-sol": True,
+    "openai/gpt-6-luna": True,                   # 2026-10-09
+    "openai/gpt-6.1-sol": True,                  # 2026-10-09
 }
 
 # Default for ``reasoning_capable``; DRA_REASONING_CAPABLE replaces it.
@@ -158,12 +169,15 @@ _REASONING_CAPABLE = [slug for slug, accepts in MODEL_REASONING.items() if accep
 # no tier may name one (tests/test_model_tiering.py). Advisory at runtime (models.py warns),
 # hence no env override.
 MODEL_CACHING: dict[str, bool] = {
+    "anthropic/claude-haiku-5.5": True,          # 0.10x (2026-10-09)
     "deepseek/deepseek-v4-flash-0731": True,     # 0.25x
     "deepseek/deepseek-v4-pro-0813": True,       # 0.03x
     "deepseek/deepseek-v4.1-flash": True,        # 0.02x
     "google/gemini-3.8-flash": True,             # 0.10x
     "openai/gpt-5.6-luna": True,                 # 0.10x
     "openai/gpt-5.6-sol": True,                  # 0.10x
+    "openai/gpt-6-luna": True,                   # 0.10x (2026-10-09)
+    "openai/gpt-6.1-sol": True,                  # 0.05x (2026-10-09)
 }
 
 # Valid values for reasoning_effort ("" = provider default; "none" = disable thinking).
@@ -195,6 +209,17 @@ def _pick(c: dict, *keys: str, env: str = "", default: Any = None) -> Any:
             return v
     v = os.environ.get(env) if env else None
     return default if v in (None, "") else v
+
+
+def _pick_reasoning_effort(c: dict, key: str, env: str, default: str) -> str:
+    """A reasoning-effort knob, resolved by ``_pick``; an unknown value keeps ``default``,
+    with a warning."""
+    effort = str(_pick(c, key, env=env, default=default)).strip().lower()
+    if effort not in _REASONING_EFFORTS:
+        log.warning("unknown %s %r — using %r (allowed: %s)", key, effort, default,
+                    ", ".join(sorted(v or '""' for v in _REASONING_EFFORTS)))
+        return default
+    return effort
 
 
 _FLAG_ON = ("1", "true", "yes", "on")
@@ -249,7 +274,7 @@ def url_blocked(url: str, *, allow_private: bool) -> str | None:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return f"scheme {parsed.scheme!r} not allowed"
-    host = (parsed.hostname or "").lower()
+    host = (parsed.hostname or "").lower().rstrip(".")   # "metadata.google.internal." resolves too
     if not host:
         return "missing host"
     if host in _BLOCKED_HOSTNAMES:
@@ -259,9 +284,20 @@ def url_blocked(url: str, *, allow_private: bool) -> str | None:
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
-        if not allow_private and _NUMERIC_HOST.fullmatch(host):
+        if not _NUMERIC_HOST.fullmatch(host):
+            return None  # a DNS name — not an IP literal to vet
+        if not allow_private:
             return f"malformed numeric host {host!r} blocked"
-        return None  # a DNS name — not an IP literal to vet
+        # Private hosts are allowed, but the resolver reads "2852039166", "0xA9FEA9FE" or
+        # "169.254.43518" as 169.254.169.254: vet the address it will actually dial.
+        try:
+            ip = ipaddress.IPv4Address(socket.inet_aton(host))
+        except OSError:
+            return f"malformed numeric host {host!r} blocked"
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped                                # [::ffff:169.254.169.254]
+    if ip in _BLOCKED_IPS:
+        return f"blocked metadata address {host}"
     if ip.is_link_local:
         return f"link-local address {host} blocked"
     if not allow_private and (
@@ -275,9 +311,24 @@ def url_blocked(url: str, *, allow_private: bool) -> str | None:
     return None
 
 
-def _mcp_url_blocked(url: str) -> str | None:
-    """The MCP-config policy: private/loopback allowed (see ``url_blocked``)."""
-    return url_blocked(url, allow_private=True)
+def _resolve_sandbox(c: dict) -> tuple[str, str]:
+    """``(sandbox_url, sandbox_token)``. The deployment's ``LLM_SANDBOX_TOKEN`` is bound
+    to ITS ``LLM_SANDBOX_URL``: a caller that points ``sandbox_url`` elsewhere must bring
+    its own ``sandbox_token`` — otherwise our bearer (and every offloaded tool result)
+    would go to the caller's host. Same key-exfiltration guard as ``base_url``."""
+    env_url = _env("LLM_SANDBOX_URL").rstrip("/")
+    url = str(_pick(c, "sandbox_url", env="LLM_SANDBOX_URL", default="")).rstrip("/")
+    token = str(_pick(c, "sandbox_token", default=""))
+    if not url or url == env_url:
+        return url, token or _env("LLM_SANDBOX_TOKEN")
+    blocked = url_blocked(url, allow_private=True)
+    if blocked:
+        log.warning("refusing sandbox_url %s: %s — sandbox disabled for this run", url, blocked)
+        return "", ""
+    if not token and _env("LLM_SANDBOX_TOKEN"):
+        log.warning("sandbox_url %s overrides LLM_SANDBOX_URL without its own sandbox_token; "
+                    "the deployment's token is not sent to it", url)
+    return url, token
 
 
 def _slug_from_url(url: str) -> str:
@@ -351,18 +402,20 @@ class ResearchConfig:
     # disables thinking where supported. Unsupported models ignore the parameter.
     # DRA_REASONING_EFFORT.
     reasoning_effort: str = "low"
+    # The same for the extract-subagent alone, which reads a file and pulls fields out: no
+    # plan to think through, and reasoning was ~3/4 of its output tokens per step. Same
+    # values; DRA_EXTRACT_REASONING_EFFORT.
+    extract_reasoning_effort: str = "none"
     # OpenRouter provider routing, sent under `provider` (models.py; the live per-model parts
     # come from provider_routing.py). Soft: preferred_* thresholds (p50 tokens/s; p50 seconds
     # to first token) push slow endpoints to the back, none excluded; 0 = off. Hard:
-    # provider_sort (price | throughput | latency) turns balancing off; max_price_factor caps
-    # every endpoint at factor x the cheapest HEALTHY one (status ok, uptime_last_30m >=
-    # min_uptime %) — pricier ones are refused even when the cheap one is slow; 0 = off.
-    # Providers with no healthy endpoint go on `ignore`. Feed cached routing_ttl seconds.
-    # DRA_PROVIDER_{MIN_THROUGHPUT,MAX_LATENCY,SORT,MAX_PRICE_FACTOR,MIN_UPTIME,ROUTING_TTL}.
+    # provider_sort (price | throughput | latency) turns balancing off; providers with no
+    # HEALTHY endpoint (status ok, uptime_last_30m >= min_uptime %) go on `ignore`. No price
+    # cap (see provider_routing.py). Feed cached routing_ttl seconds.
+    # DRA_PROVIDER_{MIN_THROUGHPUT,MAX_LATENCY,SORT,MIN_UPTIME,ROUTING_TTL}.
     provider_min_throughput: float = 50.0
     provider_max_latency: float = 0.0
     provider_sort: str = ""
-    provider_max_price_factor: float = 1.25
     provider_min_uptime: float = 97.0
     provider_routing_ttl: float = 300.0
     # Models the `reasoning` parameter may be sent to (the True flags of MODEL_REASONING);
@@ -449,26 +502,30 @@ class ResearchConfig:
     # scan (e.g. a large cross-entity sweep) doesn't grow the token footprint per call, so the
     # call ceiling can be generous. Without a sandbox these still backstop runaway runs.
     max_tool_calls: int = 200
-    max_total_tokens: int = 4_000_000
+    # Tokens here are BUDGET tokens: cached prompt input counts at turn.CACHED_INPUT_WEIGHT,
+    # since every step re-sends the whole context and the cached prefix is billed at ~0.1x.
+    max_total_tokens: int = 10_000_000
     # Wall-clock ceiling per run (seconds). Calls and tokens do not bound TIME: a fleet of
     # slow sub-agents retrying against a dead sandbox ran 90 minutes under both ceilings.
     # Same two stages (wrap-up nudge at 75%, hard stop at 100%). 0 = no cap.
     # DRA_MAX_RUN_SECONDS.
     max_run_seconds: int = 2_700
     # In-flight context compaction (compaction.py): an estimated context above this many
-    # tokens summarizes older messages on compaction_model. Absolute, since an OpenRouter slug
-    # does not expose its window; 0 disables. DRA_COMPACTION_TOKENS.
-    # 800k = ~80% of the smallest window any tier slot has (every slot model is 1M+ on
-    # OpenRouter's feed, 2026-09-11; re-check when a tier changes). The 200k headroom covers
-    # one step's growth between checks, the response, and the chars/4 estimate's error.
-    # Compacting far below the window (the old 100k) bought nothing: with prompt caching a
-    # re-sent context is billed at the cache-read rate, while each compaction is a
-    # full-price summarizer call that loses detail and, with a fat tail, re-fired every
-    # couple of steps. NOTE max_total_tokens: the budget sums every call's total tokens,
-    # cached or not, so a context near this trigger spends 4M in ~5 steps.
-    compaction_tokens: int = 800_000
+    # tokens summarizes older messages on compaction_model; 0 disables. Absolute per ROLE,
+    # since an OpenRouter slug does not expose its window (the window rule below caps both).
+    # Each compaction is a full-price summarizer call that loses detail and, with a fat
+    # tail, re-fired every couple of steps at the old 100k — so compact rarely, but not so
+    # late that every step re-sends a huge context (latency, and a budget that counts it).
+    # - Sub-agents (research / extract / coding): 600k. Their context IS the data they
+    #   work through; summarizing it early loses the figures the findings are made of.
+    #   DRA_COMPACTION_TOKENS.
+    compaction_tokens: int = 600_000
+    # - Orchestrator: 200k. It holds plans and findings, never raw data, so a context past
+    #   this is mostly spent history — and the expensive model re-reads it on every step.
+    #   DRA_ORCHESTRATOR_COMPACTION_TOKENS.
+    orchestrator_compaction_tokens: int = 200_000
     # ... and never above this fraction of the ROLE model's context window, read per model
-    # from OpenRouter's endpoint feed at graph build (no feed: the absolute alone). So a
+    # from OpenRouter's endpoint feed at graph build (no feed: 170k, conservatively). So a
     # 256k-window model in a tier compacts at ~205k without anyone editing a number. 0 turns
     # the window rule off. DRA_COMPACTION_WINDOW_FRACTION.
     compaction_window_fraction: float = 0.8
@@ -506,6 +563,13 @@ class ResearchConfig:
     def is_openrouter(self) -> bool:
         """OpenRouter-only behaviors (cost reporting, cache_control) key off this."""
         return "openrouter" in self.base_url.lower()
+
+    def reasoning_effort_for(self, role: str) -> str:
+        """The effort a model built for ``role`` runs at: the extract-subagent's own, else
+        the shared ``reasoning_effort``."""
+        if role == "extract-subagent":
+            return self.extract_reasoning_effort
+        return self.reasoning_effort
 
     def supports_reasoning(self, model_id: str) -> bool:
         """Exact-slug membership in ``reasoning_capable`` — a prefix match would pass a
@@ -599,6 +663,9 @@ class ResearchConfig:
         # `mcp_config`, `DRA_MCP_SERVERS` (JSON list of {label,url,...}), or a single
         # `DRA_MCP_URL` (+ `DRA_MCP_LABEL`). Each entry may carry a friendly `label`.
         mcp_servers = c.get("mcp_servers") or []
+        # The deployment's DRA_MCP_BEARER goes ONLY to servers the deployment configured:
+        # attached to a caller-supplied URL it would hand our credential to that host.
+        mcp_from_env = False
         if not mcp_servers and c.get("mcp_config"):
             mc = c["mcp_config"]
             # Compat contract: url is a BASE and the client appends "/mcp"
@@ -615,38 +682,62 @@ class ResearchConfig:
                 }
             ]
         if not mcp_servers and _env("DRA_MCP_SERVERS"):
+            mcp_from_env = True
             try:
                 parsed = json.loads(_env("DRA_MCP_SERVERS"))
                 mcp_servers = parsed if isinstance(parsed, list) else []
             except (ValueError, TypeError):
                 mcp_servers = []
         if not mcp_servers and _env("DRA_MCP_URL"):
+            mcp_from_env = True
             mcp_servers = [{"url": _env("DRA_MCP_URL"), "label": _env("DRA_MCP_LABEL")}]
 
         # Normalize URLs, drop SSRF-unsafe targets, derive a connection key + friendly
         # label, attach bearer auth.
-        bearer = _env("DRA_MCP_BEARER")
+        bearer = _env("DRA_MCP_BEARER") if mcp_from_env else ""
         safe_servers: list[dict] = []
         for s in mcp_servers:
             if s.get("url"):
                 s["url"] = _normalize_mcp_url(s["url"])
             blocked = (
-                _mcp_url_blocked(s.get("url", "")) if s.get("url") else "missing url"
+                # operator MCP URLs may be private/loopback (see url_blocked)
+                url_blocked(s["url"], allow_private=True) if s.get("url") else "missing url"
             )
             if blocked:
                 log.warning(
                     "refusing MCP server %s: %s", s.get("url") or "(none)", blocked
                 )
                 continue
+            if any(s["url"] == kept["url"] for kept in safe_servers):
+                # Listed twice: loading it again would hand the model every tool twice.
+                log.warning("MCP server %s listed twice — loading it once", s["url"])
+                continue
+            safe_servers.append(s)
+
+        # The name is the connection key, so it must be unique: two bare hosts both
+        # normalize to ".../mcp", and a duplicate key silently drops the first server.
+        # Explicit names are reserved first, so a derived name never takes one.
+        taken: set[str] = set()
+
+        def unique(name: str) -> str:
+            base, n = name, 2
+            while name in taken:
+                name, n = f"{base}_{n}", n + 1
+            taken.add(name)
+            return name
+
+        for s in safe_servers:
+            if s.get("name"):
+                s["name"] = unique(s["name"])
+        for s in safe_servers:
             if not s.get("name"):
-                s["name"] = _slug_from_url(s.get("url", "")) or "mcp"
+                s["name"] = unique(_slug_from_url(s.get("url", "")) or "mcp")
             if not (s.get("label") or "").strip():
                 # No explicit label → derive a readable one from the slug name
                 # ("data_provider" -> "Data Provider"), never the generic placeholder.
                 s["label"] = s["name"].replace("_", " ").replace("-", " ").title()
             if bearer and not (s.get("headers") or {}).get("Authorization"):
                 s.setdefault("headers", {})["Authorization"] = f"Bearer {bearer}"
-            safe_servers.append(s)
         mcp_servers = safe_servers
 
         # Every remaining field resolves through _pick / _flag: configurable key(s) ->
@@ -671,26 +762,11 @@ class ResearchConfig:
         if isinstance(capable, str):
             capable = capable.split(",")
 
-        reasoning_effort = (
-            str(
-                _pick(
-                    c,
-                    "reasoning_effort",
-                    env="DRA_REASONING_EFFORT",
-                    default=cls.reasoning_effort,
-                )
-            )
-            .strip()
-            .lower()
-        )
-        if reasoning_effort not in _REASONING_EFFORTS:
-            log.warning(
-                "unknown reasoning_effort %r — using %r (allowed: %s)",
-                reasoning_effort,
-                cls.reasoning_effort,
-                ", ".join(sorted(v or '""' for v in _REASONING_EFFORTS)),
-            )
-            reasoning_effort = cls.reasoning_effort
+        reasoning_effort = _pick_reasoning_effort(
+            c, "reasoning_effort", "DRA_REASONING_EFFORT", cls.reasoning_effort)
+        extract_reasoning_effort = _pick_reasoning_effort(
+            c, "extract_reasoning_effort", "DRA_EXTRACT_REASONING_EFFORT",
+            cls.extract_reasoning_effort)
 
         provider_sort = str(_pick(
             c, "provider_sort", env="DRA_PROVIDER_SORT", default=cls.provider_sort,
@@ -701,14 +777,8 @@ class ResearchConfig:
                 provider_sort, ", ".join(sorted(v or '""' for v in _PROVIDER_SORTS)),
             )
             provider_sort = cls.provider_sort
-        # 0 = off; anything else is a multiplier of the cheapest price, so never below 1.
-        provider_max_price_factor = float(_pick(
-            c, "provider_max_price_factor", env="DRA_PROVIDER_MAX_PRICE_FACTOR",
-            default=cls.provider_max_price_factor))
-        if provider_max_price_factor > 0:
-            provider_max_price_factor = max(1.0, provider_max_price_factor)
-        else:
-            provider_max_price_factor = 0.0
+
+        sandbox_url, sandbox_token = _resolve_sandbox(c)
 
         return cls(
             openai_api_key=openai_key,
@@ -726,6 +796,7 @@ class ResearchConfig:
                 c, "max_output_tokens", env="DRA_MAX_OUTPUT_TOKENS",
                 default=cls.max_output_tokens))),
             reasoning_effort=reasoning_effort,
+            extract_reasoning_effort=extract_reasoning_effort,
             reasoning_capable=[s.strip().lower() for s in capable if str(s).strip()],
             provider_min_throughput=max(0.0, float(_pick(
                 c, "provider_min_throughput", env="DRA_PROVIDER_MIN_THROUGHPUT",
@@ -734,7 +805,6 @@ class ResearchConfig:
                 c, "provider_max_latency", env="DRA_PROVIDER_MAX_LATENCY",
                 default=cls.provider_max_latency))),
             provider_sort=provider_sort,
-            provider_max_price_factor=provider_max_price_factor,
             provider_min_uptime=min(100.0, max(0.0, float(_pick(
                 c, "provider_min_uptime", env="DRA_PROVIDER_MIN_UPTIME",
                 default=cls.provider_min_uptime)))),
@@ -836,6 +906,9 @@ class ResearchConfig:
                     default=cls.compaction_tokens,
                 )
             ),
+            orchestrator_compaction_tokens=int(_pick(
+                c, "orchestrator_compaction_tokens", env="DRA_ORCHESTRATOR_COMPACTION_TOKENS",
+                default=cls.orchestrator_compaction_tokens)),
             compaction_window_fraction=min(1.0, max(0.0, float(_pick(
                 c, "compaction_window_fraction", env="DRA_COMPACTION_WINDOW_FRACTION",
                 default=cls.compaction_window_fraction)))),
@@ -871,12 +944,8 @@ class ResearchConfig:
             offload_dir=_pick(
                 c, "offload_dir", env="DRA_OFFLOAD_DIR", default=cls.offload_dir
             ),
-            sandbox_url=str(
-                _pick(c, "sandbox_url", env="LLM_SANDBOX_URL", default=cls.sandbox_url)
-            ).rstrip("/"),
-            sandbox_token=_pick(
-                c, "sandbox_token", env="LLM_SANDBOX_TOKEN", default=cls.sandbox_token
-            ),
+            sandbox_url=sandbox_url,
+            sandbox_token=sandbox_token,
             sandbox_network=_flag(
                 c,
                 "sandbox_network",

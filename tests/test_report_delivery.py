@@ -25,6 +25,7 @@ from deep_research_agent.citations import ResearchOutputMiddleware
 from deep_research_agent.completion import ForceCompletionMiddleware
 from deep_research_agent.turn import (
     NUDGE_NAME,
+    REPORT_DELIVERED,
     RESUBMIT_NUDGE_NAME,
     current_turn,
     is_json_object_dump,
@@ -165,7 +166,7 @@ def test_end_status_carries_run_time_in_success_and_error(capture_events) -> Non
     rep = "# R\n\nText[1].\n\n## Sources\n- [1] https://x.example/a\n"
     call = {"name": "submit_report", "args": {"report_markdown": rep}, "id": "t1"}
     mw.after_agent(make_state(HumanMessage("q"), AIMessage("", tool_calls=[call]),
-                          ToolMessage("ok", tool_call_id="t1")), None)
+                          ToolMessage(REPORT_DELIVERED + " You are DONE.", tool_call_id="t1")), None)
     # no meter wired (offline use): still a valid end status, just without a run time
     ResearchOutputMiddleware(max_tool_calls=80, max_total_tokens=1_000_000).after_agent(
         make_state(*_WORK, AIMessage("Now I will compare the metrics.")), None)
@@ -179,3 +180,24 @@ def test_end_status_carries_run_time_in_success_and_error(capture_events) -> Non
         assert e["detail"].endswith(f"Run time {e['elapsed']}.")
     assert ends[2]["elapsed_s"] is None and ends[2]["elapsed"] == "n/a"
     assert "Run time" not in ends[2]["detail"]
+
+
+def test_a_bounced_submit_report_is_not_a_delivered_report(capture_events) -> None:
+    """The quality gate refused the call, so the tool never ran. A model that then ends the
+    turn in prose must not be recorded as report_delivered with nothing shown: its prose is
+    salvaged and actually delivered, and completion still nudges a resubmit."""
+    from deep_research_agent.completion import ForceCompletionMiddleware
+    from deep_research_agent.report_gate import _REVISE
+
+    rep = "# Bitcoin, last 30 days\n\n" + "Price fell 8.4% over the window [1]. " * 30 + \
+          "\n\n## Sources\n- [1] https://x.example/a\n"
+    call = {"name": "submit_report", "args": {"report_markdown": rep}, "id": "t1"}
+    bounced = [*_WORK, AIMessage("", tool_calls=[call]),
+               ToolMessage(_REVISE.format(problems="- [1] uncited"), tool_call_id="t1"),
+               AIMessage(rep)]
+    assert ForceCompletionMiddleware().after_model(make_state(*bounced), None) is not None
+    ResearchOutputMiddleware(max_tool_calls=80, max_total_tokens=1_000_000).after_agent(
+        make_state(*bounced), None)
+    ends = [e for e in capture_events if e["type"] == "status" and e["state"] in ("done", "error")]
+    assert [(e["state"], e["reason"]) for e in ends] == [("done", "report_salvaged")]
+    assert [e["type"] for e in capture_events if e["type"] == "report"] == ["report"]
