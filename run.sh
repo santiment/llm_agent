@@ -6,6 +6,8 @@
 #                            (long prompt? use a file: ./run.sh ask @prompt.txt)
 #   ./run.sh smoke           ask a canned question against a RUNNING server
 #   ./run.sh doctor          check config/deps/reachability without starting anything
+#   ./run.sh tiers           each tier's models, endpoints and routing (free; public feed)
+#   ./run.sh tiers --measure 3  also time 3 calls per model: provider, first token, tok/s
 #   ./run.sh test            run the offline pytest suite (no API keys / network)
 #   ./run.sh --sync          force `uv sync --extra dev`, then start the server
 #
@@ -79,6 +81,11 @@ case "${1:-up}" in
       echo "✗ sandbox      ${LLM_SANDBOX_URL} unreachable — every execute call will fail"
       echo "                start it, or use ./run-stack.sh which starts both"
     fi
+    ;;
+  tiers)
+    need_uv
+    shift
+    exec uv run python -m deep_research_agent.tier_report "$@"
     ;;
   test)
     need_uv

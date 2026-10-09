@@ -31,6 +31,22 @@ def provider_preferences(cfg: ResearchConfig) -> dict:
     return out
 
 
+def reasoning_param(cfg: ResearchConfig, model_id: str, role: str = "") -> dict | None:
+    """OpenRouter's unified ``reasoning`` object for ``model_id`` built for ``role``, or None
+    to send none. Only for models flagged capable: a model that rejects it 400s on every
+    provider with no retry and the run dies, while omitting it merely leaves the provider
+    default. The effort is per role (``config.reasoning_effort_for``): extraction runs
+    without thinking."""
+    effort = cfg.reasoning_effort_for(role)
+    if effort and not cfg.supports_reasoning(model_id):
+        log.info("reasoning (%s) not sent to %r: not in reasoning_capable — see "
+                 "config.MODEL_REASONING / DRA_REASONING_CAPABLE", effort, model_id)
+        return None
+    if effort == "none":
+        return {"enabled": False}
+    return {"effort": effort} if effort else None
+
+
 def build_chat_model(model_id: str, cfg: ResearchConfig,
                      provider: dict | None = None, role: str = "") -> ChatOpenAI:
     # Some OpenRouter models (e.g. deepseek-v4-flash) emit off-spec streaming chunks that
@@ -47,19 +63,10 @@ def build_chat_model(model_id: str, cfg: ResearchConfig,
         log.warning("%r has no prompt-cache pricing — re-sent context is billed in full; "
                     "see config.MODEL_CACHING", model_id)
 
-    # OpenRouter's unified `reasoning` param (extra_body), only for models flagged capable:
-    # a model that rejects it 400s on every provider with no retry and the run dies, while
-    # omitting it merely leaves the provider default.
-    # The effort is per role (config.reasoning_effort_for): extraction runs without thinking.
     extra_body: dict = {}
-    effort = cfg.reasoning_effort_for(role)
-    if effort and not cfg.supports_reasoning(model_id):
-        log.info("reasoning (%s) not sent to %r: not in reasoning_capable — see "
-                 "config.MODEL_REASONING / DRA_REASONING_CAPABLE", effort, model_id)
-    elif effort == "none":
-        extra_body["reasoning"] = {"enabled": False}
-    elif effort:
-        extra_body["reasoning"] = {"effort": effort}
+    reasoning = reasoning_param(cfg, model_id, role)
+    if reasoning is not None:
+        extra_body["reasoning"] = reasoning
     # OpenRouter puts the charged cost into usage (response_metadata["token_usage"]["cost"],
     # read by metering.sum_usage). Non-streamed calls only — see the stream_usage note below.
     if not streaming and cfg.is_openrouter:

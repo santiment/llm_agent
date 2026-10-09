@@ -88,22 +88,23 @@ MODEL_TIERS: dict[str, dict[str, str]] = {
     # failing at tool calls (truncated JSON args, plans narrated instead of called, calls
     # typed as text, `ls` loops of 100+ steps) — a few cents a run buys runs that finish.
     # Luna's Intelligence Index matches gpt-5.6-luna's (38.1 vs 37.3) at under half its
-    # price. The coder is `low`'s planner (V4.1 Flash); its input is tiny, so the 3x price
-    # barely registers.
+    # price. The coder is claude-haiku-5.5, as in every tier (see `low`).
     "extra-low": {
         "research_model": "openai/gpt-6-luna",  # $0.10 / $0.50
         "subagent_model": "openai/gpt-6-luna",  # $0.10 / $0.50
         "utility_model": "openai/gpt-6-luna",  # $0.10 / $0.50
         "compaction_model": "openai/gpt-6-luna",  # $0.10 / $0.50
-        "coding_model": "deepseek/deepseek-v4.1-flash",  # $0.30 / $1.20
+        "coding_model": "anthropic/claude-haiku-5.5",  # $0.10 / $0.50
     },
     # deepseek-v4.1-flash (GA 2026-09-10): τ² airline 76.7% (#16), above 0731 (73.2%) and
     # everything near its price; 1.0M ctx, 0.02x cache read, 9 endpoints on 09-11 (4 on
     # launch day, when a 429 from all of them killed a run). Per-provider speed spans 12 to
     # 127 tok/s — routing, not the model, sets it (provider_min_throughput). Unpinned slug.
-    # The coder is claude-haiku-5.5 (2026-10-07): Terminal-Bench 32.8% against Luna's 12.6%
-    # (Artificial Analysis) at the same price; it writes ~3x the output tokens, which a
-    # coder's small input absorbs.
+    # The coder, in every tier, is claude-haiku-5.5 (2026-10-07): Terminal-Bench 4.0 ~33%
+    # (Artificial Analysis) against Luna's 12.6%, V4.1 Flash's 27% and Gemini 3.8 Flash's
+    # 19.7%, at the price floor; DeepSeek's own evals put V4 Pro below V4.1 Flash, at under
+    # half Haiku's speed. It writes ~3x the output tokens, which a coder's small input
+    # absorbs; claude-sonnet-5.5 codes better still but costs ~20x per output token.
     "low": {
         "research_model": "deepseek/deepseek-v4.1-flash",  # $0.30 / $1.20
         "subagent_model": "openai/gpt-6-luna",  # $0.10 / $0.50
@@ -121,7 +122,7 @@ MODEL_TIERS: dict[str, dict[str, str]] = {
         "subagent_model": "deepseek/deepseek-v4.1-flash",  # $0.30 / $1.20
         "utility_model": "openai/gpt-6-luna",  # $0.10 / $0.50
         "compaction_model": "openai/gpt-6-luna",  # $0.10 / $0.50
-        "coding_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
+        "coding_model": "anthropic/claude-haiku-5.5",  # $0.10 / $0.50
     },
     # gpt-6.1-sol (2026-09-29) over gpt-5.6-sol: same price, half the cache-read price, and
     # ahead of gpt-6-sol on OpenAI's agentic and coding evals. claude-sonnet-5.5 scores higher
@@ -130,15 +131,13 @@ MODEL_TIERS: dict[str, dict[str, str]] = {
     # its 3.7 predecessor out-scored the planner on τ²) is a stronger tool-caller than the
     # planner — intended: it makes the calls. Compaction on the fleet model rather than
     # luna: the summary must keep every number and source for the planner and every
-    # sub-agent, and at a few compactions per run the price barely shows. Coder pinned to
-    # the GA `-0813` Pro build (first-party at $0.66/$1.98; the index lists a reseller's
-    # price): the bare `deepseek-v4-pro` slug is the 0423 build on degraded third-party hosts.
+    # sub-agent, and at a few compactions per run the price barely shows. Coder as in `low`.
     "high": {
         "research_model": "openai/gpt-6.1-sol",  # $2.00 / $10.00
         "subagent_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
         "utility_model": "openai/gpt-6-luna",  # $0.10 / $0.50
         "compaction_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
-        "coding_model": "deepseek/deepseek-v4-pro-0813",  # $1.05 / $3.15
+        "coding_model": "anthropic/claude-haiku-5.5",  # $0.10 / $0.50
     },
 }
 
