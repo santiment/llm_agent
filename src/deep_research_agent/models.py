@@ -50,14 +50,16 @@ def build_chat_model(model_id: str, cfg: ResearchConfig,
     # OpenRouter's unified `reasoning` param (extra_body), only for models flagged capable:
     # a model that rejects it 400s on every provider with no retry and the run dies, while
     # omitting it merely leaves the provider default.
+    # The effort is per role (config.reasoning_effort_for): extraction runs without thinking.
     extra_body: dict = {}
-    if cfg.reasoning_effort and not cfg.supports_reasoning(model_id):
+    effort = cfg.reasoning_effort_for(role)
+    if effort and not cfg.supports_reasoning(model_id):
         log.info("reasoning (%s) not sent to %r: not in reasoning_capable — see "
-                 "config.MODEL_REASONING / DRA_REASONING_CAPABLE", cfg.reasoning_effort, model_id)
-    elif cfg.reasoning_effort == "none":
+                 "config.MODEL_REASONING / DRA_REASONING_CAPABLE", effort, model_id)
+    elif effort == "none":
         extra_body["reasoning"] = {"enabled": False}
-    elif cfg.reasoning_effort:
-        extra_body["reasoning"] = {"effort": cfg.reasoning_effort}
+    elif effort:
+        extra_body["reasoning"] = {"effort": effort}
     # OpenRouter puts the charged cost into usage (response_metadata["token_usage"]["cost"],
     # read by metering.sum_usage). Non-streamed calls only — see the stream_usage note below.
     if not streaming and cfg.is_openrouter:
@@ -69,7 +71,7 @@ def build_chat_model(model_id: str, cfg: ResearchConfig,
         extra_body["max_tokens"] = cfg.max_output_tokens
     # Provider routing: without it the price-weighted default lands the fleet on a model's
     # slowest providers. `provider` is the per-model object from provider_routing.resolve
-    # (price cap, ignore list); None = the static soft preferences only.
+    # (ignore list); None = the static soft preferences only.
     if cfg.is_openrouter:
         if provider is None:
             provider = provider_preferences(cfg)

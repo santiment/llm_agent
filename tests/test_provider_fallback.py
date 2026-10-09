@@ -7,13 +7,14 @@ endpoints found that satisfy the max price for this request' … 'routing_funnel
 'endpoint_count': 2}], 'failed_routing_step': 'Filter by Max Price'``: the price cap
 (``provider_routing.py``, 1.25x the public feed's cheapest healthy endpoint) was anchored on
 an endpoint the account's own tier filter had already removed, so the two endpoints left
-were both over the cap and OpenRouter refused the call outright. Pins (``model_errors.py``
+were both over the cap and OpenRouter refused the call outright. The cap is gone since, but
+the ignore list is just as hard, so the same 404 can still happen. Pins (``model_errors.py``
 + ``provider_routing.py``):
 
   - routing_rejection() recognises that 404 (body or message form) and names the step;
     every other error is None;
-  - relax() / next_relax_level(): the ladder drops the cap, then the provider lists, then
-    the whole object, skipping levels that change nothing;
+  - relax() / next_relax_level(): the ladder drops the provider lists, then the whole
+    object, skipping levels that change nothing;
   - ProviderRoutingFallbackMiddleware retries at once with the relaxed object in a per-call
     ``extra_body`` override (the rest of the body kept, the model untouched), emits a
     ``provider_fallback`` status, remembers the level per model so the next role — and
@@ -42,7 +43,6 @@ from deep_research_agent.model_errors import (ModelBackoffMiddleware,
 
 SLUG = "deepseek/deepseek-v4-flash-0731"
 FULL = {"preferred_min_throughput": {"p50": 50.0},
-        "max_price": {"prompt": 0.0625, "completion": 0.2},
         "ignore": ["fireworks", "mancer", "venice"]}
 # Everything else build_chat_model puts in the body must survive a relaxed retry.
 EXTRAS = {"usage": {"include": True}, "max_tokens": 4096}
@@ -123,25 +123,22 @@ def test_other_errors_are_not_routing_rejections() -> None:
 
 # --- the ladder ----------------------------------------------------------------------------
 
-def test_relax_ladder_drops_cap_then_lists_then_everything() -> None:
+def test_relax_ladder_drops_lists_then_everything() -> None:
     assert pr.relax(FULL, 0) == FULL and pr.relax(FULL, 0) is not FULL
-    assert pr.relax(FULL, 1) == {"preferred_min_throughput": {"p50": 50.0},
-                                 "ignore": ["fireworks", "mancer", "venice"]}
-    assert pr.relax(FULL, 2) == {"preferred_min_throughput": {"p50": 50.0}}
-    assert pr.relax(FULL, pr.MAX_RELAX_LEVEL) == {} and pr.MAX_RELAX_LEVEL == 3
-    assert pr.relax({"order": ["a"], "only": ["a"], "sort": "price"}, 2) == {"sort": "price"}
+    assert pr.relax(FULL, 1) == {"preferred_min_throughput": {"p50": 50.0}}
+    assert pr.relax(FULL, pr.MAX_RELAX_LEVEL) == {} and pr.MAX_RELAX_LEVEL == 2
+    assert pr.relax({"order": ["a"], "only": ["a"], "sort": "price"}, 1) == {"sort": "price"}
     assert pr.relax(None, 1) == {}
 
 
 def test_next_relax_level_skips_levels_that_change_nothing() -> None:
     assert pr.next_relax_level(FULL, 0) == 1
     assert pr.next_relax_level(FULL, 1) == 2
-    assert pr.next_relax_level(FULL, 2) == 3
-    assert pr.next_relax_level(FULL, 3) is None
+    assert pr.next_relax_level(FULL, 2) is None
     soft_only = {"preferred_min_throughput": {"p50": 50.0}}
-    assert pr.next_relax_level(soft_only, 0) == 3     # no cap, no lists: straight to bare
-    assert pr.next_relax_level({"max_price": {"prompt": 1}}, 0) == 1
-    assert pr.next_relax_level({"max_price": {"prompt": 1}}, 1) is None  # level 1 already bare
+    assert pr.next_relax_level(soft_only, 0) == 2     # no lists: straight to bare
+    assert pr.next_relax_level({"ignore": ["a"]}, 0) == 1
+    assert pr.next_relax_level({"ignore": ["a"]}, 1) is None  # level 1 already bare
     assert pr.next_relax_level({}, 0) is None
 
 
@@ -159,26 +156,26 @@ def test_memo_is_per_slug_bounded_by_ttl_and_only_grows() -> None:
 
 # --- the middleware -------------------------------------------------------------------------
 
-def test_cap_refused_then_retried_without_it() -> None:
+def test_lists_refused_then_retried_without_them() -> None:
     mw = ProviderRoutingFallbackMiddleware("research-subagent", SLUG, ttl=300)
-    handler, sent = _refuse_while(lambda p: p and "max_price" in p)
+    handler, sent = _refuse_while(lambda p: p and "ignore" in p)
     with capture_events_cm() as events:
         assert _run(mw, _request(), handler) == "ok"
     assert len(sent) == 2
     assert sent[0]["provider"] == FULL
-    assert sent[1]["provider"] == pr.relax(FULL, 1)       # cap gone, ignore list and soft pref kept
+    assert sent[1]["provider"] == pr.relax(FULL, 1)       # ignore list gone, soft pref kept
     assert {k: v for k, v in sent[1].items() if k != "provider"} == EXTRAS  # rest of the body intact
     fb = [e for e in events if e.get("state") == "provider_fallback"]
     assert len(fb) == 1
     assert (fb[0]["role"], fb[0]["model"], fb[0]["step"], fb[0]["level"], fb[0]["dropped"]) == \
-        ("research-subagent", SLUG, "Filter by Max Price", 1, ["max_price"])
+        ("research-subagent", SLUG, "Filter by Max Price", 1, ["ignore"])
     assert "No endpoints found that satisfy the max price" in fb[0]["detail"]
     assert pr.relaxed_level(SLUG) == 1
 
 
 def test_the_model_instance_is_never_mutated() -> None:
     request = _request()
-    handler, _ = _refuse_while(lambda p: p and "max_price" in p)
+    handler, _ = _refuse_while(lambda p: p and "ignore" in p)
     _run(ProviderRoutingFallbackMiddleware("orchestrator", SLUG), request, handler)
     assert request.model.extra_body["provider"] == FULL
     assert request.model_settings == {}                    # override() copied; ours untouched
@@ -186,7 +183,7 @@ def test_the_model_instance_is_never_mutated() -> None:
 
 def test_remembered_level_starts_every_role_relaxed() -> None:
     pr.remember_relaxed(SLUG, 1, ttl=300)
-    handler, sent = _refuse_while(lambda p: p and "max_price" in p)
+    handler, sent = _refuse_while(lambda p: p and "ignore" in p)
     assert _run(ProviderRoutingFallbackMiddleware("extract-subagent", SLUG), _request(), handler) == "ok"
     assert len(sent) == 1 and sent[0]["provider"] == pr.relax(FULL, 1)  # no refused call at all
 
@@ -196,11 +193,11 @@ def test_ladder_climbs_to_bare_then_the_error_stands() -> None:
     handler, sent = _refuse_while(lambda p: True)          # nothing satisfies OpenRouter
     with capture_events_cm() as events, pytest.raises(OpenAIModelNotFoundError):
         _run(mw, _request(), handler)
-    assert [b.get("provider") for b in sent] == [FULL, pr.relax(FULL, 1), pr.relax(FULL, 2), None]
+    assert [b.get("provider") for b in sent] == [FULL, pr.relax(FULL, 1), None]
     assert "provider" not in sent[-1] and sent[-1] == EXTRAS  # bare: OpenRouter's own routing
-    assert [e["level"] for e in events if e.get("state") == "provider_fallback"] == [1, 2, 3]
+    assert [e["level"] for e in events if e.get("state") == "provider_fallback"] == [1, 2]
     # Relaxing fixed nothing, so nothing is remembered: an unfixable 404 ("no endpoints that
-    # support tool use") must not strip every role's price cap and lists for the TTL.
+    # support tool use") must not strip every role's provider lists for the TTL.
     assert pr.relaxed_level(SLUG) == 0
 
 
@@ -236,7 +233,7 @@ def test_sync_path_matches_async() -> None:
 
     def handler(request):
         sent.append(_sent(request))
-        if "max_price" in (sent[-1].get("provider") or {}):
+        if "ignore" in (sent[-1].get("provider") or {}):
             raise _routing_404()
         return "ok"
 
@@ -252,8 +249,7 @@ def _ep(provider, tag, prompt, completion, uptime=99.5, status=0):
 
 
 _ENV_KEYS = ("DRA_PROVIDER_MIN_THROUGHPUT", "DRA_PROVIDER_MAX_LATENCY", "DRA_PROVIDER_SORT",
-             "DRA_PROVIDER_MAX_PRICE_FACTOR", "DRA_PROVIDER_MIN_UPTIME",
-             "DRA_PROVIDER_ROUTING_TTL", "OPENAI_BASE_URL")
+             "DRA_PROVIDER_MIN_UPTIME", "DRA_PROVIDER_ROUTING_TTL", "OPENAI_BASE_URL")
 
 
 def test_resolve_starts_a_relaxed_model_at_its_level(monkeypatch) -> None:
@@ -266,10 +262,10 @@ def test_resolve_starts_a_relaxed_model_at_its_level(monkeypatch) -> None:
     monkeypatch.setattr(pr, "fetch_endpoints", fake_fetch)
     cfg = build_config(_ENV_KEYS, openai_api_key="k")
     full = asyncio.run(pr.resolve(cfg, [SLUG]))[SLUG]
-    assert full["max_price"] == {"prompt": 0.0625, "completion": 0.2} and full["ignore"] == ["fireworks"]
+    assert "max_price" not in full and full["ignore"] == ["fireworks"]
     pr.remember_relaxed(SLUG, 1, ttl=300)
     assert asyncio.run(pr.resolve(cfg, [SLUG]))[SLUG] == pr.relax(full, 1)
-    pr.remember_relaxed(SLUG, 3, ttl=300)
+    pr.remember_relaxed(SLUG, 2, ttl=300)
     assert asyncio.run(pr.resolve(cfg, [SLUG]))[SLUG] == {}
 
 
@@ -303,7 +299,7 @@ def test_wired_right_outside_the_backoff_on_every_role(monkeypatch) -> None:
 
 class _Direct:
     """A chat-model stand-in with an OpenRouter body: 404s while the provider it is asked to
-    send still carries `max_price`; records the body of every call."""
+    send still carries `ignore`; records the body of every call."""
 
     def __init__(self, extra_body=None, model_name=SLUG):
         self.extra_body = extra_body
@@ -313,7 +309,7 @@ class _Direct:
     def _answer(self, kwargs):
         body = kwargs.get("extra_body", self.extra_body)
         self.sent.append(body)
-        if body and "max_price" in (body.get("provider") or {}):
+        if body and "ignore" in (body.get("provider") or {}):
             raise _routing_404()
         return "ok"
 

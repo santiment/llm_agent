@@ -69,7 +69,7 @@ _DEFAULT_STREAMING_DENYLIST = ["deepseek-v4-flash", "deepseek-v4.1-flash"]
 # Named model packages ("price tiers") — the ONLY place models are chosen; callers pick a
 # package by name (``model_tier`` / ``DRA_MODEL_TIER``), never a model. See README for what
 # each tier is for and which benchmark picked each slot. Inline $in/$out per 1M tokens,
-# verified against the OpenRouter model index 2026-09-10 (they drift);
+# verified against the OpenRouter model index 2026-09-10, new slugs 2026-10-09 (they drift);
 # tests/test_model_tiering.py parses them and fails if a fleet outprices its planner, if the
 # utility outprices the fleet, if a tier undercuts the one below it, if a tier's fleet is
 # cheaper than the planner of the tier below, or if a slug carries no price.
@@ -83,54 +83,60 @@ _DEFAULT_STREAMING_DENYLIST = ["deepseek-v4-flash", "deepseek-v4.1-flash"]
 # coding_model and compaction_model sit outside the fleet-price invariant: both get a SMALL or
 # rare input, so their per-token price barely shows in a run — pick them for quality.
 MODEL_TIERS: dict[str, dict[str, str]] = {
-    # Rock bottom: one model family end to end, so delegation pays off only via context
-    # isolation. Every slot is a _DEFAULT_STREAMING_DENYLIST match (`deepseek-v4-flash` covers
-    # the -0731 build, `deepseek-v4.1-flash` the coder), so nothing here streams. 0731 is the
-    # current V4 Flash build: the bare `deepseek/deepseek-v4-flash` slug is the older 0423 one
-    # — pricier in, 1.0M ctx vs 1.31M — so no slot should use it. The coder is `low`'s
-    # planner (V4.1 Flash); its input is tiny, so the 4x price barely registers.
+    # Rock bottom: one model end to end, so delegation pays off only via context isolation.
+    # gpt-6-luna (2026-09-22) replaced deepseek-v4-flash-0731 here on 2026-10-09: 0731 kept
+    # failing at tool calls (truncated JSON args, plans narrated instead of called, calls
+    # typed as text, `ls` loops of 100+ steps) — a few cents a run buys runs that finish.
+    # Luna's Intelligence Index matches gpt-5.6-luna's (38.1 vs 37.3) at under half its
+    # price. The coder is `low`'s planner (V4.1 Flash); its input is tiny, so the 3x price
+    # barely registers.
     "extra-low": {
-        "research_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
-        "subagent_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
-        "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
-        "compaction_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
+        "research_model": "openai/gpt-6-luna",  # $0.10 / $0.50
+        "subagent_model": "openai/gpt-6-luna",  # $0.10 / $0.50
+        "utility_model": "openai/gpt-6-luna",  # $0.10 / $0.50
+        "compaction_model": "openai/gpt-6-luna",  # $0.10 / $0.50
         "coding_model": "deepseek/deepseek-v4.1-flash",  # $0.30 / $1.20
     },
     # deepseek-v4.1-flash (GA 2026-09-10): τ² airline 76.7% (#16), above 0731 (73.2%) and
     # everything near its price; 1.0M ctx, 0.02x cache read, 9 endpoints on 09-11 (4 on
     # launch day, when a 429 from all of them killed a run). Per-provider speed spans 12 to
     # 127 tok/s — routing, not the model, sets it (provider_min_throughput). Unpinned slug.
+    # The coder is claude-haiku-5.5 (2026-10-07): Terminal-Bench 32.8% against Luna's 12.6%
+    # (Artificial Analysis) at the same price; it writes ~3x the output tokens, which a
+    # coder's small input absorbs.
     "low": {
         "research_model": "deepseek/deepseek-v4.1-flash",  # $0.30 / $1.20
-        "subagent_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
-        "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
-        "compaction_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
-        "coding_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
+        "subagent_model": "openai/gpt-6-luna",  # $0.10 / $0.50
+        "utility_model": "openai/gpt-6-luna",  # $0.10 / $0.50
+        "compaction_model": "openai/gpt-6-luna",  # $0.10 / $0.50
+        "coding_model": "anthropic/claude-haiku-5.5",  # $0.10 / $0.50
     },
     # gemini-3.8-flash (2026-09-02, not on the benchmarks yet): newest Gemini Flash at the
     # same price as the 3.7 build it replaced, which held τ² #2 overall (80.6%) and GPQA #2
     # (94.3%). The fleet is `low`'s planner: each tier's fleet is the planner of the tier
     # below (asserted), so stepping up upgrades the gathering, not just the plan. Utility is
-    # the floor everywhere.
+    # gpt-6-luna, the floor: 0731 looped 115 steps (~23 min) in this slot on 2026-10-09.
     "mid": {
         "research_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
         "subagent_model": "deepseek/deepseek-v4.1-flash",  # $0.30 / $1.20
-        "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
-        "compaction_model": "openai/gpt-5.6-luna",  # $0.20 / $1.20
+        "utility_model": "openai/gpt-6-luna",  # $0.10 / $0.50
+        "compaction_model": "openai/gpt-6-luna",  # $0.10 / $0.50
         "coding_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
     },
-    # gpt-5.6-sol over claude-sonnet-5: same price and τ², +8.7pp GPQA, half the latency.
-    # The fleet (3.8-flash; its 3.7 predecessor out-scored the planner on τ²) is a stronger
-    # tool-caller than the planner — intended: it makes the calls. Compaction on the fleet
-    # model rather than luna: the summary must keep every number and source for the planner
-    # and every sub-agent, and at a few compactions per run the price barely shows. Coder
-    # pinned to the GA `-0813` Pro build (first-party at $0.66/$1.98; the index lists a
-    # reseller's price): the bare `deepseek-v4-pro` slug is the 0423 build on degraded
-    # third-party hosts.
+    # gpt-6.1-sol (2026-09-29) over gpt-5.6-sol: same price, half the cache-read price, and
+    # ahead of gpt-6-sol on OpenAI's agentic and coding evals. claude-sonnet-5.5 scores higher
+    # on independent agentic runs (Intelligence Index 56 vs 52) but costs ~10x per task
+    # through its output volume, which a planner pays on every step. The fleet (3.8-flash;
+    # its 3.7 predecessor out-scored the planner on τ²) is a stronger tool-caller than the
+    # planner — intended: it makes the calls. Compaction on the fleet model rather than
+    # luna: the summary must keep every number and source for the planner and every
+    # sub-agent, and at a few compactions per run the price barely shows. Coder pinned to
+    # the GA `-0813` Pro build (first-party at $0.66/$1.98; the index lists a reseller's
+    # price): the bare `deepseek-v4-pro` slug is the 0423 build on degraded third-party hosts.
     "high": {
-        "research_model": "openai/gpt-5.6-sol",  # $2.00 / $10.00
+        "research_model": "openai/gpt-6.1-sol",  # $2.00 / $10.00
         "subagent_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
-        "utility_model": "deepseek/deepseek-v4-flash-0731",  # $0.07 / $0.18
+        "utility_model": "openai/gpt-6-luna",  # $0.10 / $0.50
         "compaction_model": "google/gemini-3.8-flash",  # $0.75 / $3.75
         "coding_model": "deepseek/deepseek-v4-pro-0813",  # $1.05 / $3.15
     },
@@ -144,12 +150,15 @@ DEFAULT_MODEL_TIER = "extra-low"
 # rejecting model is recorded as False, and an unlisted one is treated the same: it just runs
 # at the provider default. tests/test_model_tiering.py requires a flag for every tier slug.
 MODEL_REASONING: dict[str, bool] = {
+    "anthropic/claude-haiku-5.5": True,          # 2026-10-09
     "deepseek/deepseek-v4-flash-0731": True,
     "deepseek/deepseek-v4-pro-0813": True,
     "deepseek/deepseek-v4.1-flash": True,
     "google/gemini-3.8-flash": True,
     "openai/gpt-5.6-luna": True,
     "openai/gpt-5.6-sol": True,
+    "openai/gpt-6-luna": True,                   # 2026-10-09
+    "openai/gpt-6.1-sol": True,                  # 2026-10-09
 }
 
 # Default for ``reasoning_capable``; DRA_REASONING_CAPABLE replaces it.
@@ -161,12 +170,15 @@ _REASONING_CAPABLE = [slug for slug, accepts in MODEL_REASONING.items() if accep
 # no tier may name one (tests/test_model_tiering.py). Advisory at runtime (models.py warns),
 # hence no env override.
 MODEL_CACHING: dict[str, bool] = {
+    "anthropic/claude-haiku-5.5": True,          # 0.10x (2026-10-09)
     "deepseek/deepseek-v4-flash-0731": True,     # 0.25x
     "deepseek/deepseek-v4-pro-0813": True,       # 0.03x
     "deepseek/deepseek-v4.1-flash": True,        # 0.02x
     "google/gemini-3.8-flash": True,             # 0.10x
     "openai/gpt-5.6-luna": True,                 # 0.10x
     "openai/gpt-5.6-sol": True,                  # 0.10x
+    "openai/gpt-6-luna": True,                   # 0.10x (2026-10-09)
+    "openai/gpt-6.1-sol": True,                  # 0.05x (2026-10-09)
 }
 
 # Valid values for reasoning_effort ("" = provider default; "none" = disable thinking).
@@ -198,6 +210,17 @@ def _pick(c: dict, *keys: str, env: str = "", default: Any = None) -> Any:
             return v
     v = os.environ.get(env) if env else None
     return default if v in (None, "") else v
+
+
+def _pick_reasoning_effort(c: dict, key: str, env: str, default: str) -> str:
+    """A reasoning-effort knob, resolved by ``_pick``; an unknown value keeps ``default``,
+    with a warning."""
+    effort = str(_pick(c, key, env=env, default=default)).strip().lower()
+    if effort not in _REASONING_EFFORTS:
+        log.warning("unknown %s %r — using %r (allowed: %s)", key, effort, default,
+                    ", ".join(sorted(v or '""' for v in _REASONING_EFFORTS)))
+        return default
+    return effort
 
 
 _FLAG_ON = ("1", "true", "yes", "on")
@@ -380,18 +403,20 @@ class ResearchConfig:
     # disables thinking where supported. Unsupported models ignore the parameter.
     # DRA_REASONING_EFFORT.
     reasoning_effort: str = "low"
+    # The same for the extract-subagent alone, which reads a file and pulls fields out: no
+    # plan to think through, and reasoning was ~3/4 of its output tokens per step. Same
+    # values; DRA_EXTRACT_REASONING_EFFORT.
+    extract_reasoning_effort: str = "none"
     # OpenRouter provider routing, sent under `provider` (models.py; the live per-model parts
     # come from provider_routing.py). Soft: preferred_* thresholds (p50 tokens/s; p50 seconds
     # to first token) push slow endpoints to the back, none excluded; 0 = off. Hard:
-    # provider_sort (price | throughput | latency) turns balancing off; max_price_factor caps
-    # every endpoint at factor x the cheapest HEALTHY one (status ok, uptime_last_30m >=
-    # min_uptime %) — pricier ones are refused even when the cheap one is slow; 0 = off.
-    # Providers with no healthy endpoint go on `ignore`. Feed cached routing_ttl seconds.
-    # DRA_PROVIDER_{MIN_THROUGHPUT,MAX_LATENCY,SORT,MAX_PRICE_FACTOR,MIN_UPTIME,ROUTING_TTL}.
+    # provider_sort (price | throughput | latency) turns balancing off; providers with no
+    # HEALTHY endpoint (status ok, uptime_last_30m >= min_uptime %) go on `ignore`. No price
+    # cap (see provider_routing.py). Feed cached routing_ttl seconds.
+    # DRA_PROVIDER_{MIN_THROUGHPUT,MAX_LATENCY,SORT,MIN_UPTIME,ROUTING_TTL}.
     provider_min_throughput: float = 50.0
     provider_max_latency: float = 0.0
     provider_sort: str = ""
-    provider_max_price_factor: float = 1.25
     provider_min_uptime: float = 97.0
     provider_routing_ttl: float = 300.0
     # Models the `reasoning` parameter may be sent to (the True flags of MODEL_REASONING);
@@ -539,6 +564,13 @@ class ResearchConfig:
     def is_openrouter(self) -> bool:
         """OpenRouter-only behaviors (cost reporting, cache_control) key off this."""
         return "openrouter" in self.base_url.lower()
+
+    def reasoning_effort_for(self, role: str) -> str:
+        """The effort a model built for ``role`` runs at: the extract-subagent's own, else
+        the shared ``reasoning_effort``."""
+        if role == "extract-subagent":
+            return self.extract_reasoning_effort
+        return self.reasoning_effort
 
     def supports_reasoning(self, model_id: str) -> bool:
         """Exact-slug membership in ``reasoning_capable`` — a prefix match would pass a
@@ -731,26 +763,11 @@ class ResearchConfig:
         if isinstance(capable, str):
             capable = capable.split(",")
 
-        reasoning_effort = (
-            str(
-                _pick(
-                    c,
-                    "reasoning_effort",
-                    env="DRA_REASONING_EFFORT",
-                    default=cls.reasoning_effort,
-                )
-            )
-            .strip()
-            .lower()
-        )
-        if reasoning_effort not in _REASONING_EFFORTS:
-            log.warning(
-                "unknown reasoning_effort %r — using %r (allowed: %s)",
-                reasoning_effort,
-                cls.reasoning_effort,
-                ", ".join(sorted(v or '""' for v in _REASONING_EFFORTS)),
-            )
-            reasoning_effort = cls.reasoning_effort
+        reasoning_effort = _pick_reasoning_effort(
+            c, "reasoning_effort", "DRA_REASONING_EFFORT", cls.reasoning_effort)
+        extract_reasoning_effort = _pick_reasoning_effort(
+            c, "extract_reasoning_effort", "DRA_EXTRACT_REASONING_EFFORT",
+            cls.extract_reasoning_effort)
 
         provider_sort = str(_pick(
             c, "provider_sort", env="DRA_PROVIDER_SORT", default=cls.provider_sort,
@@ -761,14 +778,6 @@ class ResearchConfig:
                 provider_sort, ", ".join(sorted(v or '""' for v in _PROVIDER_SORTS)),
             )
             provider_sort = cls.provider_sort
-        # 0 = off; anything else is a multiplier of the cheapest price, so never below 1.
-        provider_max_price_factor = float(_pick(
-            c, "provider_max_price_factor", env="DRA_PROVIDER_MAX_PRICE_FACTOR",
-            default=cls.provider_max_price_factor))
-        if provider_max_price_factor > 0:
-            provider_max_price_factor = max(1.0, provider_max_price_factor)
-        else:
-            provider_max_price_factor = 0.0
 
         sandbox_url, sandbox_token = _resolve_sandbox(c)
 
@@ -788,6 +797,7 @@ class ResearchConfig:
                 c, "max_output_tokens", env="DRA_MAX_OUTPUT_TOKENS",
                 default=cls.max_output_tokens))),
             reasoning_effort=reasoning_effort,
+            extract_reasoning_effort=extract_reasoning_effort,
             reasoning_capable=[s.strip().lower() for s in capable if str(s).strip()],
             provider_min_throughput=max(0.0, float(_pick(
                 c, "provider_min_throughput", env="DRA_PROVIDER_MIN_THROUGHPUT",
@@ -796,7 +806,6 @@ class ResearchConfig:
                 c, "provider_max_latency", env="DRA_PROVIDER_MAX_LATENCY",
                 default=cls.provider_max_latency))),
             provider_sort=provider_sort,
-            provider_max_price_factor=provider_max_price_factor,
             provider_min_uptime=min(100.0, max(0.0, float(_pick(
                 c, "provider_min_uptime", env="DRA_PROVIDER_MIN_UPTIME",
                 default=cls.provider_min_uptime)))),

@@ -107,10 +107,10 @@ three that shape a run:
 
 | Tier        | research (orchestrator) | subagent (workers)      | utility (extract)       | Use for |
 |-------------|-------------------------|-------------------------|-------------------------|---------|
-| `extra-low` | deepseek-v4-flash-0731  | deepseek-v4-flash-0731  | deepseek-v4-flash-0731  | demos, smoke tests, high-volume low-stakes |
-| `low`       | deepseek-v4.1-flash     | deepseek-v4-flash-0731  | deepseek-v4-flash-0731  | cheapest sane agent |
-| `mid`       | gemini-3.8-flash        | deepseek-v4.1-flash     | deepseek-v4-flash-0731  | the value sweet spot |
-| `high`      | gpt-5.6-sol             | gemini-3.8-flash        | deepseek-v4-flash-0731  | best quality per dollar |
+| `extra-low` | gpt-6-luna              | gpt-6-luna              | gpt-6-luna              | demos, smoke tests, high-volume low-stakes |
+| `low`       | deepseek-v4.1-flash     | gpt-6-luna              | gpt-6-luna              | cheapest sane agent |
+| `mid`       | gemini-3.8-flash        | deepseek-v4.1-flash     | gpt-6-luna              | the value sweet spot |
+| `high`      | gpt-6.1-sol             | gemini-3.8-flash        | gpt-6-luna              | best quality per dollar |
 
 The default is `extra-low` so a bare checkout can't silently burn money — production callers opt
 **up** explicitly. The core idea of **model tiering**: a strong orchestrator *plans and
@@ -235,12 +235,13 @@ A few important behaviors:
   waits out retryable model errors (429 / 5xx / timeout) within `model_rate_limit_max_wait`
   (`model_errors.py`), and if a sub-agent still dies mid-`task`, the orchestrator receives an error
   tool result — retry the unit or report the gap — rather than the exception ending the run.
-- **A routing preference of ours can never make a model unreachable.** The price cap and ignore
-  list (`provider_routing.py`) are hard on OpenRouter's side, and its account filters run before
-  them on endpoints the public feed lists — a cap anchored on an endpoint the account cannot use
-  leaves nothing and the call 404s (`No endpoints found that satisfy the max price`). The
+- **A routing preference of ours can never make a model unreachable.** The ignore list
+  (`provider_routing.py`) is hard on OpenRouter's side, and its account filters run before it on
+  endpoints the public feed lists — what the list leaves may be endpoints the account cannot use,
+  and the call 404s (`No endpoints found …`). There is no price cap: one anchored on a near-free
+  FP4 listing once pinned a model to that single endpoint. The
   `ProviderRoutingFallbackMiddleware` (`model_errors.py`, right outside the backoff) retries at
-  once with the cap dropped, then the ignore list, then no routing object at all, emits
+  once with the ignore list dropped, then no routing object at all, emits
   `provider_fallback` per step, and remembers the level per model for the routing TTL so parallel
   roles and the next graph build start there. The triage router and the compaction summarizer,
   which call their models outside an agent step, run the same ladder (`invoke_with_routing_fallback`).
@@ -406,7 +407,7 @@ The orchestrator's stack (assembled in `agent.py`, in this order; `SkillUsageMid
 | **ExecuteResultGuardMiddleware** | `wrap_tool_call` | Collapses raw rows in an orchestrator `execute` result, as the report scrub does — the one remaining route for data into the expensive context. |
 | **ExcludeToolsMiddleware** | `wrap_model_call` / `wrap_tool_call` | Hides the file tools from the orchestrator (and per-role tools from the workers) and refuses them by name if called anyway. |
 | **SubagentFailureMiddleware** | `awrap_tool_call` | A sub-agent that dies mid-`task` (its model provider throttled past the backoff budget, say) comes back as an **error tool result** naming the sub-agent and the cause — the orchestrator retries the unit once or reports the gap — instead of the exception unwinding the whole run. Also on the research-subagent, which nests the extract / coding workers through its own `task`. |
-| **ProviderRoutingFallbackMiddleware** | `awrap_model_call` | On every role, right outside the backoff. When OpenRouter refuses a call because our routing object (price cap, provider lists) leaves no endpoint the account may use, it retries at once with less of it — price cap, then provider lists, then the whole object — and remembers the level that worked per model. |
+| **ProviderRoutingFallbackMiddleware** | `awrap_model_call` | On every role, right outside the backoff. When OpenRouter refuses a call because our routing object (provider lists) leaves no endpoint the account may use, it retries at once with less of it — provider lists, then the whole object — and remembers the level that worked per model. |
 | **ModelBackoffMiddleware** | `awrap_model_call` | Last on **every** role (one instance per role, so its `status` events name role + model). A retryable model error (429 / 5xx / timeout / connection) is waited out — `Retry-After`, else capped exponential backoff — and the call repeated until cumulative waiting would exceed `model_rate_limit_max_wait`; then the error stands. The SDK's own `max_retries` only covers sub-second blips; this is what survives a shared provider pool throttling for tens of seconds. |
 | **SandboxCleanupMiddleware** | `after_agent` | Destroys the run's sandbox session (only present when a sandbox is configured). |
 
@@ -438,7 +439,7 @@ That's what keeps the agent portable.
 | `subagent_findings` | a folded findings table from a worker |
 | `script` | a collapsed "view script" tab holding code an agent ran: a FILE script (basename + `language` + final source, at the worker's handoff) or INLINE code from an `execute` heredoc / `python3 -c` (`inline.py` + its real `output`, as the call returns, for every role including the orchestrator). The only place a script surfaces: no role names a script path in prose, and the coder's handoff is scrubbed of paths before the orchestrator reads it (`script_artifacts.py`) |
 | `clarification` | the question card (re-enables input) |
-| `status` | lifecycle: `mcp_ready` / `mcp_error` (tool loading), `budget_soft` / `budget_halt` (ceilings), `revising` (a gate bounced a deliverable back), `compacting` / `compacted` (context compaction), `loop_detected` / `loop_halt` (repeated-identical-call guard), `subagent_start` / `subagent_done` (a sub-agent run, with `role` + `model`), `rate_limited` / `model_unavailable` (a throttled or erroring model provider being waited out within `model_rate_limit_max_wait`, then given up on), `provider_fallback` (OpenRouter refused a call over our routing object — price cap / ignore list — and it is retried with less of it; `step`, `level`, `dropped`), `subagent_failed` (a sub-agent died mid-`task`; its caller got a tool error and the run continues), then exactly one end-state — `done` or `error`, with a `reason` code and the run time (`elapsed_s` / `elapsed`, also appended to `detail`: "… Run time 4m 12s.") |
+| `status` | lifecycle: `mcp_ready` / `mcp_error` (tool loading), `budget_soft` / `budget_halt` (ceilings), `revising` (a gate bounced a deliverable back), `compacting` / `compacted` (context compaction), `loop_detected` / `loop_halt` (repeated-identical-call guard), `subagent_start` / `subagent_done` (a sub-agent run, with `role` + `model`), `rate_limited` / `model_unavailable` (a throttled or erroring model provider being waited out within `model_rate_limit_max_wait`, then given up on), `provider_fallback` (OpenRouter refused a call over our routing object — the ignore list — and it is retried with less of it; `step`, `level`, `dropped`), `subagent_failed` (a sub-agent died mid-`task`; its caller got a tool error and the run continues), then exactly one end-state — `done` or `error`, with a `reason` code and the run time (`elapsed_s` / `elapsed`, also appended to `detail`: "… Run time 4m 12s.") |
 | `usage` | the per-run usage summary, incl. run time (`elapsed_s`, `elapsed`, `started_at`, `finished_at`) |
 | `report` | the final markdown answer (also persisted in state) |
 
@@ -581,8 +582,7 @@ All overridable per-run (`configurable`) or via env var; defaults shown.
 | `provider_min_throughput` | `DRA_PROVIDER_MIN_THROUGHPUT` | 50 | OpenRouter routing: deprioritize provider endpoints under this p50 tokens/s (soft — price weighting continues among those that qualify; the cheapest endpoints of one model run 5–10x slower than its fastest); `0` = off |
 | `provider_max_latency` | `DRA_PROVIDER_MAX_LATENCY` | 0 | same, for p50 time-to-first-token in seconds; `0` = off |
 | `provider_sort` | `DRA_PROVIDER_SORT` | — | hard override `price` / `throughput` / `latency`: top endpoint on that axis, OpenRouter load balancing off |
-| `provider_max_price_factor` | `DRA_PROVIDER_MAX_PRICE_FACTOR` | 1.25 | hard cap: refuse endpoints pricier than this x the cheapest healthy one (per axis), read per model from the live endpoint feed at graph start; `0` = off |
-| `provider_min_uptime` | `DRA_PROVIDER_MIN_UPTIME` | 97 | stability floor (% uptime, last 30 min): endpoints below it don't anchor the cap; a provider with no healthy endpoint is skipped via `ignore`; `0` = off |
+| `provider_min_uptime` | `DRA_PROVIDER_MIN_UPTIME` | 97 | stability floor (% uptime, last 30 min): a provider with no healthy endpoint is skipped via `ignore`; `0` = off |
 | `provider_routing_ttl` | `DRA_PROVIDER_ROUTING_TTL` | 300 | seconds the endpoint feed is cached across graph builds; `0` = every run |
 | `recursion_limit` | `DRA_RECURSION_LIMIT` | 4500 | LangGraph super-step ceiling (secondary guard; the budget is primary) |
 

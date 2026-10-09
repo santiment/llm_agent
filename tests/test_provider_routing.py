@@ -1,7 +1,7 @@
 """Every OpenRouter model call carries a provider-routing object: a soft throughput
-preference, a hard price cap at a factor of the cheapest healthy endpoint, and an ignore
-list of unstable providers — the latter two computed per model from OpenRouter's live
-endpoint feed at graph build (``provider_routing.py``).
+preference and an ignore list of unstable providers — the latter computed per model from
+OpenRouter's live endpoint feed at graph build (``provider_routing.py``). No price cap: a
+near-free FP4 listing once became its baseline and pinned every call to that one endpoint.
 
 OpenRouter's default routing is price-weighted, and within one model the cheapest
 providers are the slowest (on 2026-09-11 the fleet model's $0.05–0.07 endpoints ran
@@ -13,9 +13,9 @@ reseller ran 12 tok/s against 127 first-party). Every ReAct step pays that. Pins
   - build_chat_model sends OpenRouter's `provider` object with the documented field
     names and the p50 percentile form, only when something is set, and never off
     OpenRouter;
-  - routing(): the cap is factor x the cheapest HEALTHY endpoint per axis in $/M; a
-    provider goes on `ignore` only when none of its endpoints is healthy; a missing uptime
-    figure counts as healthy; no healthy endpoint or no feed -> soft preferences only;
+  - routing(): a provider goes on `ignore` only when none of its endpoints is healthy; a
+    missing uptime figure counts as healthy; no healthy endpoint or no feed -> soft
+    preferences only; no `max_price`, however cheap the cheapest endpoint;
   - resolve() / make_graph: the per-model object reaches the model that slot builds.
 
 Runs with plain Python (``python tests/test_provider_routing.py``) — no pytest needed.
@@ -33,8 +33,7 @@ from deep_research_agent.config import ResearchConfig
 from deep_research_agent.models import build_chat_model, provider_preferences
 
 _ENV_KEYS = ("DRA_PROVIDER_MIN_THROUGHPUT", "DRA_PROVIDER_MAX_LATENCY", "DRA_PROVIDER_SORT",
-             "DRA_PROVIDER_MAX_PRICE_FACTOR", "DRA_PROVIDER_MIN_UPTIME",
-             "DRA_PROVIDER_ROUTING_TTL", "OPENAI_BASE_URL")
+             "DRA_PROVIDER_MIN_UPTIME", "DRA_PROVIDER_ROUTING_TTL", "OPENAI_BASE_URL")
 
 
 def _cfg(env: dict[str, str] | None = None, **configurable) -> ResearchConfig:
@@ -53,18 +52,15 @@ def test_defaults_prefer_throughput_softly() -> None:
     assert cfg.provider_min_throughput == 50.0 == ResearchConfig.provider_min_throughput
     assert cfg.provider_max_latency == 0.0
     assert cfg.provider_sort == ""
-    assert (cfg.provider_max_price_factor, cfg.provider_min_uptime, cfg.provider_routing_ttl) == (1.25, 97.0, 300.0)
+    assert (cfg.provider_min_uptime, cfg.provider_routing_ttl) == (97.0, 300.0)
     assert provider_preferences(cfg) == {"preferred_min_throughput": {"p50": 50.0}}
 
 
 def test_live_rule_knobs_parse_and_clamp() -> None:
-    cfg = _cfg({"DRA_PROVIDER_MAX_PRICE_FACTOR": "1.5", "DRA_PROVIDER_MIN_UPTIME": "95",
-                "DRA_PROVIDER_ROUTING_TTL": "60"})
-    assert (cfg.provider_max_price_factor, cfg.provider_min_uptime, cfg.provider_routing_ttl) == (1.5, 95.0, 60.0)
-    cfg = _cfg({"DRA_PROVIDER_MAX_PRICE_FACTOR": "1.5"}, provider_max_price_factor=2)
-    assert cfg.provider_max_price_factor == 2.0  # configurable beats env
-    assert _cfg(provider_max_price_factor=0).provider_max_price_factor == 0.0  # off
-    assert _cfg(provider_max_price_factor=0.5).provider_max_price_factor == 1.0  # never below the cheapest
+    cfg = _cfg({"DRA_PROVIDER_MIN_UPTIME": "95", "DRA_PROVIDER_ROUTING_TTL": "60"})
+    assert (cfg.provider_min_uptime, cfg.provider_routing_ttl) == (95.0, 60.0)
+    cfg = _cfg({"DRA_PROVIDER_MIN_UPTIME": "95"}, provider_min_uptime=90)
+    assert cfg.provider_min_uptime == 90.0  # configurable beats env
     assert _cfg(provider_min_uptime=150).provider_min_uptime == 100.0
     assert _cfg(provider_min_uptime=-5).provider_min_uptime == 0.0
     assert _cfg(provider_routing_ttl=-1).provider_routing_ttl == 0.0
@@ -114,7 +110,7 @@ def test_nothing_set_sends_no_provider_object() -> None:
 
 def test_explicit_provider_object_wins() -> None:
     cfg = _cfg(openai_api_key="k")
-    routed = {"preferred_min_throughput": {"p50": 50.0}, "max_price": {"prompt": 0.0625, "completion": 0.2}}
+    routed = {"preferred_min_throughput": {"p50": 50.0}, "ignore": ["fireworks"]}
     assert build_chat_model("m", cfg, routed).extra_body["provider"] == routed
     assert "provider" not in (build_chat_model("m", cfg, {}).extra_body or {})
 
@@ -137,26 +133,25 @@ _FLEET = [
 ]
 
 
-def test_cap_is_factor_times_cheapest_healthy_and_unstable_providers_are_ignored() -> None:
+def test_unstable_providers_are_ignored() -> None:
     out = pr.routing(_cfg(), _FLEET, "fleet")
-    assert out["preferred_min_throughput"] == {"p50": 50.0}
-    assert out["max_price"] == {"prompt": 0.0625, "completion": 0.2}  # 1.25 x $0.05 / $0.16
-    assert out["ignore"] == ["fireworks"]
+    assert out == {"preferred_min_throughput": {"p50": 50.0}, "ignore": ["fireworks"]}
 
 
-def test_cap_anchors_on_healthy_endpoints_only() -> None:
-    feed = [_ep("Cheap", "cheap", 0.04, 0.10, uptime=80.0, status=-2)] + _FLEET[:3]
-    out = pr.routing(_cfg(), feed)
-    assert out["max_price"] == {"prompt": 0.0625, "completion": 0.2}  # the $0.04 one is down
-    assert out["ignore"] == ["cheap"]
+def test_a_near_free_outlier_does_not_capture_the_model() -> None:
+    # 2026-10-09: an FP4 listing at ~1/10 of everyone else's price anchored the old 1.25x
+    # cap, which then admitted that endpoint alone. Routing must leave every healthy
+    # endpoint reachable, and the old knob must not bring the cap back.
+    feed = [_ep("OpenInference", "open-inference/fp4", 0.008, 0.079)] + _FLEET
+    cfg = _cfg(provider_max_price_factor=1.25)
+    out = pr.routing(cfg, feed)
+    assert "max_price" not in out
+    healthy = [e for e in feed if pr.is_healthy(e, cfg.provider_min_uptime)]
+    assert pr.admitted(cfg, feed, out) == healthy
 
 
-def test_rules_switch_off_independently() -> None:
-    no_cap = pr.routing(_cfg(provider_max_price_factor=0), _FLEET)
-    assert "max_price" not in no_cap and no_cap["ignore"] == ["fireworks"]
-    no_uptime = pr.routing(_cfg(provider_min_uptime=0), _FLEET)
-    assert "ignore" not in no_uptime
-    assert no_uptime["max_price"] == {"prompt": 0.0625, "completion": 0.2}
+def test_uptime_rule_switches_off() -> None:
+    assert pr.routing(_cfg(provider_min_uptime=0), _FLEET) == {"preferred_min_throughput": {"p50": 50.0}}
 
 
 def test_no_feed_or_no_healthy_endpoint_means_soft_preferences_only() -> None:
@@ -179,7 +174,7 @@ def test_resolve_keys_every_slot_and_skips_the_feed_off_openrouter(monkeypatch) 
     cfg = _cfg(openai_api_key="k")
     out = asyncio.run(pr.resolve(cfg, ["a/fleet", "b/planner", "a/fleet"]))
     assert sorted(calls) == ["a/fleet", "b/planner"]  # deduplicated
-    assert out["a/fleet"]["max_price"] == {"prompt": 0.0625, "completion": 0.2}
+    assert out["a/fleet"]["ignore"] == ["fireworks"]
     assert out["b/planner"] == {"preferred_min_throughput": {"p50": 50.0}}
     calls.clear()
     local = _cfg({"OPENAI_BASE_URL": "http://localhost:11434/v1"}, openai_api_key="k")
@@ -192,7 +187,7 @@ def test_make_graph_routes_every_slot_model(monkeypatch) -> None:
     routed: dict = {}
 
     async def fake_resolve(cfg, slugs):
-        routed.update({s: {"max_price": {"prompt": 1.0, "completion": 2.0}, "tag": s} for s in slugs})
+        routed.update({s: {"ignore": ["fireworks"], "tag": s} for s in slugs})
         return routed
 
     monkeypatch.setattr(agent_mod, "resolve_routing", fake_resolve)
@@ -216,9 +211,9 @@ if __name__ == "__main__":
     test_defaults_prefer_throughput_softly()
     test_live_rule_knobs_parse_and_clamp()
     test_explicit_provider_object_wins()
-    test_cap_is_factor_times_cheapest_healthy_and_unstable_providers_are_ignored()
-    test_cap_anchors_on_healthy_endpoints_only()
-    test_rules_switch_off_independently()
+    test_unstable_providers_are_ignored()
+    test_a_near_free_outlier_does_not_capture_the_model()
+    test_uptime_rule_switches_off()
     test_no_feed_or_no_healthy_endpoint_means_soft_preferences_only()
     test_env_and_configurable()
     test_zero_disables_and_negatives_clamp()

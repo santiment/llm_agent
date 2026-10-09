@@ -217,12 +217,13 @@ def test_window_is_the_smallest_the_routing_admits() -> None:
 
     feed = [ep("Cheap", 0.05, 0.16, 1_048_576), ep("Small", 0.06, 0.18, 262_144),
             ep("Pricey", 0.44, 1.32, 1_310_720), ep("Down", 0.05, 0.16, 131_072, uptime=50, status=-2)]
-    cap = {"max_price": {"prompt": 0.0625, "completion": 0.2}}
-    assert pr.context_window(cfg, feed, cap) == 262_144                   # Cheap + Small admitted
-    assert pr.context_window(cfg, feed, {**cap, "ignore": ["small"]}) == 1_048_576
+    routed = {"ignore": ["down"]}
+    assert pr.context_window(cfg, feed, routed) == 262_144                # every healthy one; Small binds
+    assert pr.context_window(cfg, feed, {"ignore": ["small"]}) == 1_048_576
     assert pr.context_window(cfg, feed, {}) == 262_144                    # relaxed: every healthy one
-    assert pr.context_window(cfg, feed, {"max_price": {"prompt": 0.01, "completion": 0.01}}) == 262_144  # admits none -> all healthy
-    assert pr.context_window(cfg, [], cap) is None and pr.context_window(cfg, None, cap) is None
+    everyone = {"ignore": ["cheap", "small", "pricey"]}
+    assert pr.context_window(cfg, feed, everyone) == 262_144              # admits none -> all healthy
+    assert pr.context_window(cfg, [], routed) is None and pr.context_window(cfg, None, routed) is None
     assert pr.context_window(cfg, [ep("NoCtx", 0.05, 0.16, None)], {}) is None
 
 

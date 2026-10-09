@@ -174,7 +174,7 @@ async def make_graph(config: dict | None = None):
     # Both must be tool-capable. report_model is reserved for a future dedicated
     # synthesis step — using it (often a cheap "nano") for the tool loop makes the
     # agent skip tools and terminate early.
-    # Per-model OpenRouter provider routing (price cap, ignore list, speed preference) from
+    # Per-model OpenRouter provider routing (ignore list, speed preference) from
     # the live endpoint feed — see provider_routing.py. Cached; unreachable = soft prefs only.
     routing = await resolve_routing(cfg, (cfg.research_model, cfg.subagent_model,
                                           cfg.utility_model, cfg.compaction_model,
@@ -312,9 +312,9 @@ async def make_graph(config: dict | None = None):
                        # It delegates to the extract / coding sub-agents through its own
                        # `task`: one of those dying must not take this unit down.
                        SubagentFailureMiddleware(),
-                       # A call OpenRouter refuses over our own routing object (price cap,
-                       # ignore list) is retried with less of it — a model we name can be
-                       # slow or pricey for a while, never unreachable by our preference.
+                       # A call OpenRouter refuses over our own routing object (the ignore
+                       # list) is retried with less of it — a model we name can be slow for
+                       # a while, never unreachable by our preference.
                        ProviderRoutingFallbackMiddleware("research-subagent", cfg.subagent_model,
                                                          ttl=cfg.provider_routing_ttl),
                        # LAST on every role: a throttled provider is waited out (budgeted)

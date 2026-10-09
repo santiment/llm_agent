@@ -257,7 +257,7 @@ def relax_step(role: str, slug: str, ttl: float, original: dict[str, Any], level
     refusal, or nothing left to give up. Logs and emits ``provider_fallback``; the caller
     remembers the level only once a call at it SUCCEEDS (``_remember_if_relaxed``) — a 404
     that relaxing cannot fix ("no endpoints … support tool use") must not strip every role's
-    price cap for the TTL. Shared by the middleware and the direct-call helpers below."""
+    provider lists for the TTL. Shared by the middleware and the direct-call helpers below."""
     step = routing_rejection(exc)
     if step is None:
         return None
@@ -342,12 +342,11 @@ async def ainvoke_with_routing_fallback(model, input, *, role: str, slug: str = 
 class ProviderRoutingFallbackMiddleware(AgentMiddleware):
     """A call OpenRouter refuses over OUR routing object is retried, at once, with less of it.
 
-    The price cap and ignore list are hard. When they leave no endpoint — OpenRouter's
-    account-side filters run first and the public feed knows nothing of them (a "Filter by
-    Tier" step took 6 endpoints to 2, the cap took those to 0) — the call 404s instead of
-    falling back. Here that 404 climbs ``provider_routing.relax``: the cap first, then the
-    provider lists, then the whole object; each step is one immediate retry, since the
-    refusal is deterministic. The level that WORKED is remembered per model for ``ttl``
+    The ignore list is hard. When it leaves no endpoint — OpenRouter's account-side filters
+    run first and the public feed knows nothing of them (a "Filter by Tier" step can take a
+    model's endpoints down to the ones we ignore) — the call 404s instead of falling back.
+    Here that 404 climbs ``provider_routing.relax``: the provider lists first, then the
+    whole object; each step is one immediate retry, since the refusal is deterministic. The level that WORKED is remembered per model for ``ttl``
     seconds (the routing TTL) so every parallel sub-agent on the model, and the next graph
     build, start there. Every other exception propagates untouched.
 
