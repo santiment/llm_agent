@@ -10,6 +10,9 @@ Pins (``model_errors.py``):
     a provider's Retry-After honored — and calls again until the cumulative wait would
     exceed its budget, then the error stands; non-transient errors and LangGraph control
     flow propagate at once; a 0 budget disables the waiting;
+  - a streamed reply that is only an in-band error (``finish_reason`` "error", no text, no
+    tool calls) is retried like the 5xx it is, within the same budget; a reply with any
+    output is kept as the answer;
   - SubagentFailureMiddleware turns an exception out of ``task`` into an error
     ToolMessage naming the sub-agent and the cause; other tools are untouched;
   - the budget knob (DRA_MODEL_RATE_LIMIT_MAX_WAIT / configurable) parses like its MCP
@@ -29,12 +32,14 @@ import pytest
 from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.exceptions import (ModelAPIError, ModelInvalidRequestError,
                                        ModelRateLimitError, ModelTimeoutError)
-from langchain_core.messages import ToolMessage
+from langchain.agents.middleware.types import ModelResponse
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.errors import GraphBubbleUp
 
 import deep_research_agent.events as events
 from deep_research_agent.config import ResearchConfig
-from deep_research_agent.model_errors import (ModelBackoffMiddleware, SubagentFailureMiddleware,
+from deep_research_agent.model_errors import (ModelBackoffMiddleware, StreamedModelError,
+                                              SubagentFailureMiddleware, errored_reply,
                                               is_transient_model_error, retry_after_seconds)
 
 _ENV_KEYS = ("DRA_MODEL_RATE_LIMIT_MAX_WAIT",)
@@ -205,6 +210,46 @@ def test_zero_budget_disables_the_waiting() -> None:
     assert cap.states() == ["model_unavailable"]
 
 
+# --- in-band stream errors ------------------------------------------------------------------
+
+def _reply(content="", finish="errorerror", **kwargs) -> ModelResponse:
+    """What LangChain hands back for an OpenRouter stream: merged chunks double the metadata."""
+    meta = {"finish_reason": finish, "model_name": "google/gemini-3.8-flashgoogle/gemini-3.8-flash"}
+    return ModelResponse(result=[AIMessage(content=content, response_metadata=meta, **kwargs)])
+
+
+def test_an_empty_errored_stream_is_retried_then_succeeds() -> None:
+    # 2026-10-09: the mid planner's report call came back empty with finish_reason "error"
+    # twice in a row, and the run ended as if the model had answered with nothing.
+    mw = _mw()
+    handler = _failing_then([_reply(), "ok"], None)
+    with _Captured(mw) as cap:
+        assert _run(mw, handler) == "ok"
+    assert handler.calls["n"] == 2 and cap.sleeps == [2.0]
+    assert cap.states() == ["rate_limited"]
+    assert "StreamedModelError" in cap.events[0]["detail"]
+
+
+def test_an_errored_stream_that_persists_stands_once_the_budget_is_spent() -> None:
+    mw = _mw(max_wait=0.0)
+    handler = _failing_then([_reply(), "never"], None)
+    with _Captured(mw) as cap:
+        with pytest.raises(StreamedModelError):
+            _run(mw, handler)
+    assert handler.calls["n"] == 1 and cap.states() == ["model_unavailable"]
+
+
+def test_replies_with_output_are_answers_whatever_the_finish_reason() -> None:
+    assert errored_reply(_reply()) is not None
+    assert errored_reply(_reply(finish="error")) is not None
+    assert errored_reply(_reply(content="partial report")) is None
+    assert errored_reply(_reply(content=[{"type": "text", "text": "partial"}])) is None
+    call = {"name": "submit_report", "args": {"report": "x"}, "id": "c1"}
+    assert errored_reply(_reply(tool_calls=[call])) is None
+    assert errored_reply(_reply(finish="stopstop")) is None          # empty but not an error
+    assert errored_reply("ok") is None and errored_reply(AIMessage("hi")) is None
+
+
 def test_jitter_stays_within_twenty_percent() -> None:
     mw = _mw(jitter=True)
     handler = _failing_then([ModelRateLimitError(_429), "ok"], None)
@@ -337,6 +382,9 @@ if __name__ == "__main__":
     test_non_transient_error_propagates_at_once()
     test_graph_control_flow_propagates()
     test_zero_budget_disables_the_waiting()
+    test_an_empty_errored_stream_is_retried_then_succeeds()
+    test_an_errored_stream_that_persists_stands_once_the_budget_is_spent()
+    test_replies_with_output_are_answers_whatever_the_finish_reason()
     test_jitter_stays_within_twenty_percent()
     test_task_failure_becomes_an_error_tool_result()
     test_task_success_passes_through()

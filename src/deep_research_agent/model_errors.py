@@ -35,6 +35,13 @@ model calls that happen outside an agent's model step — the triage router (the
 every run, so what it learns every later role starts from) and the compaction summarizer —
 go through ``invoke_with_routing_fallback`` for the same ladder.
 
+A streamed call can also fail IN-BAND: OpenRouter has already answered 200 and started the
+stream when the provider errors, so it closes it with ``finish_reason: "error"`` and nothing
+raises — LangChain hands back an empty ``AIMessage``, which read as the model's final answer
+ended a ``mid`` run twice in a row on 2026-10-09 ("no submit_report") right as the planner
+began its report. ``ModelBackoffMiddleware`` turns such a reply into ``StreamedModelError``
+(a ``ModelAPIError``: the 5xx it is) so it gets the same retries and status events.
+
 ``SubagentFailureMiddleware`` answers (2): an exception out of ``task`` becomes an error
 ``ToolMessage`` telling the caller the unit was NOT researched and how to proceed (retry
 once, else report the gap) — a failed delegation is a RESULT, the same stance the MCP
@@ -53,14 +60,14 @@ import time
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.exceptions import ModelError, ModelNotFoundError
-from langchain_core.messages import ToolMessage
+from langchain_core.exceptions import ModelAPIError, ModelError, ModelNotFoundError
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.errors import GraphBubbleUp
 
 from .events import _is_rate_limited, _retry_after_seconds, emit, exception_message
 from .provider_routing import (MAX_RELAX_LEVEL, next_relax_level, relax, relaxed_level,
                                remember_relaxed)
-from .turn import tool_call_of
+from .turn import text_of, tool_call_of
 
 log = logging.getLogger("deep_research_agent.model_errors")
 
@@ -92,6 +99,38 @@ def retry_after_seconds(exc: BaseException) -> float | None:
         if seconds >= 0:
             return seconds
     return _retry_after_seconds(str(exc).lower())
+
+
+class StreamedModelError(ModelAPIError):
+    """A streamed call the provider ended with an in-band error chunk (``finish_reason``
+    "error") and no output — a server failure that arrived after the HTTP 200."""
+
+
+def errored_reply(response) -> AIMessage | None:
+    """The reply's ``AIMessage`` when it is only an in-band stream error: ``finish_reason``
+    says "error" (merged stream chunks double it — "errorerror"), with no text and no tool
+    calls. None for anything with output, which is kept as the model's answer."""
+    messages = getattr(response, "result", None)
+    if messages is None:
+        messages = [response]
+    for m in messages:
+        if not isinstance(m, AIMessage):
+            continue
+        finish = str((m.response_metadata or {}).get("finish_reason") or "")
+        if ("error" in finish and not text_of(m.content).strip()
+                and not m.tool_calls and not m.invalid_tool_calls):
+            return m
+    return None
+
+
+def _raise_if_errored(response):
+    m = errored_reply(response)
+    if m is not None:
+        model = (m.response_metadata or {}).get("model_name") or "?"
+        raise StreamedModelError(
+            f"the model stream ended in an error chunk with no output (model {model}, "
+            f"finish_reason {m.response_metadata.get('finish_reason')!r})")
+    return response
 
 
 def error_detail(exc: BaseException) -> str:
@@ -126,7 +165,7 @@ class ModelBackoffMiddleware(AgentMiddleware):
         attempt, waited = 0, 0.0
         while True:
             try:
-                return handler(request)
+                return _raise_if_errored(handler(request))
             except GraphBubbleUp:
                 raise
             except Exception as exc:
@@ -140,7 +179,7 @@ class ModelBackoffMiddleware(AgentMiddleware):
         attempt, waited = 0, 0.0
         while True:
             try:
-                return await handler(request)
+                return _raise_if_errored(await handler(request))
             except GraphBubbleUp:
                 raise
             except Exception as exc:
